@@ -352,9 +352,7 @@ class DicomProcessor:
 
     def apply_random_values_optimized(self, pixels_hu, dilated_volume, unique_values_list):
         new_volume = np.copy(pixels_hu)
-        random_indices = np.random.choice(len(unique_values_list), size=np.sum(dilated_volume))
-        random_values = np.array(unique_values_list)[random_indices]
-        new_volume[dilated_volume == 1] = random_values
+        new_volume[dilated_volume == 1] = -1000
         return new_volume
 
     def person_names_callback(self, ds, elem):
