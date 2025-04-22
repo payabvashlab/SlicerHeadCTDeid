@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>deid</class>
+ <widget class="qMRMLWidget" name="deid">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>279</width>
+    <height>286</height>
+   </rect>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <!-- Inputs Section -->
+   <item>
+    <widget class="ctkCollapsibleButton" name="inputsCollapsibleButton">
+     <property name="text">
+      <string>Inputs</string>
+     </property>
+     <layout class="QFormLayout" name="formLayout_2">
+      <!-- Input Folder Selection -->
+      <item row="0" column="0">
+       <widget class="QLabel" name="label">
+        <property name="text">
+         <string>Input Folder:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="ctkDirectoryButton" name="inputFolderButton">
+        <property name="toolTip">
+         <string>Select the folder containing all patients' DICOM files.</string>
+        </property>
+       </widget>
+      </item>
+      <!-- Excel File Button (input2) -->
+      <item row="1" column="0">
+       <widget class="QLabel" name="label_2">
+        <property name="text">
+         <string>Excel File:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QPushButton" name="excelFileButton">
+        <property name="toolTip">
+         <string>Select the Excel file containing patient IDs.</string>
+        </property>
+        <property name="text">
+         <string>Browse</string>
+        </property>
+       </widget>
+      </item>
+      <!-- Output Folder Selection -->
+      <item row="2" column="0">
+       <widget class="QLabel" name="label_3">
+        <property name="text">
+         <string>Output Folder:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="ctkDirectoryButton" name="outputFolderButton">
+        <property name="toolTip">
+         <string>Select the folder where de-identified files will be saved.</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <!-- Add checkbox below output folder -->
+   <item>
+     <widget class="QCheckBox" name="deidentifyCheckbox">
+      <property name="text">
+       <string>Remove text inside dicom</string>
+      </property>
+      <property name="toolTip">
+       <string>Check to temove text inside dicom.</string>
+      </property>
+     </widget>
+    </item>
+
+   <!-- Apply Button Section -->
+   <item>
+    <widget class="QPushButton" name="applyButton">
+     <property name="enabled">
+      <bool>False</bool>
+     </property>
+     <property name="toolTip">
+      <string>Run the de-identification algorithm.</string>
+     </property>
+     <property name="text">
+      <string>Apply</string>
+     </property>
+    </widget>
+   </item>
+   
+   <!-- Output Folder Selection -->
+   <item>
+    <widget class="QProgressBar" name="progressBar">
+        <property name="value">
+            <number>0</number>
+        </property>
+    </widget>
+   </item>   
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>ctkCollapsibleButton</class>
+   <extends>QWidget</extends>
+   <header>ctkCollapsibleButton.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ctkDirectoryButton</class>
+   <extends>QWidget</extends>
+   <header>ctkDirectoryButton.h</header>
+  </customwidget>
+  <customwidget>
+   <class>QPushButton</class>
+   <extends>QWidget</extends>
+   <header>QPushButton.h</header>
+  </customwidget>
+ </customwidgets>
+ <connections>
+  <!-- Connection for excel file button -->
+  <connection>
+   <sender>excelFileButton</sender>
+   <signal>clicked()</signal>
+   <receiver>deidWidget</receiver>
+   <slot>onBrowseExcelFile()</slot>  <!-- Fixed connection to the correct class -->
+  </connection>
+ </connections>
+</ui>
