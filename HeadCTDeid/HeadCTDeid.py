@@ -311,28 +311,9 @@ class DicomProcessor:
 
     def largest_connected_component(self, binary_image):
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_image, connectivity=8)
-
-        # Get the area of each component (excluding background at index 0)
-        areas = stats[1:, cv2.CC_STAT_AREA]
-
-        largest_component_image = np.zeros_like(binary_image, dtype=np.uint8)
-
-        if len(areas) == 0:
-            # No components found
-            return largest_component_image
-
-        # If only one component found, return just that
-        if len(areas) == 1:
-            largest_index = 1  # only one component, index is 1 (since 0 is background)
-            largest_component_image[labels == largest_index] = 1
-            return largest_component_image
-
-        # Otherwise, get two largest
-        largest_indices = np.argsort(areas)[-2:] + 1  # +1 to correct index offset
-
-        # Combine both components into the output mask
-        largest_component_image[(labels == largest_indices[0]) | (labels == largest_indices[1])] = 1
-
+        largest_component_index = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
+        largest_component_image = np.zeros(labels.shape, dtype=np.uint8)
+        largest_component_image[labels == largest_component_index] = 1
         return largest_component_image
 
     def get_largest_component_volume(self, volume):
