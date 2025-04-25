@@ -16,6 +16,12 @@ from PIL import Image
 from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
+dependencies = NonSlicerPythonDependencies()
+dependencies.setupPythonRequirements(upgrade=True)
+import pydicom
+from pydicom.uid import generate_uid
+from pydicom.datadict import keyword_for_tag
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 
@@ -178,72 +184,23 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
           #subprocess.check_call([sys.executable, "-m", "pip", "install", package])
           slicer.util.pip_install(package)
         
-        logging.debug("Initializing pandas...")
         try:
             import pandas as pd
         except ModuleNotFoundError as e:
             slicer.util.pip_install("pandas")
         
-        logging.debug("Initializing opencv-python...")
         try:
             import cv2
         except ModuleNotFoundError as e:
-            slicer.util.pip_install("opencv-python")
-            
-        logging.debug("Initializing openpyxl...")
-        try:
-            import openpyxl
-        except ModuleNotFoundError as e:
-            slicer.util.pip_install("openpyxl")
-                
-        logging.debug("Initializing python-gdcm...")
-        packageName = "gdcm"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("python-gdcm package is required. Installing... (it may take several minutes)")
-          install('python-gdcm')
-          if not self._checkModuleInstalled(packageName):
-            raise ValueError("python-gdcm needs to be installed to use this module.")
-            
-        logging.debug("Initializing pylibjpeg...")
-        packageName = "pylibjpeg"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("pylibjpeg package is required. Installing... (it may take several minutes)")
-          install(packageName)
-          if not self._checkModuleInstalled(packageName):
-            raise ValueError("pylibjpeg needs to be installed to use this module.")
-            
-        logging.debug("Initializing pylibjpeg-libjpeg...")
-        packageName = "pylibjpeg-libjpeg"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("pylibjpeg-libjpeg package is required. Installing... (it may take several minutes)")
-          install(packageName)
-    
-        logging.debug("Initializing  pylibjpeg-openjpeg ...")
-        packageName = "pylibjpeg-openjpeg"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("pylibjpeg-openjpeg package is required. Installing... (it may take several minutes)")
-          install(packageName)
-    
-        logging.debug("Initializing pydicom ...")
-        try:
-            import pydicom
-        except ModuleNotFoundError as e:
-            slicer.util.pip_install("pydicom")
-        from pydicom.uid import generate_uid
-        from pydicom.datadict import keyword_for_tag
+            slicer.util.pip_install("opencv-python")      
 
-        logging.debug("Initializing scikit-image ...")
         packageName = "scikit-image"
         if not self._checkModuleInstalled(packageName):
-          logging.debug("scikit-image package is required. Installing... (it may take several minutes)")
           install(packageName)
 
-        logging.debug("Initializing easyocr ...")
         packageName = "easyocr"
         if not self._checkModuleInstalled(packageName):
-          logging.debug("easyocr package is required. Installing... (it may take several minutes)")
           install(packageName)
-        import easyocr
 
         self.dependenciesInstalled = True
         logging.debug("Dependencies are set up successfully.")
@@ -338,6 +295,7 @@ class DicomProcessor:
         self.sop_uid_map = defaultdict(str)
 
     def is_dicom(self, file_path):
+        import pydicom
         try:
             ds = pydicom.dcmread(file_path, force=True)
             try:
@@ -348,10 +306,14 @@ class DicomProcessor:
                 if self.checkCTmeta(ds) == 0:
                     return False
             return True
-        except Exception:
-            return False
+        except Exception as e:
+                with open('C:/Users/at4049/Downloads/log.txt', 'a') as error_file:
+                    error_file.write(f"Error: {e}\n")
+                return 0
+                return False
 
     def is_dicom_nometa(self, file_path):
+        import pydicom
         try:
             ds = pydicom.dcmread(file_path, force=True)
             ds.decompress()
@@ -371,6 +333,7 @@ class DicomProcessor:
         return list(dicom_dirs)
 
     def load_scan(self, path):
+        import pydicom
         p = Path(path)
         if p.is_file():
             slices = pydicom.dcmread(str(p), force=True)
@@ -393,6 +356,7 @@ class DicomProcessor:
         return binary_volume
 
     def largest_connected_component(self, binary_image):
+        import cv2
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_image, connectivity=8)
         largest_component_index = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
         largest_component_image = np.zeros(labels.shape, dtype=np.uint8)
@@ -404,6 +368,7 @@ class DicomProcessor:
         return processed_volume
 
     def dilate_volume(self, volume, kernel_size=KERNEL_SIZE):
+        import cv2
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         dilated_volume = cv2.dilate(volume.astype(np.uint8), kernel)
         return dilated_volume
@@ -469,6 +434,8 @@ class DicomProcessor:
 
     def save_new_dicom_files(self, original_dir, out_dir, replacer='face', id='New_ID', patient_id='0', new_patient_id='Processed for anonymization',
                              remove_text=False):
+        import cv2
+
         dicom_files = [f for f in os.listdir(original_dir) if self.is_dicom(os.path.join(original_dir, f))]
         errors = []
         try:
@@ -734,6 +701,7 @@ class DicomProcessor:
                         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
                     # Perform OCR on the image
+                    import easyocr
                     reader = easyocr.Reader(['en'])
                     results = reader.readtext(image)
 
