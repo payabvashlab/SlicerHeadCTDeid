@@ -5,8 +5,7 @@ Approximately 15% to 30% of CT scans performed annually in the United States are
 
 A critical step for medical image sharing is removal of Protected Health Information (PHI) and Personally Identifiable Information (PII) to safeguard patient privacy and comply with HIPAA regulations. In head CT scans, personal and medical information are included in the DICOM file metadata [3]. Additionally, some scans may contain burned-in text displaying PHI/PII directly on the image. Three-dimensional reconstructions of volumetric brain CTs can also reveal facial features that may compromise patient privacy [4]. 
 
-This 3D Slicer extension is designed to remove PHI from head CT DICOM metadata, detect and eliminate DICOM images with burned-in text, and strip superficial facial tissue at the air–skin interface to prevent facial feature recognition in 3D reconstructed head CTs. The module allows batch de-identification of multiple DICOM files to facilitate automated processing. In addition, the pipeline identifies axial head CT series and excludes non-head CT files or non-axial reconstructions to minimize file storage requirements. This project was in part supported by the American Heart Association (AHA) Stroke Image Sharing Consortium:
-
+This 3D Slicer extension is designed to remove PHI from head CT DICOM metadata, detect and eliminate DICOM images with burned-in text, and strip superficial facial tissue at the air–skin interface to prevent facial feature recognition in 3D reconstructed head CTs. This project was in part supported by the American Heart Association (AHA) Stroke Image Sharing Consortium:
 https://professional.heart.org/en/research-programs/aha-funding-opportunities/data-grant-stroke-images
 https://newsroom.heart.org/news/sharing-brain-images-can-foster-new-neuroscience-discoveries
 
@@ -32,9 +31,6 @@ Using the following steps, the application ensures that only axial head CT DICOM
 - Step 2: Remove PHI/PII from the DICOM file metadata by identifying the tags listed in the *DICOM header removal* PDF file (<a href="https://github.com/payabvashlab/SlicerDeid/blob/main/documents/dicomTags.pdf"> DICOM header removal.pdf </a>) and replacing them with the string “anonymous.” The patient name is replaced with “Processed for anonymization”.
 
 - Step 3: Blurring of facial features using morphology-based image processing [4]. We will identify the skin–air interface based on air-level (-1000) Hounsfield Unit attenuation in CT scan. Superficial subcutaneous fat tissue is then removed using a kernel size of 20 voxels to prevent facial feature recognition in 3D reconstructions of the scan.
-
-<img width="1716" alt="Screenshot 2025-04-22 at 11 14 46 PM" src="https://github.com/user-attachments/assets/eb12e577-2fb7-4c4e-89bb-ae7304953e28" />
-
 
 <h2>Installing the Slicer module</h2>
 
