@@ -4,11 +4,6 @@ import vtk
 import slicer
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
-from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
-
-dependencies = NonSlicerPythonDependencies()
-dependencies.setupPythonRequirements(upgrade=True)
-import pandas as pd
 from ctk import ctkFileDialog
 from datetime import datetime
 import time
@@ -16,22 +11,17 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 import sys
-import cv2
+import importlib
 from PIL import Image
-from pydicom.uid import generate_uid
 from collections import defaultdict
-from pydicom.datadict import keyword_for_tag
-import easyocr
 from PIL import Image, ImageDraw, ImageFont
+import numpy as np
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 
 AIR_THRESHOLD = -800
 KERNEL_SIZE = 35
 ERROR = ""
-import pydicom
-import numpy as np
-reader = easyocr.Reader(['en'])
 
 class HeadCTDeid(ScriptedLoadableModule):
     """Uses ScriptedLoadableModule base class, available at:
@@ -133,6 +123,15 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.infoDisplay(
                 "This tools is work in progress being validated in project. Contact sp4479@columbia.edu for more details. Use at your own risk.",
                 windowTitle="Warning")
+            import qt
+            try:
+                slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+                self.logic.setupPythonRequirements()
+                slicer.app.restoreOverrideCursor()
+            except Exception as e:
+                slicer.app.restoreOverrideCursor()
+                slicer.util.errorDisplay(f"Failed to install required packages.\n\n{e}")
+                return
             self.ui.progressBar.setValue(0)
             self.logic.process(
                 self.ui.inputFolderButton.directory,
@@ -167,6 +166,88 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         ScriptedLoadableModuleLogic.__init__(self)
         self.logger = logging.getLogger("PatientProcessor")
 
+    def _checkModuleInstalled(self, moduleName):
+      try:
+        importlib.import_module(moduleName)
+        return True
+      except ModuleNotFoundError:
+        return False
+
+    def setupPythonRequirements(self, upgrade=False):
+        def install(package):
+          #subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+          slicer.util.pip_install(package)
+        
+        logging.debug("Initializing pandas...")
+        try:
+            import pandas as pd
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("pandas")
+        
+        logging.debug("Initializing opencv-python...")
+        try:
+            import cv2
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("opencv-python")
+            
+        logging.debug("Initializing openpyxl...")
+        try:
+            import openpyxl
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("openpyxl")
+                
+        logging.debug("Initializing python-gdcm...")
+        packageName = "gdcm"
+        if not self._checkModuleInstalled(packageName):
+          logging.debug("python-gdcm package is required. Installing... (it may take several minutes)")
+          install('python-gdcm')
+          if not self._checkModuleInstalled(packageName):
+            raise ValueError("python-gdcm needs to be installed to use this module.")
+            
+        logging.debug("Initializing pylibjpeg...")
+        packageName = "pylibjpeg"
+        if not self._checkModuleInstalled(packageName):
+          logging.debug("pylibjpeg package is required. Installing... (it may take several minutes)")
+          install(packageName)
+          if not self._checkModuleInstalled(packageName):
+            raise ValueError("pylibjpeg needs to be installed to use this module.")
+            
+        logging.debug("Initializing pylibjpeg-libjpeg...")
+        packageName = "pylibjpeg-libjpeg"
+        if not self._checkModuleInstalled(packageName):
+          logging.debug("pylibjpeg-libjpeg package is required. Installing... (it may take several minutes)")
+          install(packageName)
+    
+        logging.debug("Initializing  pylibjpeg-openjpeg ...")
+        packageName = "pylibjpeg-openjpeg"
+        if not self._checkModuleInstalled(packageName):
+          logging.debug("pylibjpeg-openjpeg package is required. Installing... (it may take several minutes)")
+          install(packageName)
+    
+        logging.debug("Initializing pydicom ...")
+        try:
+            import pydicom
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("pydicom")
+        from pydicom.uid import generate_uid
+        from pydicom.datadict import keyword_for_tag
+
+        logging.debug("Initializing scikit-image ...")
+        packageName = "scikit-image"
+        if not self._checkModuleInstalled(packageName):
+          logging.debug("scikit-image package is required. Installing... (it may take several minutes)")
+          install(packageName)
+
+        logging.debug("Initializing easyocr ...")
+        packageName = "easyocr"
+        if not self._checkModuleInstalled(packageName):
+          logging.debug("easyocr package is required. Installing... (it may take several minutes)")
+          install(packageName)
+        import easyocr
+
+        self.dependenciesInstalled = True
+        logging.debug("Dependencies are set up successfully.")
+
     def setDefaultParameters(self, parameterNode):
         if not parameterNode.GetParameter("InputFolder"):
             parameterNode.SetParameter("InputFolder", "")
@@ -178,6 +259,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             parameterNode.SetParameter("Deidentify", "false")
 
     def process(self, inputFolder, excelFile, outputFolder, remove_text, progressBar):
+
         if not os.path.exists(inputFolder):
             raise ValueError(f"Input folder does not exist: {inputFolder}")
         if not os.path.exists(excelFile):
@@ -185,7 +267,8 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         if not os.path.exists(outputFolder):
             os.makedirs(outputFolder)
         columns_as_text = ['Accession_number', 'New_ID'] 
-        df = pd.read_excel(excelFile, dtype={col: str for col in columns_as_text})
+        import pandas
+        df = pandas.read_excel(excelFile, dtype={col: str for col in columns_as_text})
         if ("Accession_number" not in df.columns) or ("New_ID" not in df.columns):
             raise ValueError("Excel file must contain a 'Accession_number' and 'New_ID' column")
             return 0
@@ -651,6 +734,7 @@ class DicomProcessor:
                         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
                     # Perform OCR on the image
+                    reader = easyocr.Reader(['en'])
                     results = reader.readtext(image)
 
                     for (bbox, text, prob) in results:
