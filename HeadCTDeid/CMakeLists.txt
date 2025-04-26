@@ -1,25 +1,31 @@
-cmake_minimum_required(VERSION 3.16.3...3.19.7 FATAL_ERROR)
-
-project(SlicerHeadCTDeid)
+#-----------------------------------------------------------------------------
+set(MODULE_NAME HeadCTDeid)
 
 #-----------------------------------------------------------------------------
-# Extension meta-information
-set(EXTENSION_HOMEPAGE "https://github.com/payabvashlab/SlicerHeadCTDeid")
-set(EXTENSION_CONTRIBUTORS "Sam Payabvash (Columbia University)")
-set(EXTENSION_DESCRIPTION "Head CT DICOM De identification ")
-set(EXTENSION_ICONURL "https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/HeadCTDeid/Resources/Icons/HeadCTDeid.png")
-set(EXTENSION_SCREENSHOTURLS "https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/screenshot.png")
-set(EXTENSION_DEPENDS "NA") # Specified as a list or "NA" if no dependencies
+set(MODULE_PYTHON_SCRIPTS
+  ${MODULE_NAME}.py
+  )
+
+set(MODULE_PYTHON_RESOURCES
+  Resources/Icons/${MODULE_NAME}.png
+  Resources/UI/${MODULE_NAME}.ui
+  )
 
 #-----------------------------------------------------------------------------
-# Extension dependencies
-find_package(Slicer REQUIRED)
-include(${Slicer_USE_FILE})
+slicerMacroBuildScriptedModule(
+  NAME ${MODULE_NAME}
+  SCRIPTS ${MODULE_PYTHON_SCRIPTS}
+  RESOURCES ${MODULE_PYTHON_RESOURCES}
+  WITH_GENERIC_TESTS
+  )
 
 #-----------------------------------------------------------------------------
-# Extension modules
-## NEXT_MODULE
+if(BUILD_TESTING)
 
-#-----------------------------------------------------------------------------
-include(${Slicer_EXTENSION_GENERATE_CONFIG})
-include(${Slicer_EXTENSION_CPACK})
+  # Register the unittest subclass in the main script as a ctest.
+  # Note that the test will also be available at runtime.
+  slicer_add_python_unittest(SCRIPT ${MODULE_NAME}.py)
+
+  # Additional build-time testing
+  add_subdirectory(Testing)
+endif()

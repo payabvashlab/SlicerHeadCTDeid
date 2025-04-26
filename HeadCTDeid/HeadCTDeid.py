@@ -16,12 +16,6 @@ from PIL import Image
 from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
-from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
-dependencies = NonSlicerPythonDependencies()
-dependencies.setupPythonRequirements(upgrade=True)
-import pydicom
-from pydicom.uid import generate_uid
-from pydicom.datadict import keyword_for_tag
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 
@@ -185,15 +179,41 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
           slicer.util.pip_install(package)
         
         try:
-            import pandas as pd
+            import pandas
         except ModuleNotFoundError as e:
             slicer.util.pip_install("pandas")
         
         try:
             import cv2
         except ModuleNotFoundError as e:
-            slicer.util.pip_install("opencv-python")      
+            slicer.util.pip_install("opencv-python")
 
+               
+        packageName = "openpyxl"
+        if not self._checkModuleInstalled(packageName):
+          install(packageName)
+                
+        packageName = "gdcm"
+        if not self._checkModuleInstalled(packageName):
+          install('python-gdcm')
+            
+        packageName = "pylibjpeg"
+        if not self._checkModuleInstalled(packageName):
+          install(packageName)            
+   
+        packageName = "pylibjpeg-libjpeg"
+        if not self._checkModuleInstalled(packageName):
+          install(packageName)
+    
+    
+        packageName = "pylibjpeg-openjpeg"
+        if not self._checkModuleInstalled(packageName):
+          install(packageName)     
+
+        packageName = "pydicom"
+        if not self._checkModuleInstalled(packageName):
+          install(packageName)
+          
         packageName = "scikit-image"
         if not self._checkModuleInstalled(packageName):
           install(packageName)
@@ -435,6 +455,9 @@ class DicomProcessor:
     def save_new_dicom_files(self, original_dir, out_dir, replacer='face', id='New_ID', patient_id='0', new_patient_id='Processed for anonymization',
                              remove_text=False):
         import cv2
+        import pydicom
+        from pydicom.uid import generate_uid
+        from pydicom.datadict import keyword_for_tag
 
         dicom_files = [f for f in os.listdir(original_dir) if self.is_dicom(os.path.join(original_dir, f))]
         errors = []
