@@ -20,7 +20,9 @@ FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 
 AIR_THRESHOLD = -800
-KERNEL_SIZE = 35
+import random
+
+KERNEL_SIZE = random.randint(30, 40)
 ERROR = ""
 
 class HeadCTDeid(ScriptedLoadableModule):
