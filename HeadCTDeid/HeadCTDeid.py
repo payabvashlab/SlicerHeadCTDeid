@@ -691,7 +691,7 @@ class DicomProcessor:
 
                 binarized_volume = self.binarize_volume(pixels_hu)
                 processed_volume = self.get_largest_component_volume(binarized_volume)
-                dilated_volume = self.dilate_volume(processed_volume)
+                dilated_volume = self.dilate_volume(processed_volume, random.randint(30, 40))
 
                 if replacer == 'face':
                     unique_values_list = self.apply_mask_and_get_values(pixels_hu, dilated_volume - processed_volume)
