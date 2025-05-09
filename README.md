@@ -5,7 +5,7 @@ Approximately 15% to 30% of CT scans performed annually in the United States are
 
 A critical step for medical image sharing is removal of Protected Health Information (PHI) and Personally Identifiable Information (PII) to safeguard patient privacy and comply with HIPAA regulations. In head CT scans, personal and medical information are included in the DICOM file metadata [3]. Additionally, some scans may contain burned-in text displaying PHI/PII directly on the image. Three-dimensional reconstructions of volumetric brain CTs can also reveal facial features that may compromise patient privacy [4]. 
 
-This 3D Slicer extension is designed to remove PHI from head CT DICOM metadata, detect and eliminate DICOM images with burned-in text, and strip superficial facial tissue at the air–skin interface to prevent facial feature recognition in 3D reconstructed head CTs. This project was in part supported by the American Heart Association (AHA) Stroke Image Sharing Consortium:
+This 3D Slicer extension is designed to remove PHI from head CT DICOM metadata [5], detect and eliminate DICOM images with burned-in text, and strip superficial facial tissue at the air–skin interface to prevent facial feature recognition in 3D reconstructed head CTs. This project was in part supported by the American Heart Association (AHA) Stroke Image Sharing Consortium:
 https://professional.heart.org/en/research-programs/aha-funding-opportunities/data-grant-stroke-images
 https://newsroom.heart.org/news/sharing-brain-images-can-foster-new-neuroscience-discoveries
 
@@ -17,6 +17,7 @@ References:
 2.	Sheppard, J.P., et al., Risk of Brain Tumor Induction from Pediatric Head CT Procedures: A Systematic Literature Review. Brain Tumor Res Treat, 2018. 6(1): p. 1-7.
 3.	Clunie, D.A., et al., Report of the Medical Image De-Identification (MIDI) Task Group -- Best Practices and Recommendations. ArXiv, 2025.
 4.	Collins, S.A., J. Wu, and H.X. Bai, Facial De-identification of Head CT Scans. Radiology, 2020. 296(1): p. 22.
+5.	https://dicom.nema.org/medical/dicom/current/output/html/part15.html#chapter_E
 
 
 
@@ -30,7 +31,23 @@ Using the following steps, the application ensures that only axial head CT DICOM
 
 - Step 2: Remove PHI/PII from the DICOM file metadata by identifying the tags listed in the *DICOM header removal* PDF file (<a href="https://github.com/payabvashlab/SlicerDeid/blob/main/documents/dicomTags.pdf"> DICOM header removal.pdf </a>) and replacing them with the string “anonymous.” The patient name is replaced with “Processed for anonymization”.
 
-- Step 3: Blurring of facial features using morphology-based image processing [4]. We will identify the skin–air interface based on air-level (-1000) Hounsfield Unit attenuation in CT scan. Superficial subcutaneous fat tissue is then removed using a kernel size of 20 voxels to prevent facial feature recognition in 3D reconstructions of the scan.
+- Step 3: Blurring of facial features using morphology-based image processing [4]. We will identify the skin–air interface based on air-level (-1000) Hounsfield Unit attenuation in CT scan. Superficial subcutaneous fat tissue is then removed using a kernel size of 30 to 40 voxels to prevent facial feature recognition in 3D reconstructions of the scan. Of note, the kernel size randomly varies between 30 and 40 for each slice to minimize the risk of facial reconstruction by reversing the steps of our pipeline code.
+
+<h2>Capabilities and constrains:</h2>
+
+•	This tool allows automatic batch de-identification of head CTs. However, the DICOM files of individual patients should be saved in separate folders/directories.
+
+•	The list of DICOM tags containing PHI or PII that are removed by the tool are provided in dicomTags PDF in documents section. Please be aware that the patient’s sex, age (not DOB), race and ethnicity tags are retained. This was intentional to allow any future analysis of sex, age, race and ethnicity of de-identified scans ensuring diversity of subjects in future studies.
+
+•	This application will replace patient identifier (typically scan accession numbers) with new set of IDs that are provided in an excel sheet or csv file as an input.
+
+•	The program identifies, anonymize, and stores “axial” head CT DICOMs - removing any reconstructed series or additional scout or report files. This will reduce the need for storage of de-identified CTs and minimize the risk of including any patient identifier in accompanying files.
+
+•	The pipeline relies on accurate labeling of “modality” (0008,0060), “image type” (0008,0008), and “Study description” (0008,1030) in meta-data of DICOM files. If these tags are mislabeled during Head CT acquisition or removed during retrieval, the DICOM files will be excluded in de-identification process.
+
+•	The de-identification tool removes approximately 1 cm of superficial soft tissue from the skin–air interface. In rare cases of craniectomy without cranioplasty, where brain tissue lies less than one cm from the skin–air interface, a portion of the outer brain may be removed.
+
+•	The application also applies an OCR (Optical Character Recognition)–based text detection and removes any DICOM with imprinted text character.
 
 <h2>Installing the Slicer module</h2>
 
