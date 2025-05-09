@@ -19,6 +19,7 @@ References:
 4.	Collins, S.A., J. Wu, and H.X. Bai, Facial De-identification of Head CT Scans. Radiology, 2020. 296(1): p. 22.
 5.	https://dicom.nema.org/medical/dicom/current/output/html/part15.html#chapter_E
 
+<img width="1720" alt="face" src="https://github.com/user-attachments/assets/b20e91c6-8667-4af1-bc07-868b3e1dfcc9" />
 
 
 <h2>Axial head CT detection and de-identification algorithm:</h2>
@@ -55,7 +56,6 @@ Using the following steps, the application ensures that only axial head CT DICOM
 2.	Select "Add Python scripted modules to the application" in the popup window, and click OK.
 3.	Select which modules to add to load immediately and click Yes.
 4.	The selected modules will be immediately loaded, installed in all libraries, and made available under: Modules/Utilities/Head CT Deidentification.
-<img width="1163" alt="Screenshot 2025-04-17 at 4 03 01 PM" src="https://github.com/user-attachments/assets/bee37032-fbdb-4948-9cc3-7649f360a1b2" />
 
 
 <h2>Uninstalling the Slicer module</h2>
@@ -69,14 +69,19 @@ Using the following steps, the application ensures that only axial head CT DICOM
 
 The application requires three inputs: the address of folder that contains the DICOM files; the list folder names containing the head CT of each patient; direction of folder to save the de-identified files.
 
-<img width="403" alt="Screenshot 2025-04-17 at 3 15 01 PM" src="https://github.com/user-attachments/assets/f00bb003-e903-4a01-89b4-f33ee18385d0" />
+<img width="1181" alt="application" src="https://github.com/user-attachments/assets/cef0aa8a-ce82-497e-be21-193dc2b75dfd" />
 
 1.	<b>Input folder</b>: The input folder should directly contain individual patient folders that include corresponding DICOM files. The application treats each folder within the input folder address as one patient, using the folder name as the patient identifier, and processes and saves the corresponding DICOM files accordingly. Therefore, DICOM files from different patients must not be stored in the same folder. Each patient folder may contain subfolders or non-DICOM files; the application will preserve the subfolder structure and save the de-identified DICOM files using the same organizational hierarchy as the input.
-<img width="994" alt="Screenshot 2025-04-17 at 3 25 23 PM" src="https://github.com/user-attachments/assets/43e0a714-f95a-4694-964c-912e3a8cd503" />
+
+<img width="999" alt="input" src="https://github.com/user-attachments/assets/1002f1f2-ce5b-4ace-b649-5daa7fcf7249" />
 
 2.	<b>Excel File</b>: The Excel file should contain two columns with the following headers in the first row: <b>Accession_number</b> and <b>New_ID</b>. Each "accession number" must match a patient folder name in the input directory. The application will treat each "accession number" as a unique patient identifier, use it to locate and process the corresponding folder, and then rename the folder using the associated "New_ID" from the same row. Both "accession numbers" and "New_IDs" can be any combination of alphanumeric characters.
-<img width="196" alt="Screenshot 2025-04-17 at 3 43 10 PM" src="https://github.com/user-attachments/assets/d250e758-9a02-4c5f-80f1-5f52f4f4bb97" />
+
+<img width="455" alt="list" src="https://github.com/user-attachments/assets/2cd296e1-a77c-494d-aab0-5f527de5c3f7" />
 
 3.	<b>Output folde</b>r: The output folder specifies the directory where de-identified DICOM files will be saved. After de-identification, axial head CT DICOM files will be stored in a new set of folders, each renamed using the corresponding "New_ID" from the Excel file, replacing the original patient folder names. Additionally, the DICOM tag *Accession Number (0008,0050)* will be replaced by the "New_ID".
+
+<img width="772" alt="folder" src="https://github.com/user-attachments/assets/fece5d80-b899-4511-bb14-d7ffe77dc33f" />
+
 
 <b>Remove text inside dicom</b>: This feature examines for any burned-in text within the images and removes the corresponding DICOM files. While enabling this option will increase processing time, it is recommended for thorough de-identification of scans. 
