@@ -7,8 +7,8 @@ project(SlicerHeadCTDeid)
 set(EXTENSION_HOMEPAGE "https://github.com/payabvashlab/SlicerHeadCTDeid")
 set(EXTENSION_CONTRIBUTORS "Sam Payabvash (Columbia University)")
 set(EXTENSION_DESCRIPTION "Head CT DICOM De identification ")
-set(EXTENSION_ICONURL "https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/HeadCTDeid/Resources/Icons/HeadCTDeid.png")
-set(EXTENSION_SCREENSHOTURLS "https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/screenshot.png")
+set(EXTENSION_ICONURL "https://raw.githubusercontent.com/payabvashlab/SlicerHeadCTDeid/refs/heads/main/HeadCTDeid/Resources/Icons/HeadCTDeid.png")
+set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/payabvashlab/SlicerHeadCTDeid/refs/heads/main/screenshot.png")
 set(EXTENSION_DEPENDS "NA") # Specified as a list or "NA" if no dependencies
 
 #-----------------------------------------------------------------------------
