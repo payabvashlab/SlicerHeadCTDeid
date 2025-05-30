@@ -35,12 +35,12 @@ class HeadCTDeid(ScriptedLoadableModule):
         self.parent.title = "Head CT de-identification"  # Human-readable title
         self.parent.categories = ["Utilities"]
         self.parent.dependencies = []
-        self.parent.contributors = ["Columbia University"]
+        self.parent.contributors = ["Anh Tuan Tran, Sam Payabvash"]
         self.parent.helpText = """
 This module de-identifies DICOM files by removing patient information based on a given list of patients.
 """
         self.parent.acknowledgementText = """
-This file was developed by Sam, Columbia University.
+This file was developed by Anh Tuan Tran, Sam Payabvash (Columbia University).
 """
 
 
@@ -329,7 +329,7 @@ class DicomProcessor:
                     return False
             return True
         except Exception as e:
-                with open('C:/Users/at4049/Downloads/log.txt', 'a') as error_file:
+                with open('log.txt', 'a') as error_file:
                     error_file.write(f"Error: {e}\n")
                 return 0
                 return False
