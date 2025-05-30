@@ -5,7 +5,7 @@ project(SlicerHeadCTDeid)
 #-----------------------------------------------------------------------------
 # Extension meta-information
 set(EXTENSION_HOMEPAGE "https://github.com/payabvashlab/SlicerHeadCTDeid")
-set(EXTENSION_CONTRIBUTORS "Sam Payabvash (Columbia University)")
+set(EXTENSION_CONTRIBUTORS "Anh Tuan Tran, Sam Payabvash (Columbia University)")
 set(EXTENSION_DESCRIPTION "Head CT DICOM De identification ")
 set(EXTENSION_ICONURL "https://raw.githubusercontent.com/payabvashlab/SlicerHeadCTDeid/refs/heads/main/HeadCTDeid/Resources/Icons/HeadCTDeid.png")
 set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/payabvashlab/SlicerHeadCTDeid/refs/heads/main/screenshot.png")
