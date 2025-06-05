@@ -180,17 +180,15 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
           #subprocess.check_call([sys.executable, "-m", "pip", "install", package])
           slicer.util.pip_install(package)
         
-        try:
-            import pandas
-        except ModuleNotFoundError as e:
-            slicer.util.pip_install("pandas")
-        
+        packageName = "pandas"
+        if not self._checkModuleInstalled(packageName):
+          slicer.util.pip_install("pandas==2.2.3")
+          
         try:
             import cv2
         except ModuleNotFoundError as e:
             slicer.util.pip_install("opencv-python")
 
-               
         packageName = "openpyxl"
         if not self._checkModuleInstalled(packageName):
           install(packageName)
@@ -222,7 +220,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 
         packageName = "easyocr"
         if not self._checkModuleInstalled(packageName):
-          install(packageName)
+          slicer.util.pip_install(["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"])
 
         self.dependenciesInstalled = True
         logging.debug("Dependencies are set up successfully.")
@@ -448,7 +446,7 @@ class DicomProcessor:
             studyDes = list(map(lambda x: x.lower().replace(' ', ''), studyDes))
             check = ["head", "brain", "skull"]
             status3 = any(self.is_substring_in_list(c, studyDes) for c in check)
-
+            
             return int(status1 and status2 and status3)
         except Exception as e:
             self.error = str(e)
