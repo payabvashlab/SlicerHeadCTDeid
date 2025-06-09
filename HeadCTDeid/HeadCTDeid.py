@@ -332,14 +332,6 @@ class DicomProcessor:
                 return 0
                 return False
 
-    def is_dicom_nometa(self, file_path):
-        import pydicom
-        try:
-            ds = pydicom.dcmread(file_path, force=True)
-            ds.decompress()
-            return True
-        except Exception:
-            return False
 
     def list_dicom_directories(self, root_dir):
         dicom_dirs = set()
@@ -474,6 +466,7 @@ class DicomProcessor:
                     ds.decompress()
                 except Exception as e:
                     self.error = e
+                    continue
                 
                 ds.remove_private_tags()
                 if "OtherPatientIDs" in ds:
