@@ -147,8 +147,8 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onBrowseExcelFile(self):
         fileDialog = ctkFileDialog()
-        fileDialog.setWindowTitle("Select Excel File")
-        fileDialog.setNameFilters(["Excel Files (*.xlsx)", "All Files (*)"])
+        fileDialog.setWindowTitle("Select Excel/CSV File")
+        fileDialog.setNameFilters(["Excel Files (*.xlsx)", "CSV Files (*.csv)", "All Files (*)"])
         fileDialog.setFileMode(ctkFileDialog.ExistingFile)  # Ensure only existing files can be selected
         fileDialog.setOption(ctkFileDialog.DontUseNativeDialog, False)
 
@@ -180,15 +180,17 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
           #subprocess.check_call([sys.executable, "-m", "pip", "install", package])
           slicer.util.pip_install(package)
         
-        packageName = "pandas"
-        if not self._checkModuleInstalled(packageName):
-          slicer.util.pip_install("pandas==2.2.3")
-          
+        try:
+            import pandas
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("pandas==2.2.3")
+        
         try:
             import cv2
         except ModuleNotFoundError as e:
             slicer.util.pip_install("opencv-python")
 
+               
         packageName = "openpyxl"
         if not self._checkModuleInstalled(packageName):
           install(packageName)
@@ -240,12 +242,21 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         if not os.path.exists(inputFolder):
             raise ValueError(f"Input folder does not exist: {inputFolder}")
         if not os.path.exists(excelFile):
-            raise ValueError(f"Excel file does not exist: {excelFile}")
+            raise ValueError(f"Excel/CSV file does not exist: {excelFile}")
         if not os.path.exists(outputFolder):
             os.makedirs(outputFolder)
         columns_as_text = ['Accession_number', 'New_ID'] 
         import pandas
-        df = pandas.read_excel(excelFile, dtype={col: str for col in columns_as_text})
+        # Get file extension (lowercase)
+        ext = os.path.splitext(excelFile)[1].lower()
+        # Read the appropriate file type
+        if ext == '.csv':
+            df = pandas.read_csv(excelFile, dtype={col: str for col in columns_as_text})
+        elif ext in ['.xlsx', '.xls']:
+            df = pandas.read_excel(excelFile, dtype={col: str for col in columns_as_text})
+        else:
+            raise ValueError(f"Unsupported file type: {ext}")
+        
         if ("Accession_number" not in df.columns) or ("New_ID" not in df.columns):
             raise ValueError("Excel file must contain a 'Accession_number' and 'New_ID' column")
             return 0
@@ -332,6 +343,14 @@ class DicomProcessor:
                 return 0
                 return False
 
+    def is_dicom_nometa(self, file_path):
+        import pydicom
+        try:
+            ds = pydicom.dcmread(file_path, force=True)
+            ds.decompress()
+            return True
+        except Exception:
+            return False
 
     def list_dicom_directories(self, root_dir):
         dicom_dirs = set()
@@ -381,6 +400,7 @@ class DicomProcessor:
 
     def dilate_volume(self, volume, kernel_size=KERNEL_SIZE):
         import cv2
+        logging.getLogger("PatientProcessor").info(f"kernel_size {kernel_size}")
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         dilated_volume = cv2.dilate(volume.astype(np.uint8), kernel)
         return dilated_volume
@@ -438,7 +458,7 @@ class DicomProcessor:
             studyDes = list(map(lambda x: x.lower().replace(' ', ''), studyDes))
             check = ["head", "brain", "skull"]
             status3 = any(self.is_substring_in_list(c, studyDes) for c in check)
-            
+
             return int(status1 and status2 and status3)
         except Exception as e:
             self.error = str(e)
@@ -466,7 +486,6 @@ class DicomProcessor:
                     ds.decompress()
                 except Exception as e:
                     self.error = e
-                    continue
                 
                 ds.remove_private_tags()
                 if "OtherPatientIDs" in ds:
@@ -698,33 +717,36 @@ class DicomProcessor:
                 new_volume = self.apply_random_values_optimized(pixels_hu, dilated_volume, unique_values_list)
                 if remove_text == True:
                     #draw text
-                    min_val = np.min(pixels_hu)
-                    max_val = np.max(pixels_hu)
-                    pixels_hu_255 = np.uint8(((pixels_hu - min_val) / (max_val - min_val)) * 255.0)
-
-                    image = Image.fromarray(pixels_hu_255)
-                    """draw = ImageDraw.Draw(image)
                     try:
-                        font = ImageFont.truetype("arial.ttf", 20)
-                    except IOError:
-                        font = ImageFont.load_default()
-                    draw.text((100, 100), "Patient: Nguyen Van A", fill="white", font=font)
-                    draw.text((150, 200), "DB:01/01/2000", fill="white", font=font)
-                    draw.text((200, 300), "Address= USA", fill="white", font=font)"""
-                    image = np.array(image)
-                    
-                    if len(pixels_hu_255.shape) == 2:  # Grayscale
-                        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                        min_val = np.min(pixels_hu)
+                        max_val = np.max(pixels_hu)
+                        pixels_hu_255 = np.uint8(((pixels_hu - min_val) / (max_val - min_val)) * 255.0)
 
-                    # Perform OCR on the image
-                    import easyocr
-                    reader = easyocr.Reader(['en'])
-                    results = reader.readtext(image)
+                        image = Image.fromarray(pixels_hu_255)
+                        """draw = ImageDraw.Draw(image)
+                        try:
+                            font = ImageFont.truetype("arial.ttf", 20)
+                        except IOError:
+                            font = ImageFont.load_default()
+                        draw.text((100, 100), "Patient: Nguyen Van A", fill="white", font=font)
+                        draw.text((150, 200), "DB:01/01/2000", fill="white", font=font)
+                        draw.text((200, 300), "Address= USA", fill="white", font=font)"""
+                        image = np.array(image)
+                        
+                        if len(pixels_hu_255.shape) == 2:  # Grayscale
+                            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
-                    for (bbox, text, prob) in results:
-                        if prob > 0.8:  # Confidence threshold
-                            (top_left, bottom_right) = (tuple(map(int, bbox[0])), tuple(map(int, bbox[2])))
-                            cv2.rectangle(new_volume, top_left, bottom_right, (0, 0, 0), thickness=cv2.FILLED)  # Black out
+                        # Perform OCR on the image
+                        import easyocr
+                        reader = easyocr.Reader(['en'])
+                        results = reader.readtext(image)
+
+                        for (bbox, text, prob) in results:
+                            if prob > 0.8:  # Confidence threshold
+                                (top_left, bottom_right) = (tuple(map(int, bbox[0])), tuple(map(int, bbox[2])))
+                                cv2.rectangle(new_volume, top_left, bottom_right, (0, 0, 0), thickness=cv2.FILLED)  # Black out
+                    except Exception as e:
+                        errors.append((dicom_file, str(e)))
                 new_slice = (new_volume - ds.RescaleIntercept) / ds.RescaleSlope
                 ds.PixelData = new_slice.astype(np.int16).tobytes()
                 ds.BitsAllocated = 16
