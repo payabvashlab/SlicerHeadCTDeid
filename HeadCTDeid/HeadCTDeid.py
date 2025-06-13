@@ -400,7 +400,6 @@ class DicomProcessor:
 
     def dilate_volume(self, volume, kernel_size=KERNEL_SIZE):
         import cv2
-        logging.getLogger("PatientProcessor").info(f"kernel_size {kernel_size}")
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         dilated_volume = cv2.dilate(volume.astype(np.uint8), kernel)
         return dilated_volume
