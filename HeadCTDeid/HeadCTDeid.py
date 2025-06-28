@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 import vtk
 import slicer
 from slicer.ScriptedLoadableModule import *
@@ -16,6 +17,9 @@ from PIL import Image
 from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+import gc
+import warnings
+warnings.filterwarnings('ignore')
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 
@@ -279,22 +283,29 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_path = os.path.join(outputFolder, f'Processed for anonymization_{current_time}')
             os.makedirs(out_path, exist_ok=True)
-
+            total_time = 0
+            number_successul = 0
             for i, foldername in enumerate(dicom_folders):
                 if (foldername in id_mapping):
                     dst_folder = ""
                     try:
+                        start_time = time.time()
                         dst_folder = os.path.join(out_path, id_mapping[foldername])
                         processor = DicomProcessor()
                         src_folder = os.path.join(inputFolder, foldername)
                         result = processor.drown_volume(src_folder, dst_folder, 'face', id_mapping[foldername], f"Processed for anonymization {id_mapping[foldername]}", remove_text)
-                        progressBar.setValue(int((i + 1)* 100/ total_rows)) 
+                        progressBar.setValue(int((i + 1)* 100/ total_rows))
                         slicer.util.showStatusMessage(f"Finished processing foldername {foldername}")
                         self.logger.info(f"Finished processing folder: {foldername}")
+                        elapsed = time.time() - start_time
+                        total_time += elapsed
+                        number_successul = number_successul + 1
                     except Exception as e:
                         self.logger.error(f"Error processing folder {foldername}: {str(e)}")
                         if os.path.exists(dst_folder):
                             shutil.rmtree(dst_folder)
+            average_time = total_time*1.0 /number_successul
+            self.logger.info(f"Time processing each folder: {average_time}")
             try:
                 folder_list_2 = df['Accession_number'].tolist()  # Convert to string (in case of numbers)
                 actual_folders = dicom_folders  # Get folder names in directory
@@ -456,15 +467,14 @@ class DicomProcessor:
             studyDes = [studyDes] if isinstance(studyDes, str) else studyDes
             studyDes = list(map(lambda x: x.lower().replace(' ', ''), studyDes))
             check = ["head", "brain", "skull"]
-            status3 = any(self.is_substring_in_list(c, studyDes) for c in check)
+            status3 = 1#any(self.is_substring_in_list(c, studyDes) for c in check)
 
             return int(status1 and status2 and status3)
         except Exception as e:
             self.error = str(e)
         return 0
 
-    def save_new_dicom_files(self, original_dir, out_dir, replacer='face', id='New_ID', patient_id='0', new_patient_id='Processed for anonymization',
-                             remove_text=False):
+    def save_new_dicom_files(self, original_dir, out_dir, replacer='face', id='New_ID', patient_id='0', new_patient_id='Processed for anonymization', remove_text=False):
         import cv2
         import pydicom
         from pydicom.uid import generate_uid
@@ -635,9 +645,9 @@ class DicomProcessor:
                                 # Generate new UID
                                 ds[tag].value = generate_uid()
                             else:
-                                ds[tag].value = ANONYMOUS
+                                ds[tag].value = '0.0.0'
                         except Exception as e:
-                             ds[tag].value = 0
+                             ds[tag].value = '0.0.0'
 
                 # Patient's Birth Date
                 if (0x10, 0x30) in ds:
@@ -744,6 +754,7 @@ class DicomProcessor:
                             if prob > 0.8:  # Confidence threshold
                                 (top_left, bottom_right) = (tuple(map(int, bbox[0])), tuple(map(int, bbox[2])))
                                 cv2.rectangle(new_volume, top_left, bottom_right, (0, 0, 0), thickness=cv2.FILLED)  # Black out
+                        del reader, results
                     except Exception as e:
                         errors.append((dicom_file, str(e)))
                 new_slice = (new_volume - ds.RescaleIntercept) / ds.RescaleSlope
@@ -755,6 +766,7 @@ class DicomProcessor:
                 new_file_name = f"{id}_{i:05d}.dcm"
                 final_file_path = os.path.join(out_dir, new_file_name)
                 ds.save_as(final_file_path, write_like_original=False)
+                del ds, pixels_hu, new_volume
             except Exception as e:
                 errors.append((dicom_file, str(e)))
 
@@ -776,6 +788,7 @@ class DicomProcessor:
                 if dicom_files:
                     os.makedirs(out_dir, exist_ok=True)
                     error = self.save_new_dicom_files(root, out_dir, replacer, id, patient_id, 'Processed for anonymization', remove_text)
+                    gc.collect()
         except Exception as e:
             with open(os.path.join(out_dir, 'log.txt'), 'a') as error_file:
                 error_file.write(f"Error: {e}\n")
