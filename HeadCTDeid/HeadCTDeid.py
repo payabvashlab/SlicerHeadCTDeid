@@ -352,7 +352,7 @@ class DicomProcessor:
                 with open('log.txt', 'a') as error_file:
                     error_file.write(f"Error: {e}\n")
                 return 0
-                return False
+        return False
 
     def is_dicom_nometa(self, file_path):
         import pydicom
