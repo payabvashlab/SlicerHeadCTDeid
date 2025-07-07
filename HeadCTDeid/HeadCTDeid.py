@@ -226,7 +226,8 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 
         packageName = "easyocr"
         if not self._checkModuleInstalled(packageName):
-          slicer.util.pip_install(["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"])
+            slicer.util.pip_install('numpy<2')
+            slicer.util.pip_install(["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"])
 
         self.dependenciesInstalled = True
         logging.debug("Dependencies are set up successfully.")
