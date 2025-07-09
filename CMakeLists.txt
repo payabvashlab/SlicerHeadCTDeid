@@ -20,6 +20,7 @@ include(${Slicer_USE_FILE})
 #-----------------------------------------------------------------------------
 # Extension modules,
 add_subdirectory(HeadCTDeid)
+add_subdirectory(HeadCTDeid/HeadCTDeidLib)
 ## NEXT_MODULE
 
 #-----------------------------------------------------------------------------

@@ -6,6 +6,9 @@ import slicer
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 from ctk import ctkFileDialog
+from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
+dependencies = NonSlicerPythonDependencies()
+dependencies.setupPythonRequirements(upgrade=True)
 from datetime import datetime
 import time
 import shutil
@@ -193,40 +196,14 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             import cv2
         except ModuleNotFoundError as e:
             slicer.util.pip_install("opencv-python")
-
-               
-        packageName = "openpyxl"
-        if not self._checkModuleInstalled(packageName):
-          install(packageName)
-                
-        packageName = "gdcm"
-        if not self._checkModuleInstalled(packageName):
-          install('python-gdcm')
-            
-        packageName = "pylibjpeg"
-        if not self._checkModuleInstalled(packageName):
-          install(packageName)            
-   
-        packageName = "pylibjpeg-libjpeg"
-        if not self._checkModuleInstalled(packageName):
-          install(packageName)
-    
-    
-        packageName = "pylibjpeg-openjpeg"
-        if not self._checkModuleInstalled(packageName):
-          install(packageName)     
-
-        packageName = "pydicom"
-        if not self._checkModuleInstalled(packageName):
-          install(packageName)
           
         packageName = "scikit-image"
         if not self._checkModuleInstalled(packageName):
           install(packageName)
 
         packageName = "easyocr"
+        slicer.util.pip_install('numpy<2')
         if not self._checkModuleInstalled(packageName):
-            slicer.util.pip_install('numpy<2')
             slicer.util.pip_install(["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"])
 
         self.dependenciesInstalled = True
