@@ -202,7 +202,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
           install(packageName)
 
         packageName = "easyocr"
-        slicer.util.pip_install('numpy<2')
         if not self._checkModuleInstalled(packageName):
             slicer.util.pip_install(["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"])
 
