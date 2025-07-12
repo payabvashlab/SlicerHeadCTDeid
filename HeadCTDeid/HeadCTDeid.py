@@ -9,6 +9,8 @@ from ctk import ctkFileDialog
 from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
 dependencies = NonSlicerPythonDependencies()
 dependencies.setupPythonRequirements(upgrade=True)
+import site
+site.main()  # Refresh sys.path and .pth files
 from datetime import datetime
 import time
 import shutil
