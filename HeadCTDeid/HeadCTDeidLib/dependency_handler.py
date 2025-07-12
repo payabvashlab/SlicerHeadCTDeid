@@ -29,56 +29,21 @@ class NonSlicerPythonDependencies(DependenciesBase):
         return False
 
     def setupPythonRequirements(self, upgrade=False):
-        def install(package):
-          #subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-          slicer.util.pip_install(package)
-        
-        logging.debug("Initializing openpyxl...")
-        packageName = "openpyxl"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("openpyxl package is required. Installing... (it may take several minutes)")
-          install(packageName)
-          if not self._checkModuleInstalled(packageName):
-            raise ValueError("openpyxl needs to be installed to use this module.")
-        else:  
-            from packaging import version
-            import openpyxl
+
+        def install_gdcm_and_restart_if_needed():
+            try:
+                import gdcm
+            except ModuleNotFoundError as e:
+                slicer.util.pip_install("python-gdcm")
+                ok = slicer.util.confirmOkCancelDisplay("To support full encoding DICOM.\nSlicer needs to restart to complete the setup.", windowTitle="Restart Required")
+                if ok:
+                    restart_slicer()
                 
-        logging.debug("Initializing python-gdcm...")
-        packageName = "gdcm"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("python-gdcm package is required. Installing... (it may take several minutes)")
-          install('python-gdcm')
-          if not self._checkModuleInstalled(packageName):
-            raise ValueError("python-gdcm needs to be installed to use this module.")
-            
-        logging.debug("Initializing pylibjpeg...")
-        packageName = "pylibjpeg"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("pylibjpeg package is required. Installing... (it may take several minutes)")
-          install(packageName)
-          if not self._checkModuleInstalled(packageName):
-            raise ValueError("pylibjpeg needs to be installed to use this module.")
-            
-   
-        logging.debug("Initializing pylibjpeg-libjpeg...")
-        packageName = "pylibjpeg-libjpeg"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("pylibjpeg-libjpeg package is required. Installing... (it may take several minutes)")
-          install(packageName)
-    
-    
-        logging.debug("Initializing  pylibjpeg-openjpeg ...")
-        packageName = "pylibjpeg-openjpeg"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("pylibjpeg-openjpeg package is required. Installing... (it may take several minutes)")
-          install(packageName)
-    
-    
-        logging.debug("Initializing pydicom ...")
-        packageName = "pydicom"
-        if not self._checkModuleInstalled(packageName):
-          logging.debug("pydicom package is required. Installing... (it may take several minutes)")
-          install(packageName)
-          if not self._checkModuleInstalled(packageName):
-            raise ValueError("pydicom needs to be installed to use this module.")
+        def restart_slicer():
+            slicerExecutable = slicer.app.applicationFilePath()
+            slicerHome = slicer.app.slicerHome
+            subprocess.Popen([slicerExecutable], cwd=slicerHome)
+            slicer.util.quit()
+                       
+        install_gdcm_and_restart_if_needed()
+        logging.debug("Done")
