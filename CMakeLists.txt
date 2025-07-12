@@ -21,7 +21,14 @@ include(${Slicer_USE_FILE})
 # Extension modules,
 add_subdirectory(HeadCTDeid)
 ## NEXT_MODULE
-
+execute_process(
+  COMMAND ${Slicer_PYTHON_EXECUTABLE} -m pip install
+          pydicom
+          pylibjpeg
+          pylibjpeg-libjpeg
+          pylibjpeg-openjpeg
+          python-gdcm
+)
 #-----------------------------------------------------------------------------
 include(${Slicer_EXTENSION_GENERATE_CONFIG})
 include(${Slicer_EXTENSION_CPACK})
