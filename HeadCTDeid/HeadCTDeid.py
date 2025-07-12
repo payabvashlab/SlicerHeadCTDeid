@@ -193,7 +193,26 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             import pandas
         except ModuleNotFoundError as e:
             slicer.util.pip_install("pandas==2.2.3")
-        
+        try:
+            import openpyxl
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("openpyxl")
+        try:
+            import pydicom
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("pydicom")
+        try:
+            import pydicom
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("pylibjpeg")
+        try:
+            import pydicom
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("pylibjpeg-libjpeg")
+        try:
+            import pydicom
+        except ModuleNotFoundError as e:
+            slicer.util.pip_install("pylibjpeg-openjpeg")            
         try:
             import cv2
         except ModuleNotFoundError as e:
@@ -209,6 +228,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 
         self.dependenciesInstalled = True
         logging.debug("Dependencies are set up successfully.")
+
 
     def setDefaultParameters(self, parameterNode):
         if not parameterNode.GetParameter("InputFolder"):
