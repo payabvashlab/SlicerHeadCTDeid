@@ -201,18 +201,10 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             import pydicom
         except ModuleNotFoundError as e:
             slicer.util.pip_install("pydicom")
-        try:
-            import pydicom
-        except ModuleNotFoundError as e:
             slicer.util.pip_install("pylibjpeg")
-        try:
-            import pydicom
-        except ModuleNotFoundError as e:
             slicer.util.pip_install("pylibjpeg-libjpeg")
-        try:
-            import pydicom
-        except ModuleNotFoundError as e:
-            slicer.util.pip_install("pylibjpeg-openjpeg")            
+            slicer.util.pip_install("pylibjpeg-openjpeg")
+        
         try:
             import cv2
         except ModuleNotFoundError as e:
