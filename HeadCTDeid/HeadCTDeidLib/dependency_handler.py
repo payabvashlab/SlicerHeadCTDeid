@@ -6,7 +6,6 @@ import slicer
 
 from abc import ABC, abstractmethod
 
-
 class DependenciesBase(ABC):
 
     minimumTorchVersion = "1.12"
