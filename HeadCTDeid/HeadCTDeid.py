@@ -458,7 +458,7 @@ class DicomProcessor:
             studyDes = [studyDes] if isinstance(studyDes, str) else studyDes
             studyDes = list(map(lambda x: x.lower().replace(' ', ''), studyDes))
             check = ["head", "brain", "skull"]
-            status3 = 1#any(self.is_substring_in_list(c, studyDes) for c in check)
+            status3 = any(self.is_substring_in_list(c, studyDes) for c in check)
 
             return int(status1 and status2 and status3)
         except Exception as e:
