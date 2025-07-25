@@ -6,8 +6,6 @@ import slicer
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 from ctk import ctkFileDialog
-import site
-site.main()  # Refresh sys.path and .pth files
 from datetime import datetime
 import time
 import shutil
