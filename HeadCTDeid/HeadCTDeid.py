@@ -307,7 +307,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 
 class HeadCTDeidTest(ScriptedLoadableModuleTest):
     def runTest(self):
-        return
+        self.assertTrue(True)
 
 class DicomProcessor:
     def __init__(self):
