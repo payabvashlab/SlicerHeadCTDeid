@@ -306,16 +306,8 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                 self.logger.error(f"Error processing folder {foldername}: {str(e)}")
 
 class HeadCTDeidTest(ScriptedLoadableModuleTest):
-    def setUp(self):
-        slicer.mrmlScene.Clear()
-
     def runTest(self):
-        self.setUp()
-        self.test_HeadCTDeid1()
-
-    def test_HeadCTDeid1(self):
-        self.delayDisplay("Do not take the test")
-
+        return
 
 class DicomProcessor:
     def __init__(self):
