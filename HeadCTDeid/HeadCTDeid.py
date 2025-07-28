@@ -214,7 +214,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 
         packageName = "easyocr"
         if not self._checkModuleInstalled(packageName):
-            slicer.util.pip_install(["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"])
+            slicer.util.pip_install(packageName)
 
         self.dependenciesInstalled = True
         logging.debug("Dependencies are set up successfully.")
@@ -282,7 +282,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                         dst_folder = os.path.join(out_path, id_mapping[foldername])
                         processor = DicomProcessor()
                         src_folder = os.path.join(inputFolder, foldername)
-                        result = processor.drown_volume(src_folder, dst_folder, 'face', id_mapping[foldername], f"Processed for anonymization {id_mapping[foldername]}", remove_text)
+                        result = processor.drown_volume(src_folder, dst_folder, 'face', id_mapping[foldername], f"anonymous", f"Processed for anonymization {id_mapping[foldername]}", remove_text)
                         progressBar.setValue(int((i + 1)* 100/ total_rows))
                         slicer.util.showStatusMessage(f"Finished processing foldername {foldername}")
                         self.logger.info(f"Finished processing folder: {foldername}")
