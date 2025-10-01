@@ -36,7 +36,7 @@ class HeadCTDeid(ScriptedLoadableModule):
 
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = "Head CT de-identification"  # Human-readable title
+        self.parent.title = "Head CT de-identification for AHA"  # Human-readable title
         self.parent.categories = ["Utilities"]
         self.parent.dependencies = []
         self.parent.contributors = ["Anh Tuan Tran, Sam Payabvash"]
@@ -74,6 +74,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.deidentifyCheckbox.connect('toggled(bool)', self.updateParameterNodeFromGUI)  # Handle checkbox state
 
         self.initializeParameterNode()
+        
         from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
         dependencies = NonSlicerPythonDependencies()
         dependencies.setupPythonRequirements(upgrade=True)
@@ -191,6 +192,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             import pandas
         except ModuleNotFoundError as e:
             slicer.util.pip_install("pandas==2.2.3")
+
         try:
             import openpyxl
         except ModuleNotFoundError as e:
@@ -202,7 +204,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             slicer.util.pip_install("pylibjpeg")
             slicer.util.pip_install("pylibjpeg-libjpeg")
             slicer.util.pip_install("pylibjpeg-openjpeg")
-        
+            
         try:
             import cv2
         except ModuleNotFoundError as e:
@@ -214,11 +216,10 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 
         packageName = "easyocr"
         if not self._checkModuleInstalled(packageName):
-            slicer.util.pip_install(packageName)
+            slicer.util.pip_install(["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"])
 
         self.dependenciesInstalled = True
         logging.debug("Dependencies are set up successfully.")
-
 
     def setDefaultParameters(self, parameterNode):
         if not parameterNode.GetParameter("InputFolder"):
@@ -238,7 +239,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             raise ValueError(f"Excel/CSV file does not exist: {excelFile}")
         if not os.path.exists(outputFolder):
             os.makedirs(outputFolder)
-        columns_as_text = ['Accession_number', 'New_ID'] 
+        columns_as_text = ['Accession_number', 'GWTG_ID'] 
         import pandas
         # Get file extension (lowercase)
         ext = os.path.splitext(excelFile)[1].lower()
@@ -250,8 +251,8 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         else:
             raise ValueError(f"Unsupported file type: {ext}")
         
-        if ("Accession_number" not in df.columns) or ("New_ID" not in df.columns):
-            raise ValueError("Excel file must contain a 'Accession_number' and 'New_ID' column")
+        if ("Accession_number" not in df.columns) or ("GWTG_ID" not in df.columns):
+            raise ValueError("Excel file must contain a 'Accession_number' and 'GWTG_ID' column")
             return 0
         else:
             try:
@@ -265,12 +266,12 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             except Exception as e:
                 self.logger.info(e)
             df['Accession_number'] = df['Accession_number'].astype(str).str.strip()
-            df['New_ID'] = df['New_ID'].astype(str).str.strip()
-            id_mapping = dict(zip(df['Accession_number'], df['New_ID']))
+            df['GWTG_ID'] = df['GWTG_ID'].astype(str).str.strip()
+            id_mapping = dict(zip(df['Accession_number'], df['GWTG_ID']))
             dicom_folders = [d for d in os.listdir(inputFolder) if os.path.isdir(os.path.join(inputFolder, d))]
             total_rows = df.shape[0]
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = os.path.join(outputFolder, f'Processed for anonymization_{current_time}')
+            out_path = os.path.join(outputFolder, f'Processed for AHA_{current_time}')
             os.makedirs(out_path, exist_ok=True)
             total_time = 0
             number_successul = 0
@@ -282,7 +283,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                         dst_folder = os.path.join(out_path, id_mapping[foldername])
                         processor = DicomProcessor()
                         src_folder = os.path.join(inputFolder, foldername)
-                        result = processor.drown_volume(src_folder, dst_folder, 'face', id_mapping[foldername], f"anonymous", f"Processed for anonymization {id_mapping[foldername]}", remove_text)
+                        result = processor.drown_volume(src_folder, dst_folder, 'face', id_mapping[foldername], f"Processed for AHA {id_mapping[foldername]}", remove_text)
                         progressBar.setValue(int((i + 1)* 100/ total_rows))
                         slicer.util.showStatusMessage(f"Finished processing foldername {foldername}")
                         self.logger.info(f"Finished processing folder: {foldername}")
@@ -306,8 +307,16 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                 self.logger.error(f"Error processing folder {foldername}: {str(e)}")
 
 class HeadCTDeidTest(ScriptedLoadableModuleTest):
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+
     def runTest(self):
-        return
+        self.setUp()
+        self.test_HeadCTDeid1()
+
+    def test_HeadCTDeid1(self):
+        self.delayDisplay("Do not take the test")
+
 
 class DicomProcessor:
     def __init__(self):
@@ -448,14 +457,19 @@ class DicomProcessor:
             studyDes = [studyDes] if isinstance(studyDes, str) else studyDes
             studyDes = list(map(lambda x: x.lower().replace(' ', ''), studyDes))
             check = ["head", "brain", "skull"]
+            exclude = ["angio", "cta", "perfusion"]
+            # First check if any include keyword is present
             status3 = any(self.is_substring_in_list(c, studyDes) for c in check)
+            # Exclude if "angio" or "cta" present
+            if any(self.is_substring_in_list(e, studyDes) for e in exclude):
+            	status3 = False
 
             return int(status1 and status2 and status3)
         except Exception as e:
             self.error = str(e)
         return 0
 
-    def save_new_dicom_files(self, original_dir, out_dir, replacer='face', id='New_ID', patient_id='0', new_patient_id='Processed for anonymization', remove_text=False):
+    def save_new_dicom_files(self, original_dir, out_dir, replacer='face', id='GWTG_ID', patient_id='0', new_patient_id='Processed for anonymization', remove_text=False):
         import cv2
         import pydicom
         from pydicom.uid import generate_uid
@@ -500,9 +514,9 @@ class DicomProcessor:
                     ds[0x10, 0x20].value = ANONYMOUS    
                 # Patient's Name           
                 if (0x10, 0x10) not in ds:
-                    ds.add_new((0x10, 0x10), 'PN', "Processed for anonymization")
+                    ds.add_new((0x10, 0x10), 'PN', 'Processed for anonymization')
                 else:
-                    ds[0x10, 0x10].value = "Processed for anonymization"
+                    ds[0x10, 0x10].value = 'Processed for anonymization'
                 # requirement tag
                 requirement_tags = [(0x10, 0x1000),  # Other Patient IDs
                                  (0x10, 0x1001),  # Other Patient Names
@@ -758,7 +772,7 @@ class DicomProcessor:
 
         return errors
 
-    def drown_volume(self, in_path, out_path, replacer='face', id='New_ID', patient_id='0', name='Processed for anonymization',
+    def drown_volume(self, in_path, out_path, replacer='face', id='GWTG_ID', patient_id='0', name='Processed for anonymization',
                      remove_text=False):
         try:
             error=""
