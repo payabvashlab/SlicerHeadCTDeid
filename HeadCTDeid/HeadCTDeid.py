@@ -278,7 +278,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         dicom_folders = [d for d in os.listdir(inputFolder) if os.path.isdir(os.path.join(inputFolder, d))]
         total_rows = max(1, df.shape[0])  # avoid div by zero in progress
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(outputFolder, f'Processed for AHA_{current_time}')
+        out_path = os.path.join(outputFolder, f'Processed for Anonymization_{current_time}')
         os.makedirs(out_path, exist_ok=True)
 
         total_time = 0.0
@@ -294,7 +294,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     src_folder = os.path.join(inputFolder, foldername)
                     result = processor.drown_volume(
                         src_folder, dst_folder, 'face', id_mapping[foldername],
-                        patient_id='0', name=f"Processed for AHA {id_mapping[foldername]}",
+                        patient_id='0', name=f"Processed for Anonymization {id_mapping[foldername]}",
                         remove_text=remove_text, remove_CTA=remove_CTA
                     )
                     progressBar.setValue(int((i + 1) * 100 / total_rows))
