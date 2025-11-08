@@ -351,16 +351,16 @@ class DicomProcessor:
         self.series_uid_map = defaultdict(str)
         self.sop_uid_map = defaultdict(str)
 
-    def is_dicom(self, file_path):
+    def is_dicom(self, file_path, remove_CTA):
         import pydicom
         try:
             ds = pydicom.dcmread(file_path, force=True)
             try:
                 ds.decompress()
-                if self.checkCTmeta(ds) == 0:
+                if self.checkCTmeta(ds, remove_CTA) == 0:
                     return False
             except Exception:
-                if self.checkCTmeta(ds) == 0:
+                if self.checkCTmeta(ds, remove_CTA) == 0:
                     return False
             return True
         except Exception as e:
@@ -380,12 +380,12 @@ class DicomProcessor:
         except Exception:
             return False
 
-    def list_dicom_directories(self, root_dir):
+    def list_dicom_directories(self, root_dir, remove_CTA=False):
         dicom_dirs = set()
         for root, dirs, files in os.walk(root_dir):
             for file in files:
                 file_path = os.path.join(root, file)
-                if self.is_dicom(file_path):
+                if self.is_dicom(file_path, remove_CTA):
                     dicom_dirs.add(root)
                     break
         return list(dicom_dirs)
@@ -454,7 +454,7 @@ class DicomProcessor:
     def is_substring_in_list(self, substring, string_list):
         return any(substring in string for string in string_list)
 
-    def checkCTmeta(self, ds):
+    def checkCTmeta(self, ds, remove_CTA):
         try:
             modality = ""
             if (0x08, 0x60) in ds:
@@ -484,22 +484,24 @@ class DicomProcessor:
             include = ["head", "brain", "skull"]
             exclude = ["angio", "cta", "perfusion"]
             status3 = any(self.is_substring_in_list(c, studyDes) for c in include)
-            if any(self.is_substring_in_list(e, studyDes) for e in exclude):
-                status3 = False
+            status4 = True
+            if remove_CTA==False:
+            	if any(self.is_substring_in_list(e, studyDes) for e in exclude):
+                	status4 = False
 
-            return int(status1 and status2 and status3)
+            return int(status1 and status2 and status3 and status4)
         except Exception as e:
             self.error = str(e)
         return 0
 
     def save_new_dicom_files(self, original_dir, out_dir, replacer='face', id='new_folder_name',
-                             patient_id='0', new_patient_id='Processed for anonymization', remove_text=False):
+                             patient_id='0', new_patient_id='Processed for anonymization', remove_text=False, remove_CTA=False):
         import cv2
         import pydicom
         from pydicom.uid import generate_uid
         from pydicom.datadict import keyword_for_tag
 
-        dicom_files = [f for f in os.listdir(original_dir) if self.is_dicom(os.path.join(original_dir, f))]
+        dicom_files = [f for f in os.listdir(original_dir) if self.is_dicom(os.path.join(original_dir, f), remove_CTA)]
         errors = []
         try:
             dicom_files.sort(
@@ -692,7 +694,7 @@ class DicomProcessor:
             for root, dirs, files in os.walk(in_path):
                 rel = os.path.relpath(root, in_path)
                 out_dir = os.path.join(out_path, rel)
-                dicom_files = [f for f in files if self.is_dicom(os.path.join(root, f))]
+                dicom_files = [f for f in files if self.is_dicom(os.path.join(root, f), remove_CTA)]
                 if dicom_files:
                     os.makedirs(out_dir, exist_ok=True)
                     _ = self.save_new_dicom_files(
@@ -702,7 +704,8 @@ class DicomProcessor:
                         id=id,
                         patient_id=patient_id,
                         new_patient_id='Processed for anonymization',
-                        remove_text=remove_text
+                        remove_text=remove_text,
+                        remove_CTA=remove_CTA
                     )
                     gc.collect()
 
