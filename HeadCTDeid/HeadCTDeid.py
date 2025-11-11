@@ -40,7 +40,7 @@ class HeadCTDeid(ScriptedLoadableModule):
     """ScriptedLoadableModule base (3D Slicer)."""
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = "Head CT De-identification for Anonymization"
+        self.parent.title = "Head CT De-identification"
         self.parent.categories = ["Utilities"]
         self.parent.dependencies = []
         self.parent.contributors = ["Anh Tuan Tran, Sam Payabvash"]
