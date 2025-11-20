@@ -4,8 +4,6 @@ Head CT De-identification for Anonymization
 - Processes CT Head DICOMs, anonymizes tags/pixels, mirrors input tree, then
   renames each level's subfolders to <new_folder_name>_<1..N>, preserving depth.
 """
-
-import gc
 import logging
 import os
 import random
@@ -759,7 +757,6 @@ class DicomProcessor:
                         remove_text=remove_text,
                         remove_CTA=remove_CTA,
                     )
-                    gc.collect()
 
             # Phase 2: per-level renaming to <id>_<n>
             # Walk topdown so we can replace 'subdirs' in-place and descend.
