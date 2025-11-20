@@ -76,11 +76,20 @@
        <string>Remove text inside dicom</string>
       </property>
       <property name="toolTip">
-       <string>Check to temove text inside dicom.</string>
+       <string>Check to remove text inside dicom.</string>
       </property>
      </widget>
     </item>
-
+   <item>
+     <widget class="QCheckBox" name="deidentifyCTACheckbox">
+      <property name="text">
+       <string>Allow de-identification of CTA and CT perfusion</string>
+      </property>
+      <property name="toolTip">
+       <string>Check to allow de-identification of CTA and CT perfusion.</string>
+      </property>
+     </widget>
+    </item>
    <!-- Apply Button Section -->
    <item>
     <widget class="QPushButton" name="applyButton">
