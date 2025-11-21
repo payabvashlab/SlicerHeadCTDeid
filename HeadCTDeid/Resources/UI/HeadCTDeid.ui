@@ -138,7 +138,6 @@
   <connection>
    <sender>excelFileButton</sender>
    <signal>clicked()</signal>
-   <receiver>deidWidget</receiver>
    <slot>onBrowseExcelFile()</slot>  <!-- Fixed connection to the correct class -->
   </connection>
  </connections>
