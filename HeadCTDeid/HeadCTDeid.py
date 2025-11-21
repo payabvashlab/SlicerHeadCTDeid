@@ -354,8 +354,7 @@ class HeadCTDeidTest(ScriptedLoadableModuleTest):
         self.test_HeadCTDeid1()
 
     def test_HeadCTDeid1(self):
-        self.delayDisplay("Do not take the test")
-
+        self.assertTrue(True)
 # ---------------------------------------------------------------------------
 # DICOM Processor
 # ---------------------------------------------------------------------------
