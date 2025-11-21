@@ -139,10 +139,11 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-            slicer.util.infoDisplay(
-                "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
-                windowTitle="Warning"
-            )
+            if slicer.util.mainWindow():
+                slicer.util.infoDisplay(
+                    "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
+                    windowTitle="Warning"
+                )
             import qt
             try:
                 slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
