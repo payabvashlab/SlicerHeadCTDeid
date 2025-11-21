@@ -144,25 +144,25 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
                     windowTitle="Warning"
                 )
-            import qt
-            try:
-                slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
-                self.logic.setupPythonRequirements()
-                slicer.app.restoreOverrideCursor()
-            except Exception as e:
-                slicer.app.restoreOverrideCursor()
-                slicer.util.errorDisplay(f"Failed to install required packages.\n\n{e}")
-                return
-
-            self.ui.progressBar.setValue(0)
-            self.logic.process(
-                self.ui.inputFolderButton.directory,
-                self.ui.excelFileButton.text,
-                self.ui.outputFolderButton.directory,
-                self.ui.deidentifyCheckbox.isChecked(),
-                self.ui.deidentifyCTACheckbox.isChecked(),
-                self.ui.progressBar
-            )
+                import qt
+                try:
+                    slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+                    self.logic.setupPythonRequirements()
+                    slicer.app.restoreOverrideCursor()
+                except Exception as e:
+                    slicer.app.restoreOverrideCursor()
+                    slicer.util.errorDisplay(f"Failed to install required packages.\n\n{e}")
+                    return
+    
+                self.ui.progressBar.setValue(0)
+                self.logic.process(
+                    self.ui.inputFolderButton.directory,
+                    self.ui.excelFileButton.text,
+                    self.ui.outputFolderButton.directory,
+                    self.ui.deidentifyCheckbox.isChecked(),
+                    self.ui.deidentifyCTACheckbox.isChecked(),
+                    self.ui.progressBar
+                )
         except Exception as e:
             slicer.util.errorDisplay(f"Error: {str(e)}")
 
