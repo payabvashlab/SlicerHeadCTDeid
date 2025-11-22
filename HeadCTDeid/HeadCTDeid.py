@@ -17,11 +17,8 @@ from pathlib import Path
 
 import numpy as np
 import slicer
-import vtk
-from PIL import Image
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
-from ctk import ctkFileDialog
 
 warnings.filterwarnings("ignore")
 
@@ -88,6 +85,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.setParameterNode(self.logic.getParameterNode())
 
     def setParameterNode(self, inputParameterNode):
+        import vtk
         if inputParameterNode:
             self.logic.setDefaultParameters(inputParameterNode)
         if self._parameterNode is not None:
@@ -137,36 +135,47 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._parameterNode.SetParameter("DeidentifyCTA", str(self.ui.deidentifyCTACheckbox.isChecked()).lower())
         self._parameterNode.EndModify(wasModified)
 
-    def onApplyButton(self):
-        try:
-            if slicer.util.mainWindow():
-                slicer.util.infoDisplay(
-                    "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
-                    windowTitle="Warning"
-                )
-                import qt
-                try:
-                    slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
-                    self.logic.setupPythonRequirements()
-                    slicer.app.restoreOverrideCursor()
-                except Exception as e:
-                    slicer.app.restoreOverrideCursor()
-                    slicer.util.errorDisplay(f"Failed to install required packages.\n\n{e}")
-                    return
+  def onApplyButton(self):
+      try:
+          # Only show dialogs / cursor if a GUI exists
+          has_gui = slicer.util.mainWindow() is not None
+          if has_gui:
+              slicer.util.infoDisplay(
+                  "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
+                  windowTitle="Warning"
+              )
+  
+          import qt
+          try:
+              if has_gui:
+                  slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+  
+              self.logic.setupPythonRequirements()
+  
+          finally:
+              if has_gui:
+                  slicer.app.restoreOverrideCursor()
+  
+          # progressBar may be None in headless usage; guard it
+          if has_gui and self.ui.progressBar:
+              self.ui.progressBar.setValue(0)
+  
+          self.logic.process(
+              self.ui.inputFolderButton.directory,
+              self.ui.excelFileButton.text,
+              self.ui.outputFolderButton.directory,
+              self.ui.deidentifyCheckbox.isChecked(),
+              self.ui.deidentifyCTACheckbox.isChecked(),
+              self.ui.progressBar if has_gui else None,
+          )
+      except Exception as e:
+          if slicer.util.mainWindow():
+              slicer.util.errorDisplay(f"Error: {str(e)}")
+          else:
+              print(f"[HeadCTDeid] Error: {e}")
     
-                self.ui.progressBar.setValue(0)
-                self.logic.process(
-                    self.ui.inputFolderButton.directory,
-                    self.ui.excelFileButton.text,
-                    self.ui.outputFolderButton.directory,
-                    self.ui.deidentifyCheckbox.isChecked(),
-                    self.ui.deidentifyCTACheckbox.isChecked(),
-                    self.ui.progressBar
-                )
-        except Exception as e:
-            slicer.util.errorDisplay(f"Error: {str(e)}")
-
     def onBrowseExcelFile(self):
+        from ctk import ctkFileDialog
         fileDialog = ctkFileDialog()
         fileDialog.setWindowTitle("Select Excel/CSV File")
         fileDialog.setNameFilters(["Excel Files (*.xlsx)", "CSV Files (*.csv)", "All Files (*)"])
@@ -314,7 +323,8 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                         remove_text=remove_text,
                         remove_CTA=remove_CTA,
                     )
-                    progressBar.setValue(int((i + 1) * 100 / total_rows))
+                    if progressBar:
+                        progressBar.setValue(int((i + 1) * 100 / total_rows))
                     slicer.util.showStatusMessage(f"Finished processing folder {foldername}")
                     self.logger.info(f"Finished processing folder: {foldername}")
                     elapsed = time.time() - start_time
