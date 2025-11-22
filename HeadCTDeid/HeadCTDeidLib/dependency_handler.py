@@ -34,9 +34,7 @@ class NonSlicerPythonDependencies(DependenciesBase):
                 import gdcm
             except ModuleNotFoundError as e:
                 slicer.util.pip_install("python-gdcm")
-                ok = slicer.util.confirmOkCancelDisplay("To support full encoding DICOM.\nSlicer needs to restart to complete the setup.", windowTitle="Restart Required")
-                if ok:
-                    restart_slicer()
+                restart_slicer()
                 
         def restart_slicer():
             slicerExecutable = slicer.app.applicationFilePath()
