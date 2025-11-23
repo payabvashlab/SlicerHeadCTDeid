@@ -135,45 +135,45 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._parameterNode.SetParameter("DeidentifyCTA", str(self.ui.deidentifyCTACheckbox.isChecked()).lower())
         self._parameterNode.EndModify(wasModified)
 
-  def onApplyButton(self):
-      try:
-          # Only show dialogs / cursor if a GUI exists
-          has_gui = slicer.util.mainWindow() is not None
-          if has_gui:
-              slicer.util.infoDisplay(
-                  "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
-                  windowTitle="Warning"
+    def onApplyButton(self):
+        try:
+              # Only show dialogs / cursor if a GUI exists
+              has_gui = slicer.util.mainWindow() is not None
+              if has_gui:
+                  slicer.util.infoDisplay(
+                      "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
+                      windowTitle="Warning"
+                  )
+
+              import qt
+              try:
+                  if has_gui:
+                      slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+
+                  self.logic.setupPythonRequirements()
+
+              finally:
+                  if has_gui:
+                      slicer.app.restoreOverrideCursor()
+
+              # progressBar may be None in headless usage; guard it
+              if has_gui and self.ui.progressBar:
+                  self.ui.progressBar.setValue(0)
+
+              self.logic.process(
+                  self.ui.inputFolderButton.directory,
+                  self.ui.excelFileButton.text,
+                  self.ui.outputFolderButton.directory,
+                  self.ui.deidentifyCheckbox.isChecked(),
+                  self.ui.deidentifyCTACheckbox.isChecked(),
+                  self.ui.progressBar if has_gui else None,
               )
-  
-          import qt
-          try:
-              if has_gui:
-                  slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
-  
-              self.logic.setupPythonRequirements()
-  
-          finally:
-              if has_gui:
-                  slicer.app.restoreOverrideCursor()
-  
-          # progressBar may be None in headless usage; guard it
-          if has_gui and self.ui.progressBar:
-              self.ui.progressBar.setValue(0)
-  
-          self.logic.process(
-              self.ui.inputFolderButton.directory,
-              self.ui.excelFileButton.text,
-              self.ui.outputFolderButton.directory,
-              self.ui.deidentifyCheckbox.isChecked(),
-              self.ui.deidentifyCTACheckbox.isChecked(),
-              self.ui.progressBar if has_gui else None,
-          )
-      except Exception as e:
-          if slicer.util.mainWindow():
-              slicer.util.errorDisplay(f"Error: {str(e)}")
-          else:
-              print(f"[HeadCTDeid] Error: {e}")
-    
+          except Exception as e:
+              if slicer.util.mainWindow():
+                  slicer.util.errorDisplay(f"Error: {str(e)}")
+              else:
+                  print(f"[HeadCTDeid] Error: {e}")
+
     def onBrowseExcelFile(self):
         from ctk import ctkFileDialog
         fileDialog = ctkFileDialog()
