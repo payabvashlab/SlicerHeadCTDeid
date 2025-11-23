@@ -34,7 +34,6 @@ class NonSlicerPythonDependencies(DependenciesBase):
                 import gdcm
             except ModuleNotFoundError as e:
                 slicer.util.pip_install("python-gdcm")
-                restart_slicer()
                 
         def restart_slicer():
             slicerExecutable = slicer.app.applicationFilePath()
