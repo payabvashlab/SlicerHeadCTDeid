@@ -133,12 +133,4 @@
    <header>QPushButton.h</header>
   </customwidget>
  </customwidgets>
- <connections>
-  <!-- Connection for excel file button -->
-  <connection>
-   <sender>excelFileButton</sender>
-   <signal>clicked()</signal>
-   <slot>onBrowseExcelFile()</slot>  <!-- Fixed connection to the correct class -->
-  </connection>
- </connections>
 </ui>
