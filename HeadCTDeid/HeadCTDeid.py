@@ -168,7 +168,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                   self.ui.deidentifyCTACheckbox.isChecked(),
                   self.ui.progressBar if has_gui else None,
               )
-          except Exception as e:
+        except Exception as e:
               if slicer.util.mainWindow():
                   slicer.util.errorDisplay(f"Error: {str(e)}")
               else:
