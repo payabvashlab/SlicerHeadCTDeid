@@ -78,8 +78,8 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.initializeParameterNode()
 
         # third-party deps bootstrap
-        from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
-        NonSlicerPythonDependencies().setupPythonRequirements(upgrade=True)
+        #from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
+        #NonSlicerPythonDependencies().setupPythonRequirements(upgrade=True)
 
     def initializeParameterNode(self):
         self.setParameterNode(self.logic.getParameterNode())
