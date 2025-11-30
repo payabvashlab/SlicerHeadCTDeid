@@ -27,12 +27,14 @@ FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 AIR_THRESHOLD = -800
 
+
 # ---------------------------------------------------------------------------
 # Module
 # ---------------------------------------------------------------------------
 
 class HeadCTDeid(ScriptedLoadableModule):
     """ScriptedLoadableModule base (3D Slicer)."""
+
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = "Head CT De-identification"
@@ -45,6 +47,7 @@ This module de-identifies DICOM files by removing patient information based on a
         self.parent.acknowledgementText = """
 This file was developed by Anh Tuan Tran, Sam Payabvash (Columbia University).
 """
+
 
 # ---------------------------------------------------------------------------
 # Widget
@@ -78,8 +81,8 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.initializeParameterNode()
 
         # third-party deps bootstrap
-        #from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
-        #NonSlicerPythonDependencies().setupPythonRequirements(upgrade=True)
+        # from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
+        # NonSlicerPythonDependencies().setupPythonRequirements(upgrade=True)
 
     def initializeParameterNode(self):
         self.setParameterNode(self.logic.getParameterNode())
@@ -112,10 +115,10 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # enable Apply only when required fields present
         if (
-            len(self._parameterNode.GetParameter("InputFolder")) > 1
-            and len(self._parameterNode.GetParameter("ExcelFile")) > 4
-            and len(self._parameterNode.GetParameter("OutputFolder")) > 1
-            and self._parameterNode.GetParameter("ExcelFile") != "Browse"
+                len(self._parameterNode.GetParameter("InputFolder")) > 1
+                and len(self._parameterNode.GetParameter("ExcelFile")) > 4
+                and len(self._parameterNode.GetParameter("OutputFolder")) > 1
+                and self._parameterNode.GetParameter("ExcelFile") != "Browse"
         ):
             self.ui.applyButton.setEnabled(True)
         else:
@@ -137,42 +140,31 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-              # Only show dialogs / cursor if a GUI exists
-              has_gui = slicer.util.mainWindow() is not None
-              if has_gui:
-                  slicer.util.infoDisplay(
-                      "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
-                      windowTitle="Warning"
-                  )
+            import gdcm
+            slicer.util.infoDisplay(
+                "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
+                    windowTitle="Warning"
+            )
+            import qt
+            self.logic.setupPythonRequirements()
+           # progressBar may be None in headless usage; guard it
+            if self.ui.progressBar:
+                self.ui.progressBar.setValue(0)
 
-              import qt
-              try:
-                  if has_gui:
-                      slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
-
-                  self.logic.setupPythonRequirements()
-
-              finally:
-                  if has_gui:
-                      slicer.app.restoreOverrideCursor()
-
-              # progressBar may be None in headless usage; guard it
-              if has_gui and self.ui.progressBar:
-                  self.ui.progressBar.setValue(0)
-
-              self.logic.process(
-                  self.ui.inputFolderButton.directory,
-                  self.ui.excelFileButton.text,
-                  self.ui.outputFolderButton.directory,
-                  self.ui.deidentifyCheckbox.isChecked(),
-                  self.ui.deidentifyCTACheckbox.isChecked(),
-                  self.ui.progressBar if has_gui else None,
-              )
+            self.logic.process(
+                self.ui.inputFolderButton.directory,
+                self.ui.excelFileButton.text,
+                self.ui.outputFolderButton.directory,
+                self.ui.deidentifyCheckbox.isChecked(),
+                self.ui.deidentifyCTACheckbox.isChecked(),
+                self.ui.progressBar,
+            )
         except Exception as e:
-              if slicer.util.mainWindow():
-                  slicer.util.errorDisplay(f"Error: {str(e)}")
-              else:
-                  print(f"[HeadCTDeid] Error: {e}")
+            slicer.util.pip_install("python-gdcm==3.0.25")
+            slicer.util.infoDisplay(
+                "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
+                windowTitle="Warning"
+            )
 
     def onBrowseExcelFile(self):
         from ctk import ctkFileDialog
@@ -186,6 +178,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.excelFileButton.text = selectedFile
             self._parameterNode.SetParameter("ExcelFile", selectedFile)
             self.updateGUIFromParameterNode()
+
 
 # ---------------------------------------------------------------------------
 # Logic
@@ -352,6 +345,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         except Exception as e:
             self.logger.error(f"Post-check error: {str(e)}")
 
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -366,6 +360,8 @@ class HeadCTDeidTest(ScriptedLoadableModuleTest):
 
     def test_HeadCTDeid1(self):
         self.assertTrue(True)
+
+
 # ---------------------------------------------------------------------------
 # DICOM Processor
 # ---------------------------------------------------------------------------
@@ -377,6 +373,7 @@ class DicomProcessor:
       Phase 2: For every directory level under out_path, rename its immediate subfolders
                in sorted order to <id>_<1..N>, preserving the nesting depth.
     """
+
     def __init__(self):
         self.error = ""
         self.net = ""
@@ -524,15 +521,15 @@ class DicomProcessor:
     # --------------- core write ---------------
 
     def save_new_dicom_files(
-        self,
-        original_dir,
-        out_dir,
-        replacer="face",
-        id="new_folder_name",
-        patient_id="0",
-        new_patient_id="Processed for anonymization",
-        remove_text=False,
-        remove_CTA=False,
+            self,
+            original_dir,
+            out_dir,
+            replacer="face",
+            id="new_folder_name",
+            patient_id="0",
+            new_patient_id="Processed for anonymization",
+            remove_text=False,
+            remove_CTA=False,
     ):
         import pydicom
         from pydicom.datadict import keyword_for_tag
@@ -734,15 +731,15 @@ class DicomProcessor:
     # --------------- driver ---------------
 
     def drown_volume(
-        self,
-        in_path,
-        out_path,
-        replacer="face",
-        id="new_folder_name",
-        patient_id="0",
-        name="",
-        remove_text=False,
-        remove_CTA=False,
+            self,
+            in_path,
+            out_path,
+            replacer="face",
+            id="new_folder_name",
+            patient_id="0",
+            name="",
+            remove_text=False,
+            remove_CTA=False,
     ):
         """
         Phase 1: process while mirroring input structure.
