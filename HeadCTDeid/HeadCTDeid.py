@@ -141,6 +141,13 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onApplyButton(self):
         try:
             import gdcm
+        except Exception as e:
+            slicer.util.pip_install("python-gdcm==3.0.25")
+            slicer.util.infoDisplay(
+                "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
+                windowTitle="Warning"
+            )
+        try:
             slicer.util.infoDisplay(
                 "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
                     windowTitle="Warning"
@@ -160,11 +167,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ui.progressBar,
             )
         except Exception as e:
-            slicer.util.pip_install("python-gdcm==3.0.25")
-            slicer.util.infoDisplay(
-                "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
-                windowTitle="Warning"
-            )
+            slicer.util.errorDisplay(f"Error: {str(e)}")
 
     def onBrowseExcelFile(self):
         from ctk import ctkFileDialog
