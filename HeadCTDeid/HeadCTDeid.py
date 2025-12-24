@@ -4,6 +4,7 @@ Head CT De-identification for Anonymization
 - Processes CT Head DICOMs, anonymizes tags/pixels, mirrors input tree, then
   renames each level's subfolders to <new_folder_name>_<1..N>, preserving depth.
 """
+
 import logging
 import os
 import random
@@ -22,7 +23,7 @@ from slicer.util import VTKObservationMixin
 
 warnings.filterwarnings("ignore")
 
-# HU ranges used for “face/soft-tissue” sampling (kept from your original)
+# HU ranges used for “face/soft-tissue” sampling
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 AIR_THRESHOLD = -800
@@ -80,10 +81,6 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.initializeParameterNode()
 
-        # third-party deps bootstrap
-        # from HeadCTDeidLib.dependency_handler import NonSlicerPythonDependencies
-        # NonSlicerPythonDependencies().setupPythonRequirements(upgrade=True)
-
     def initializeParameterNode(self):
         self.setParameterNode(self.logic.getParameterNode())
 
@@ -109,16 +106,14 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.excelFileButton.text = excelFile
         self.ui.outputFolderButton.directory = self._parameterNode.GetParameter("OutputFolder")
 
-        # reflect checkbox states
         self.ui.deidentifyCheckbox.setChecked(self._parameterNode.GetParameter("Deidentify") == "true")
         self.ui.deidentifyCTACheckbox.setChecked(self._parameterNode.GetParameter("DeidentifyCTA") == "true")
 
-        # enable Apply only when required fields present
         if (
-                len(self._parameterNode.GetParameter("InputFolder")) > 1
-                and len(self._parameterNode.GetParameter("ExcelFile")) > 4
-                and len(self._parameterNode.GetParameter("OutputFolder")) > 1
-                and self._parameterNode.GetParameter("ExcelFile") != "Browse"
+            len(self._parameterNode.GetParameter("InputFolder")) > 1
+            and len(self._parameterNode.GetParameter("ExcelFile")) > 4
+            and len(self._parameterNode.GetParameter("OutputFolder")) > 1
+            and self._parameterNode.GetParameter("ExcelFile") != "Browse"
         ):
             self.ui.applyButton.setEnabled(True)
         else:
@@ -140,8 +135,8 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-            import gdcm
-        except Exception as e:
+            import gdcm  # noqa
+        except Exception:
             slicer.util.pip_install("python-gdcm==3.0.25")
             slicer.util.infoDisplay(
                 "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
@@ -150,11 +145,9 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         try:
             slicer.util.infoDisplay(
                 "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
-                    windowTitle="Warning"
+                windowTitle="Warning"
             )
-            import qt
             self.logic.setupPythonRequirements()
-           # progressBar may be None in headless usage; guard it
             if self.ui.progressBar:
                 self.ui.progressBar.setValue(0)
 
@@ -250,7 +243,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         try:
             os.makedirs(outputFolder, exist_ok=True)
             log_file = os.path.join(outputFolder, "patient_processing.log")
-            # Avoid duplicate handlers
             already = any(
                 isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_file
                 for h in self.logger.handlers
@@ -263,8 +255,189 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                 self.logger.addHandler(file_handler)
             self.logger.setLevel(logging.INFO)
             self.logger.info(f"Initialized patient processing module {log_file}")
-        except Exception as e:
+        except Exception:
             pass
+
+    # ---------------- NEW: 3D frontal render snapshot ----------------
+    def _capture_threeDView_png(self, threeDView, out_png_path):
+        import vtk
+
+        rw = threeDView.renderWindow()
+        w2i = vtk.vtkWindowToImageFilter()
+        w2i.SetInput(rw)
+        w2i.SetReadFrontBuffer(False)
+        w2i.Update()
+
+        writer = vtk.vtkPNGWriter()
+        writer.SetFileName(out_png_path)
+        writer.SetInputConnection(w2i.GetOutputPort())
+        writer.Write()
+
+
+    def _set_view_and_zoom(self, threeDView, axisIndex, dollyFactor=2.0, viewAngleDeg=12.0):
+        """
+        axisIndex matches Slicer rotateToViewAxis convention:
+        0=Right, 1=Left, 2=Posterior, 3=Anterior, 4=Superior, 5=Inferior
+        dollyFactor > 1.0 => closer/bigger
+        viewAngleDeg smaller => more zoom (perspective)
+        """
+        import slicer
+
+        # Set canonical view
+        threeDView.rotateToViewAxis(axisIndex)
+        threeDView.resetFocalPoint()
+        threeDView.resetCamera()
+        threeDView.forceRender()
+        slicer.app.processEvents()
+
+        # Camera zoom (portable)
+        camNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(threeDView.mrmlViewNode())
+        cam = camNode.GetCamera()
+
+        # perspective zoom: smaller view angle = bigger object
+        try:
+            cam.SetViewAngle(float(viewAngleDeg))
+        except Exception:
+            pass
+
+        # dolly: move camera toward focal point
+        # dollyFactor=2.0 means "twice as close" (approximately)
+        try:
+            cam.Dolly(float(dollyFactor))
+        except Exception:
+            # fallback: manual position scaling toward focal point
+            fp = cam.GetFocalPoint()
+            pos = cam.GetPosition()
+            newPos = (
+                fp[0] + (pos[0] - fp[0]) / float(dollyFactor),
+                fp[1] + (pos[1] - fp[1]) / float(dollyFactor),
+                fp[2] + (pos[2] - fp[2]) / float(dollyFactor),
+            )
+            cam.SetPosition(*newPos)
+
+        # Needed after Dolly for correct clipping in VTK pipelines
+        try:
+            camNode.ResetClippingRange()
+        except Exception:
+            pass
+
+        threeDView.forceRender()
+        slicer.app.processEvents()
+
+    def _create_and_save_multi_view_snapshots(
+        self,
+        dicomFolder,
+        out_prefix="view",
+        dollyFactor=2.2,
+        viewAngleDeg=12.0,
+        preset_names_to_try=None,
+    ):
+        """
+        Loads DICOM in dicomFolder, enables volume rendering, then saves:
+        - anterior (frontal)
+        - left
+        - right
+        - posterior (behind)
+        - superior (top)
+        into dicomFolder with filenames like:
+        view_anterior.png, view_left.png, ...
+        """
+        import os
+        import slicer
+        from DICOMLib import DICOMUtils
+
+        if preset_names_to_try is None:
+            preset_names_to_try = ["CT-AAA", "CT Bone", "CT Air", "CT-Soft-Tissue", "CT Abdomen"]
+
+        lm = slicer.app.layoutManager()
+        if lm is None:
+            raise RuntimeError("No layoutManager available. Run with Slicer GUI (3D view required).")
+
+        # Clear scene each case
+        slicer.mrmlScene.Clear(False)
+        slicer.app.processEvents()
+
+        # --- Import/load DICOM ---
+        with DICOMUtils.TemporaryDICOMDatabase() as db:
+            DICOMUtils.importDicom(dicomFolder, db)
+            patientUIDs = db.patients()
+            if not patientUIDs:
+                raise RuntimeError(f"No DICOM patients found in: {dicomFolder}")
+            loadedNodeIDs = DICOMUtils.loadPatientByUID(patientUIDs[0])
+
+        # Select scalar volume loaded
+        volumeNode = None
+        for nid in loadedNodeIDs:
+            n = slicer.mrmlScene.GetNodeByID(nid)
+            if n and n.IsA("vtkMRMLScalarVolumeNode"):
+                volumeNode = n
+                break
+        if volumeNode is None:
+            vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            volumeNode = vols[0] if vols else None
+        if volumeNode is None:
+            raise RuntimeError(f"No scalar volume loaded from: {dicomFolder}")
+
+        # --- Volume rendering ---
+        vrLogic = slicer.modules.volumerendering.logic()
+        if vrLogic is None:
+            raise RuntimeError("VolumeRendering logic not available.")
+
+        displayNode = vrLogic.GetFirstVolumeRenderingDisplayNode(volumeNode)
+        if displayNode is None:
+            vrLogic.CreateDefaultVolumeRenderingNodes(volumeNode)
+            displayNode = vrLogic.GetFirstVolumeRenderingDisplayNode(volumeNode)
+        if displayNode is None:
+            raise RuntimeError("Failed to create Volume Rendering display node.")
+
+        # Apply preset safely (avoid 'Copy failed: invalid source node')
+        presetNode = None
+        for pname in preset_names_to_try:
+            p = vrLogic.GetPresetByName(pname)
+            if p:
+                presetNode = p
+                break
+        if presetNode:
+            propNode = displayNode.GetVolumePropertyNode()
+            if propNode:
+                propNode.Copy(presetNode)
+
+        displayNode.SetVisibility(1)
+        try:
+            vrLogic.FitROIToVolume(displayNode)
+        except Exception:
+            pass
+
+        # --- Get 3D view ---
+        threeDView = lm.threeDWidget(0).threeDView()
+
+        # axisIndex mapping for rotateToViewAxis:
+        # 0=Right, 1=Left, 2=Posterior, 3=Anterior, 4=Superior, 5=Inferior
+        views = [
+            # name, axisIndex, dollyFactor, viewAngleDeg
+            ("anterior", 3, 1.4, 12.0),   # <-- BACKED OFF (less zoom)
+            ("left", 1, 2.2, 12.0),
+            ("right", 0, 2.2, 12.0),
+            ("posterior", 2, 2.2, 12.0),
+            ("superior", 4, 2.2, 12.0),
+        ]
+
+        outputs = []
+        for name, axisIndex, dolly, angle in views:
+            self._set_view_and_zoom(
+                threeDView,
+                axisIndex=axisIndex,
+                dollyFactor=dolly,
+                viewAngleDeg=angle,
+            )
+            out_path = os.path.join(dicomFolder, f"{out_prefix}_{name}.png")
+            self._capture_threeDView_png(threeDView, out_path)
+            outputs.append(out_path)
+
+        return outputs
+
+
+    # ---------------- main processing ----------------
 
     def process(self, inputFolder, excelFile, outputFolder, remove_text, remove_CTA, progressBar):
         import pandas
@@ -309,6 +482,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     dst_folder = os.path.join(out_path, id_mapping[foldername])
                     processor = DicomProcessor()
                     src_folder = os.path.join(inputFolder, foldername)
+
                     _ = processor.drown_volume(
                         in_path=src_folder,
                         out_path=dst_folder,
@@ -319,10 +493,24 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                         remove_text=remove_text,
                         remove_CTA=remove_CTA,
                     )
+
+                    # NEW: Create frontal 3D snapshot and save inside dst_folder
+                    try:
+                        pngs = self._create_and_save_multi_view_snapshots(
+                            dicomFolder=dst_folder,
+                            out_prefix="3d",
+                            dollyFactor=2.0,   # bigger => 2.8 or 3.5
+                            viewAngleDeg=8.0, # smaller => more zoom (try 8–16)
+                        )
+                        self.logger.info(f"Saved 3D snapshots: {pngs}")
+                    except Exception as snap_e:
+                        self.logger.error(f"Snapshot error for {foldername}: {snap_e}")
+
                     if progressBar:
                         progressBar.setValue(int((i + 1) * 100 / total_rows))
                     slicer.util.showStatusMessage(f"Finished processing folder {foldername}")
                     self.logger.info(f"Finished processing folder: {foldername}")
+
                     elapsed = time.time() - start_time
                     total_time += elapsed
                     successful += 1
@@ -385,8 +573,6 @@ class DicomProcessor:
         self.sop_uid_map = defaultdict(str)
         self._ocr_reader = None  # lazy-initialized easyocr.Reader
 
-    # --------------- helpers ---------------
-
     def _get_ocr_reader(self):
         if self._ocr_reader is None:
             try:
@@ -406,7 +592,6 @@ class DicomProcessor:
                 pass
             return self.checkCTmeta(ds, remove_CTA) == 1
         except Exception as e:
-            # best-effort local log
             try:
                 with open("log.txt", "a") as f:
                     f.write(f"Error: {e}\n")
@@ -477,27 +662,22 @@ class DicomProcessor:
     def is_substring_in_list(self, substring, string_list):
         return any(substring in str(s) for s in string_list)
 
-    # --------------- selection ---------------
-
     def checkCTmeta(self, ds, remove_CTA=False):
         """
         Accept only CT head (original/primary/axial). By default, exclude CTA/perfusion.
         If remove_CTA=True -> do not exclude CTA (i.e., include such series as well).
         """
         try:
-            # Modality check
             modality = ds.get((0x08, 0x60), "")
             modality = [modality.value] if hasattr(modality, "value") else [modality]
             modality = [str(x).lower().replace(" ", "") for x in modality]
             status1 = any(self.is_substring_in_list(c, modality) for c in ["ct", "computedtomography", "ctprotocal"])
 
-            # ImageType check
             imageType = ds.get((0x08, 0x08), "")
             imageType = [imageType.value] if hasattr(imageType, "value") else [imageType]
             imageType = [str(x).lower().replace(" ", "") for x in imageType]
             status2 = all(self.is_substring_in_list(c, imageType) for c in ["original", "primary", "axial"])
 
-            # Study description includes head terms; optionally exclude CTA/perfusion
             studyDes = None
             for tag in [(0x08, 0x1030), (0x08, 0x103e), (0x18, 0x0015), (0x18, 0x1160)]:
                 if tag in ds:
@@ -521,18 +701,16 @@ class DicomProcessor:
             self.error = str(e)
             return 0
 
-    # --------------- core write ---------------
-
     def save_new_dicom_files(
-            self,
-            original_dir,
-            out_dir,
-            replacer="face",
-            id="new_folder_name",
-            patient_id="0",
-            new_patient_id="Processed for anonymization",
-            remove_text=False,
-            remove_CTA=False,
+        self,
+        original_dir,
+        out_dir,
+        replacer="face",
+        id="new_folder_name",
+        patient_id="0",
+        new_patient_id="Processed for anonymization",
+        remove_text=False,
+        remove_CTA=False,
     ):
         import pydicom
         from pydicom.datadict import keyword_for_tag
@@ -542,7 +720,6 @@ class DicomProcessor:
         files = [f for f in os.listdir(original_dir) if self.is_dicom(os.path.join(original_dir, f), remove_CTA)]
         errors = []
 
-        # Robust sort by InstanceNumber if present; fallback to filename
         def _instnum(path):
             try:
                 ds = pydicom.dcmread(path, force=True, stop_before_pixels=True)
@@ -560,7 +737,6 @@ class DicomProcessor:
                 except Exception:
                     pass
 
-                # Remove private tags & PHI-ish content
                 ds.remove_private_tags()
                 if "OtherPatientIDs" in ds:
                     delattr(ds, "OtherPatientIDs")
@@ -570,9 +746,7 @@ class DicomProcessor:
                 ds.walk(self.curves_callback)
 
                 ANON = "anonymous"
-                today = time.strftime("%Y%m%d")
 
-                # Minimal required IDs
                 if (0x0008, 0x0050) not in ds:
                     ds.add_new((0x0008, 0x0050), "SH", id)
                 else:
@@ -588,7 +762,6 @@ class DicomProcessor:
                 else:
                     ds[0x0010, 0x0010].value = new_patient_id
 
-                # Scrub a set of tags
                 requirement_tags = [
                     (0x0010, 0x1000), (0x0010, 0x1001), (0x0010, 0x1005), (0x0010, 0x1040),
                     (0x0010, 0x2154), (0x0010, 0x2295), (0x0012, 0x0020), (0x0012, 0x0030),
@@ -617,7 +790,6 @@ class DicomProcessor:
                         else:
                             ds[tag].value = ANON
 
-                # Remap key UIDs consistently per-study/series/instance
                 if (0x0020, 0x000E) in ds:
                     series_uid = str(ds[0x0020, 0x000E].value)
                     if series_uid and series_uid not in self.series_uid_map:
@@ -636,14 +808,13 @@ class DicomProcessor:
                         self.sop_uid_map[sop_uid] = generate_uid()
                     ds[0x0008, 0x0018].value = self.sop_uid_map.get(sop_uid, generate_uid())
 
-                # Normalize common tags
                 TAGS = [
-                    (0x0008, 0x0201),  # TimezoneOffsetFromUTC
-                    (0x0010, 0x2150),  # CountryOfResidence
-                    (0x0010, 0x2152),  # RegionOfResidence
-                    (0x0038, 0x0300),  # CurrentPatientLocation
-                    (0x0008, 0x0080),  # InstitutionName
-                    (0x0008, 0x0081),  # InstitutionAddress
+                    (0x0008, 0x0201),
+                    (0x0010, 0x2150),
+                    (0x0010, 0x2152),
+                    (0x0038, 0x0300),
+                    (0x0008, 0x0080),
+                    (0x0008, 0x0081),
                 ]
                 for tag in TAGS:
                     if tag in ds:
@@ -652,7 +823,6 @@ class DicomProcessor:
                 if (0x0010, 0x2160) in ds and str(ds[(0x0010, 0x2160)].value).lower() == "unknown":
                     ds[(0x0010, 0x2160)].value = ""
 
-                # Simplify race
                 RACE_TAG = (0x0010, 0x2201)
                 RACE_MAPPING = {
                     "WHITE": "White",
@@ -667,7 +837,6 @@ class DicomProcessor:
                     rv = str(ds[RACE_TAG].value).strip().upper() if ds[RACE_TAG].value else "Other"
                     ds[RACE_TAG].value = RACE_MAPPING.get(rv, "Other")
 
-                # --- pixel operations ---
                 pixels_hu = self.get_pixels_hu(ds)
                 bin_mask = self.binarize_volume(pixels_hu)
                 lcc = self.get_largest_component_volume(bin_mask)
@@ -685,11 +854,10 @@ class DicomProcessor:
 
                 new_volume = self.apply_random_values_optimized(pixels_hu, dilated, vals)
 
-                # Optional OCR blackout
                 if remove_text:
                     try:
                         import cv2
-                        reader = self._get_ocr_reader()  # lazy; may be None
+                        reader = self._get_ocr_reader()
                         if reader is not None:
                             mn, mx = int(np.min(pixels_hu)), int(np.max(pixels_hu))
                             rng = max(1, mx - mn)
@@ -704,7 +872,6 @@ class DicomProcessor:
                     except Exception as e:
                         errors.append((fname, str(e)))
 
-                # Write back pixels
                 slope = float(getattr(ds, "RescaleSlope", 1)) or 1.0
                 intercept = float(getattr(ds, "RescaleIntercept", 0))
                 new_slice = (new_volume - intercept) / slope
@@ -731,18 +898,16 @@ class DicomProcessor:
 
         return errors
 
-    # --------------- driver ---------------
-
     def drown_volume(
-            self,
-            in_path,
-            out_path,
-            replacer="face",
-            id="new_folder_name",
-            patient_id="0",
-            name="",
-            remove_text=False,
-            remove_CTA=False,
+        self,
+        in_path,
+        out_path,
+        replacer="face",
+        id="new_folder_name",
+        patient_id="0",
+        name="",
+        remove_text=False,
+        remove_CTA=False,
     ):
         """
         Phase 1: process while mirroring input structure.
@@ -769,14 +934,12 @@ class DicomProcessor:
                     )
 
             # Phase 2: per-level renaming to <id>_<n>
-            # Walk topdown so we can replace 'subdirs' in-place and descend.
             for curr, subdirs, files in os.walk(out_path, topdown=True):
                 if not subdirs:
                     continue
-                # stable order so numbering is deterministic
+
                 subdirs_sorted = sorted(subdirs)
 
-                # temp rename to avoid collisions
                 tmp_map = []
                 for i, d in enumerate(subdirs_sorted, start=1):
                     src = os.path.join(curr, d)
@@ -785,7 +948,6 @@ class DicomProcessor:
                         os.rename(src, tmp)
                         tmp_map.append(tmp)
 
-                # final rename to <id>_<i>
                 new_names = []
                 for i, tmp in enumerate(tmp_map, start=1):
                     dst_name = f"{id}_{i}"
@@ -793,7 +955,6 @@ class DicomProcessor:
                     os.rename(tmp, dst)
                     new_names.append(dst_name)
 
-                # update traversal list so os.walk continues into renamed dirs
                 subdirs[:] = new_names
 
         except Exception as e:
