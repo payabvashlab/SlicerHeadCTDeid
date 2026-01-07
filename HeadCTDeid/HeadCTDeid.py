@@ -347,7 +347,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         from DICOMLib import DICOMUtils
 
         if preset_names_to_try is None:
-            preset_names_to_try = ["CT-AAA", "CT Bone", "CT Air", "CT-Soft-Tissue", "CT Abdomen"]
+            preset_names_to_try = ["CT-Soft-Tissue", "CT Abdomen", "CT-AAA", "CT Air", "CT Bone"]
 
         lm = slicer.app.layoutManager()
         if lm is None:
@@ -401,6 +401,32 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             propNode = displayNode.GetVolumePropertyNode()
             if propNode:
                 propNode.Copy(presetNode)
+                propNode = displayNode.GetVolumePropertyNode()
+                vp = propNode.GetVolumeProperty()
+                
+                # Scalar opacity function (HU -> opacity)
+                sof = vp.GetScalarOpacity()
+                sof.RemoveAllPoints()
+                
+                # Start rendering at -40 HU (opacity 0 at/under -40)
+                sof.AddPoint(-200, 0.0)
+                sof.AddPoint(-40,  0.0)
+                
+                # Soft tissue becomes visible
+                sof.AddPoint(0,    0.05)
+                sof.AddPoint(50,   0.15)
+                sof.AddPoint(150,  0.35)
+                
+                # Bone becomes strong
+                sof.AddPoint(300,  0.6)
+                sof.AddPoint(700,  1.0)
+                
+                # Also helpful: reduce shading a bit (optional)
+                vp.SetShade(True)
+                vp.SetAmbient(0.2)
+                vp.SetDiffuse(0.9)
+                vp.SetSpecular(0.1)
+
 
         displayNode.SetVisibility(1)
         try:
