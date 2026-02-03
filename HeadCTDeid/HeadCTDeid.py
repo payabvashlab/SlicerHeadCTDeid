@@ -238,32 +238,32 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-            import gdcm  # noqa
+            import gdcm  
+            try:
+                slicer.util.infoDisplay(
+                    "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
+                    windowTitle="Warning"
+                )
+                self.logic.setupPythonRequirements()
+                if self.ui.progressBar:
+                    self.ui.progressBar.setValue(0)
+
+                self.logic.process(
+                    self.ui.inputFolderButton.directory,
+                    self.ui.excelFileButton.text,
+                    self.ui.outputFolderButton.directory,
+                    self.ui.deidentifyCheckbox.isChecked(),
+                    self.ui.deidentifyCTACheckbox.isChecked(),
+                    self.ui.progressBar,
+                )
+            except Exception as e:
+                slicer.util.errorDisplay(f"Error: {str(e)}")
         except Exception:
             slicer.util.pip_install("python-gdcm==3.0.25")
             slicer.util.infoDisplay(
                 "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
                 windowTitle="Warning"
             )
-        try:
-            slicer.util.infoDisplay(
-                "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
-                windowTitle="Warning"
-            )
-            self.logic.setupPythonRequirements()
-            if self.ui.progressBar:
-                self.ui.progressBar.setValue(0)
-
-            self.logic.process(
-                self.ui.inputFolderButton.directory,
-                self.ui.excelFileButton.text,
-                self.ui.outputFolderButton.directory,
-                self.ui.deidentifyCheckbox.isChecked(),
-                self.ui.deidentifyCTACheckbox.isChecked(),
-                self.ui.progressBar,
-            )
-        except Exception as e:
-            slicer.util.errorDisplay(f"Error: {str(e)}")
 
     def onBrowseExcelFile(self):
         from ctk import ctkFileDialog
@@ -471,7 +471,10 @@ class DicomProcessor:
     Phase 1: Walk input tree, mirror structure to out_path and write anonymized DICOMs.
     Phase 2: For every directory level under out_path, rename its immediate subfolders
              in sorted order to <id>_<1..N>, preserving the nesting depth.
-    Phase 3 (NEW): snapshot generation (VR 3D) for every subfolder containing DICOMs.
+    Phase 3: snapshot generation (VR 3D) for every subfolder containing DICOMs.
+             IMPORTANT UPDATE:
+               - Render imports ONLY DICOM files (ignores log.txt/png/etc)
+               - Renders ONLY 4 views: anterior, left, right, posterior
     """
 
     def __init__(self):
@@ -652,7 +655,6 @@ class DicomProcessor:
         """
         Overwrite element value using VR-aware rules.
         """
-        # enforce required patient identity
         if tag == (0x0010, 0x0020):  # PatientID
             ds[tag].value = patient_id_value
             return
@@ -663,7 +665,6 @@ class DicomProcessor:
             ds[tag].value = patient_id_value
             return
 
-        # current date/time
         da_now, tm_now, dt_now = self._current_da_tm_dt()
         if vr == "DA":
             ds[tag].value = da_now
@@ -675,7 +676,6 @@ class DicomProcessor:
             ds[tag].value = dt_now
             return
 
-        # UID remap
         if vr == "UI":
             if tag == (0x0020, 0x000D):  # StudyInstanceUID
                 ds[tag].value = self._remap_uid(ds[tag].value, self.study_uid_map, generate_uid_fn)
@@ -865,27 +865,25 @@ class DicomProcessor:
 
         return errors
 
-    # ---------------- snapshot helpers ----------------
+    # -----------------------------------------------------------------------
+    # UPDATED SNAPSHOT RENDER (DICOM-ONLY IMPORT + 4 VIEWS)
+    # -----------------------------------------------------------------------
 
     def _capture_threeDView_png(self, threeDView, out_png_path):
-        """
-        Capture current 3D view render window to PNG.
-        """
         import vtk
+        import slicer
 
-        # ensure up-to-date render
-        threeDView.forceRender()
-        slicer.app.processEvents()
-
-        rw = threeDView.renderWindow()
         try:
+            threeDView.forceRender()
+            slicer.app.processEvents()
+            rw = threeDView.renderWindow()
             rw.Render()
         except Exception:
             pass
 
+        rw = threeDView.renderWindow()
         w2i = vtk.vtkWindowToImageFilter()
         w2i.SetInput(rw)
-        # back buffer is typically correct in Slicer
         w2i.SetReadFrontBuffer(False)
         w2i.Update()
 
@@ -896,10 +894,11 @@ class DicomProcessor:
 
     def _set_view_and_zoom(self, threeDView, axisIndex, dollyFactor=2.0, viewAngleDeg=12.0):
         """
-        axisIndex: 0=Right, 1=Left, 2=Posterior, 3=Anterior, 4=Superior, 5=Inferior
-        viewAngleDeg: camera view angle (degrees). SMALLER => zoom-in (more magnification).
-        dollyFactor: camera dolly. >1 => closer.
+        axisIndex matches Slicer rotateToViewAxis:
+          0=Right, 1=Left, 2=Posterior, 3=Anterior, 4=Superior, 5=Inferior
         """
+        import slicer
+
         threeDView.rotateToViewAxis(int(axisIndex))
         threeDView.resetFocalPoint()
         threeDView.resetCamera()
@@ -955,9 +954,29 @@ class DicomProcessor:
         except Exception:
             pass
 
-    def _apply_soft_tissue_transfer_function(self, displayNode):
+    def _choose_best_volume_node(self, loadedNodeIDs):
+        """Pick the most suitable scalar volume for rendering (avoid BONE if possible)."""
+        candidates = []
+        for nid in loadedNodeIDs:
+            n = slicer.mrmlScene.GetNodeByID(nid)
+            if n and n.IsA("vtkMRMLScalarVolumeNode"):
+                img = n.GetImageData()
+                dims = img.GetDimensions() if img else (0, 0, 0)
+                vox = int(dims[0] * dims[1] * max(1, dims[2]))
+                name = (n.GetName() or "").upper()
+                penalty = 0
+                if "BONE" in name:
+                    penalty += 1000000000
+                candidates.append((penalty, -vox, n))
+        if not candidates:
+            vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            return vols[0] if vols else None
+        candidates.sort()
+        return candidates[0][2]
+
+    def _apply_new_soft_tissue_opacity(self, displayNode):
         """
-        Apply your provided soft-tissue oriented transfer functions.
+        Apply YOUR NEW opacity tuning after preset Copy().
         """
         try:
             propNode = displayNode.GetVolumePropertyNode()
@@ -967,41 +986,27 @@ class DicomProcessor:
             if not vp:
                 return
 
-            so = vp.GetScalarOpacity()
-            so.RemoveAllPoints()
-            so.AddPoint(-1000, 0.00)
-            so.AddPoint(-700, 0.00)
-            so.AddPoint(-200, 0.02)
-            so.AddPoint(-100, 0.05)
-            so.AddPoint(-50, 0.10)
-            so.AddPoint(0, 0.18)
-            so.AddPoint(40, 0.28)
-            so.AddPoint(80, 0.35)
-            so.AddPoint(300, 0.20)
-            so.AddPoint(700, 0.25)
-            so.AddPoint(1200, 0.30)
+            sof = vp.GetScalarOpacity()
+            sof.RemoveAllPoints()
 
-            ct = vp.GetRGBTransferFunction()
-            ct.RemoveAllPoints()
-            ct.AddRGBPoint(-1000, 0.00, 0.00, 0.00)
-            ct.AddRGBPoint(-200, 0.25, 0.25, 0.25)
-            ct.AddRGBPoint(0, 0.55, 0.55, 0.55)
-            ct.AddRGBPoint(80, 0.70, 0.70, 0.70)
-            ct.AddRGBPoint(300, 0.85, 0.85, 0.85)
-            ct.AddRGBPoint(1200, 1.00, 1.00, 1.00)
+            # Start rendering at -40 HU (opacity 0 at/under -40)
+            sof.AddPoint(-200, 0.0)
+            sof.AddPoint(-40,  0.0)
 
-            go = vp.GetGradientOpacity()
-            go.RemoveAllPoints()
-            go.AddPoint(0, 0.00)
-            go.AddPoint(30, 0.20)
-            go.AddPoint(80, 0.60)
-            go.AddPoint(120, 0.90)
+            # Soft tissue becomes visible
+            sof.AddPoint(0,    0.05)
+            sof.AddPoint(50,   0.15)
+            sof.AddPoint(150,  0.35)
+
+            # Bone becomes strong
+            sof.AddPoint(300,  0.6)
+            sof.AddPoint(700,  1.0)
 
             try:
                 vp.SetShade(True)
-                vp.SetAmbient(0.25)
-                vp.SetDiffuse(0.75)
-                vp.SetSpecular(0.15)
+                vp.SetAmbient(0.2)
+                vp.SetDiffuse(0.9)
+                vp.SetSpecular(0.1)
             except Exception:
                 pass
         except Exception:
@@ -1010,7 +1015,7 @@ class DicomProcessor:
     def _find_all_dicom_dirs(self, rootFolder):
         """
         Return ALL directories (under rootFolder) that contain at least one DICOM file.
-        This matches your requirement: "every subfolder that contains DICOMs".
+        Uses pydicom header read only.
         """
         import pydicom
 
@@ -1036,46 +1041,57 @@ class DicomProcessor:
 
         return sorted(set(dicom_dirs))
 
-    def _choose_best_volume_node(self, loadedNodeIDs):
-        """Pick the most suitable scalar volume for rendering (avoid BONE if possible)."""
-        candidates = []
-        for nid in loadedNodeIDs:
-            n = slicer.mrmlScene.GetNodeByID(nid)
-            if n and n.IsA("vtkMRMLScalarVolumeNode"):
-                img = n.GetImageData()
-                dims = img.GetDimensions() if img else (0, 0, 0)
-                vox = int(dims[0] * dims[1] * max(1, dims[2]))
-                name = (n.GetName() or "").upper()
-                penalty = 0
-                if "BONE" in name:
-                    penalty += 1000000000
-                candidates.append((penalty, -vox, n))
-        if not candidates:
-            vols = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
-            return vols[0] if vols else None
-        candidates.sort()
-        return candidates[0][2]
-
-    def _render_one_dicom_folder(self, dicomDir, out_prefix="3d"):
+    def _render_one_dicom_folder(self, dicomDir, out_prefix="view"):
         """
-        Load DICOMs from dicomDir and create 4 snapshots inside that same folder.
-        Returns list of output png paths.
+        NEW RENDER (your code), but FIXED to import ONLY dicom slices (ignore log.txt/png/etc).
+        Renders ONLY 4 files: anterior, left, right, posterior.
         """
+        import tempfile
+        import shutil as _shutil
         from DICOMLib import DICOMUtils
+
+        # collect only DICOM files in dicomDir
+        dicom_files = []
+        for fn in os.listdir(dicomDir):
+            fp = os.path.join(dicomDir, fn)
+            if not os.path.isfile(fp):
+                continue
+            if self.is_dicom(fp, remove_CTA=False):
+                dicom_files.append(fp)
+
+        if not dicom_files:
+            raise RuntimeError(f"No DICOM files found in: {dicomDir}")
 
         lm = slicer.app.layoutManager()
         if lm is None:
             raise RuntimeError("No layoutManager available. Run with Slicer GUI (3D view required).")
 
+        # Clear scene each folder (your behavior)
         slicer.mrmlScene.Clear(False)
         slicer.app.processEvents()
 
-        with DICOMUtils.TemporaryDICOMDatabase() as db:
-            DICOMUtils.importDicom(dicomDir, db)
-            patientUIDs = db.patients()
-            if not patientUIDs:
-                raise RuntimeError(f"No DICOM patients found in: {dicomDir}")
-            loadedNodeIDs = DICOMUtils.loadPatientByUID(patientUIDs[0])
+        # temp folder with only dicoms => prevents Qt errors on log.txt/png
+        tmp_root = tempfile.mkdtemp(prefix="slicer_dicoms_")
+        try:
+            for i, src in enumerate(sorted(dicom_files), start=1):
+                dst = os.path.join(tmp_root, f"slice_{i:06d}.dcm")
+                try:
+                    _shutil.copy2(src, dst)
+                except Exception:
+                    _shutil.copy(src, dst)
+
+            # Import/load DICOM
+            with DICOMUtils.TemporaryDICOMDatabase() as db:
+                DICOMUtils.importDicom(tmp_root, db)
+                patientUIDs = db.patients()
+                if not patientUIDs:
+                    raise RuntimeError(f"No DICOM patients found in: {dicomDir}")
+                loadedNodeIDs = DICOMUtils.loadPatientByUID(patientUIDs[0])
+        finally:
+            try:
+                _shutil.rmtree(tmp_root, ignore_errors=True)
+            except Exception:
+                pass
 
         volumeNode = self._choose_best_volume_node(loadedNodeIDs)
         if volumeNode is None:
@@ -1094,13 +1110,15 @@ class DicomProcessor:
         if displayNode is None:
             raise RuntimeError("Failed to create Volume Rendering display node.")
 
-        preset_names_to_try = ["CT-Soft-Tissue", "CT Abdomen", "CT-AAA", "CT Bone", "CT Air"]
+        # your preset list
+        preset_names_to_try = ["CT-Soft-Tissue", "CT Abdomen", "CT-AAA", "CT Air", "CT Bone"]
         presetNode = None
         for pname in preset_names_to_try:
             p = vrLogic.GetPresetByName(pname)
             if p:
                 presetNode = p
                 break
+
         if presetNode:
             propNode = displayNode.GetVolumePropertyNode()
             if propNode:
@@ -1109,7 +1127,8 @@ class DicomProcessor:
                 except Exception:
                     pass
 
-        self._apply_soft_tissue_transfer_function(displayNode)
+        # apply your NEW opacity tuning
+        self._apply_new_soft_tissue_opacity(displayNode)
 
         displayNode.SetVisibility(1)
         try:
@@ -1119,9 +1138,9 @@ class DicomProcessor:
 
         threeDView = lm.threeDWidget(0).threeDView()
 
-        # Only 4 views (NO superior)
+        # ONLY 4 views (no superior)
         views = [
-            ("anterior", 3, 1.8, 12.0),
+            ("anterior", 3, 1.4, 12.0),
             ("left",     1, 2.2, 12.0),
             ("right",    0, 2.2, 12.0),
             ("posterior", 2, 2.2, 12.0),
@@ -1129,19 +1148,22 @@ class DicomProcessor:
 
         outputs = []
         for name, axisIndex, dolly, angle in views:
-            self._set_view_and_zoom(threeDView, axisIndex=axisIndex, dollyFactor=dolly, viewAngleDeg=angle)
+            self._set_view_and_zoom(
+                threeDView,
+                axisIndex=axisIndex,
+                dollyFactor=dolly,
+                viewAngleDeg=angle,
+            )
             out_path = os.path.join(dicomDir, f"{out_prefix}_{name}.png")
             self._capture_threeDView_png(threeDView, out_path)
             outputs.append(out_path)
 
         return outputs
 
-    def _create_and_save_multi_view_snapshots(self, patientFolder, out_prefix="3d"):
+    def _create_and_save_multi_view_snapshots(self, patientFolder, out_prefix="view"):
         """
-        NEW BEHAVIOR (as requested):
-        - patientFolder is the patient-level output folder (new_folder_name).
         - Find ALL subfolders/sub-subfolders under patientFolder that contain DICOM slices.
-        - For EACH DICOM-containing folder => generate snapshots into that folder.
+        - For EACH DICOM-containing folder => render 4 PNGs in that folder.
         """
         dicom_dirs = self._find_all_dicom_dirs(patientFolder)
         if not dicom_dirs:
@@ -1153,7 +1175,6 @@ class DicomProcessor:
                 outs = self._render_one_dicom_folder(d, out_prefix=out_prefix)
                 all_outputs.extend(outs)
             except Exception as e:
-                # keep going; write a per-folder render log
                 try:
                     with open(os.path.join(d, "render_log.txt"), "a") as f:
                         f.write(f"[{datetime.now()}] Render failed: {e}\n")
@@ -1167,6 +1188,10 @@ class DicomProcessor:
 
         return all_outputs
 
+    # -----------------------------------------------------------------------
+    # MAIN PIPELINE
+    # -----------------------------------------------------------------------
+
     def drown_volume(
         self,
         in_path,
@@ -1179,14 +1204,12 @@ class DicomProcessor:
         remove_CTA=False,
     ):
         """
-        Phase 1: process while mirroring input structure.
-        Phase 2: rename, at each level, immediate subdirectories to <id>_<n> (1-based),
-                 preserving nesting; uses only os.rename (safe two-step).
-        Phase 3: snapshot generation (VR 3D): every DICOM-containing subfolder under out_path
-                 gets 4 views: anterior, left, right, posterior.
+        Phase 1: mirror + write anonymized slices
+        Phase 2: rename immediate subdirectories at each level to <id>_<n>
+        Phase 3: snapshots (DICOM-only import), 4 views
         """
         try:
-            # Phase 1: mirror + write anonymized slices
+            # Phase 1
             for root, dirs, files in os.walk(in_path):
                 rel = os.path.relpath(root, in_path)
                 out_dir = os.path.join(out_path, rel)
@@ -1204,7 +1227,7 @@ class DicomProcessor:
                         remove_CTA=remove_CTA,
                     )
 
-            # Phase 2: per-level renaming to <id>_<n>
+            # Phase 2
             for curr, subdirs, files in os.walk(out_path, topdown=True):
                 if not subdirs:
                     continue
@@ -1228,10 +1251,9 @@ class DicomProcessor:
 
                 subdirs[:] = new_names
 
-            # Phase 3: snapshots (use your renderer)
-            # out_path is the patient-level folder in this function.
+            # Phase 3
             try:
-                self._create_and_save_multi_view_snapshots(out_path, out_prefix="3d")
+                self._create_and_save_multi_view_snapshots(out_path, out_prefix="view")
             except Exception as e:
                 try:
                     with open(os.path.join(out_path, "render_summary.txt"), "a") as f:
