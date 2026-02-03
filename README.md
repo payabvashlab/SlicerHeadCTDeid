@@ -1,4 +1,4 @@
-# Head CT de-identification tool
+<img width="110" height="17" alt="image" src="https://github.com/user-attachments/assets/a5cc31b3-e110-47d3-931c-13984b57f93c" /># Head CT de-identification tool
 <h2>Summary</h2>
 
 Approximately 15% to 30% of CT scans performed annually in the United States are head CTs [1, 2]. As a rapid and widely accessible modality, head CT is the first line of imaging to evaluate acute brain injury, cerebrovascular accidents, altered mental status, and post-procedural monitoring. Sharing head CT scans across institutions can facilitate the creation of large datasets for training deep learning models to guide treatment decisions in acute clinical settings. 
@@ -75,7 +75,7 @@ The application requires three inputs: the address of folder that contains the D
 
 <img width="999" alt="input" src="https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/images/input.png" />
 
-2.	<b>Excel File</b>: The Excel file should contain two columns with the following headers in the first row: <b>Accession_number</b> and <b>New_ID</b>. Each "accession number" must match a patient folder name in the input directory. The application will treat each "accession number" as a unique patient identifier, use it to locate and process the corresponding folder, and then rename the folder using the associated "New_ID" from the same row. Both "accession numbers" and "New_IDs" can be any combination of alphanumeric characters.
+2.	<b>Excel File</b>: The Excel file should contain two columns with the following headers in the first row: <b>original_folder_name</b> and <b>new_folder_name</b>. Each "original_folder_name" must match a patient folder name in the input directory. The application will treat each "original_folder_name" as a unique patient identifier, use it to locate and process the corresponding folder, and then rename the folder using the associated "new_folder_name" from the same row. Both "original_folder_name" and "new_folder_name" can be any combination of alphanumeric characters.
 
 <img width="455" alt="list" src="https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/images/list.png" />
 
