@@ -79,7 +79,7 @@ The application requires three inputs: the address of folder that contains the D
 
 <img width="455" alt="list" src="https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/images/Fig S6.png" />
 
-3.	<b>Output folde</b>r: The output folder specifies the directory where de-identified DICOM files will be saved. After de-identification, axial head CT DICOM files will be stored in a new set of folders, each renamed using the corresponding "New_ID" from the Excel file, replacing the original patient folder names. Additionally, the DICOM tag *Accession Number (0008,0050)* will be replaced by the "New_ID".
+3.	<b>Output folde</b>r: The output folder specifies the directory where de-identified DICOM files will be saved. After de-identification, axial head CT DICOM files will be stored in a new set of folders, each renamed using the corresponding "new_folder_name" from the Excel file, replacing the original patient folder names. Additionally, the DICOM tag *Accession Number (0008,0050)* will be replaced by the "new_folder_name".
 
 <img width="772" alt="folder" src="https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/images/folder.png" />
 
