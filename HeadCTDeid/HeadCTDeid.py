@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+"""
+HeadCTDeid (3D Slicer scripted module)
+"""
+
+import glob
 import logging
 import os
 import random
@@ -18,14 +23,29 @@ from slicer.util import VTKObservationMixin
 
 warnings.filterwarnings("ignore")
 
-# HU ranges used for “face/soft-tissue” sampling
+# 1) Where to pip-install SAM2 from (must be pip-installable)
+SAM2_PIP_SOURCE = "git+https://github.com/facebookresearch/segment-anything-2.git"
+
+# 2) Direct checkpoint URL (.pt) (must be a direct file download, not a web page)
+SAM2_CKPT_URL = "https://huggingface.co/facebook/sam2-hiera-small/resolve/main/sam2_hiera_small.pt?download=true"
+
+# 3) Direct config URL (.yaml)
+SAM2_CFG_URL = "https://huggingface.co/facebook/sam2-hiera-small/resolve/main/sam2_hiera_s.yaml?download=true"
+
+# Filenames saved under Resources/models/
+SAM2_CKPT_FILENAME = "sam2_hiera_small.pt"
+SAM2_CFG_FILENAME = "sam2_hiera_s.yaml"
+
+# =============================================================================
+
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 AIR_THRESHOLD = -800
-
+BONE_STOP_HU = 250  # tune 250-350 if needed
+FRONT_BOOST_KERNEL = (3, 3)
 
 # ---------------------------------------------------------------------------
-# DICOM tags to de-id 101 tags
+# DICOM tags to de-id (your list)
 # ---------------------------------------------------------------------------
 PDF_TAGS_TO_DEID = {
     (0x0008, 0x0014),
@@ -133,12 +153,41 @@ PDF_TAGS_TO_DEID = {
 
 
 # ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _to_str(x):
+    """Convert pydicom values / DataElement / raw types to lowercase stripped string."""
+    try:
+        if x is None:
+            return ""
+        if hasattr(x, "value"):
+            x = x.value
+        if isinstance(x, (list, tuple)):
+            if not x:
+                return ""
+            x = x[0]
+        return str(x).strip().lower()
+    except Exception:
+        return ""
+
+
+def dicom_has_burned_in(ds) -> bool:
+    try:
+        bia_val = getattr(ds, "BurnedInAnnotation", None)
+        if bia_val is None:
+            bia_val = ds.get((0x0028, 0x0301), None)
+        v = _to_str(bia_val)
+        return v in {"yes", "y", "true", "1"}
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Module
 # ---------------------------------------------------------------------------
 
 class HeadCTDeid(ScriptedLoadableModule):
-    """ScriptedLoadableModule base (3D Slicer)."""
-
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
         self.parent.title = "Head CT De-identification"
@@ -191,6 +240,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         import vtk
         if inputParameterNode:
             self.logic.setDefaultParameters(inputParameterNode)
+
         if self._parameterNode is not None:
             self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
         self._parameterNode = inputParameterNode
@@ -238,23 +288,44 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-            import gdcm  
+            import gdcm  # noqa: F401
             try:
                 slicer.util.infoDisplay(
-                    "This tool is a work-in-progress being validated in project. Contact sp4479@columbia.edu for details. Use at your own risk.",
-                    windowTitle="Warning"
+                    "This tool is a work-in-progress being validated in project. "
+                    "Contact sp4479@columbia.edu for details. Use at your own risk.",
+                    windowTitle="Warning",
                 )
-                self.logic.setupPythonRequirements()
+
+                remove_text = self.ui.deidentifyCheckbox.isChecked()
+                remove_cta = self.ui.deidentifyCTACheckbox.isChecked()
+
+                # Base deps always; SAM2 deps only if remove_text
+                self.logic.setupPythonRequirements(remove_text=remove_text)
+
+                pn = self.logic.getParameterNode()
+
+                # Ensure SAM2 and download ONLY when remove_text True
+                if remove_text:
+                    ckpt_path, cfg_path = self.logic.ensureSAM2AutoDownload(parameterNode=pn)
+                    if pn is not None:
+                        pn.SetParameter("SAM2_CKPT", os.path.abspath(ckpt_path))
+                        pn.SetParameter("SAM2_CONFIG", os.path.abspath(cfg_path))
+
                 if self.ui.progressBar:
                     self.ui.progressBar.setValue(0)
+
+                ckpt = pn.GetParameter("SAM2_CKPT") if pn else ""
+                cfg = pn.GetParameter("SAM2_CONFIG") if pn else ""
 
                 self.logic.process(
                     self.ui.inputFolderButton.directory,
                     self.ui.excelFileButton.text,
                     self.ui.outputFolderButton.directory,
-                    self.ui.deidentifyCheckbox.isChecked(),
-                    self.ui.deidentifyCTACheckbox.isChecked(),
+                    remove_text,
+                    remove_cta,
                     self.ui.progressBar,
+                    sam2_ckpt=ckpt,
+                    sam2_cfg=cfg,
                 )
             except Exception as e:
                 slicer.util.errorDisplay(f"Error: {str(e)}")
@@ -262,7 +333,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.pip_install("python-gdcm==3.0.25")
             slicer.util.infoDisplay(
                 "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
-                windowTitle="Warning"
+                windowTitle="Warning",
             )
 
     def onBrowseExcelFile(self):
@@ -295,41 +366,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         except ModuleNotFoundError:
             return False
 
-    def setupPythonRequirements(self, upgrade=False):
-        def install(package):
-            slicer.util.pip_install(package)
-
-        try:
-            import pandas  # noqa
-        except ModuleNotFoundError:
-            slicer.util.pip_install("pandas==2.2.3")
-        try:
-            import openpyxl  # noqa
-        except ModuleNotFoundError:
-            slicer.util.pip_install("openpyxl")
-        try:
-            import pydicom  # noqa
-        except ModuleNotFoundError:
-            slicer.util.pip_install("pydicom")
-            slicer.util.pip_install("pylibjpeg")
-            slicer.util.pip_install("pylibjpeg-libjpeg")
-            slicer.util.pip_install("pylibjpeg-openjpeg")
-        try:
-            import cv2  # noqa
-        except ModuleNotFoundError:
-            slicer.util.pip_install("opencv-python")
-
-        if not self._checkModuleInstalled("scikit-image"):
-            install("scikit-image")
-
-        if not self._checkModuleInstalled("easyocr"):
-            slicer.util.pip_install(
-                ["torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cpu"]
-            )
-
-        self.dependenciesInstalled = True
-        logging.debug("Dependencies are set up successfully.")
-
     def setDefaultParameters(self, parameterNode):
         if not parameterNode.GetParameter("InputFolder"):
             parameterNode.SetParameter("InputFolder", "")
@@ -341,6 +377,173 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             parameterNode.SetParameter("Deidentify", "false")
         if not parameterNode.GetParameter("DeidentifyCTA"):
             parameterNode.SetParameter("DeidentifyCTA", "false")
+        if not parameterNode.GetParameter("SAM2_CKPT"):
+            parameterNode.SetParameter("SAM2_CKPT", "")
+        if not parameterNode.GetParameter("SAM2_CONFIG"):
+            parameterNode.SetParameter("SAM2_CONFIG", "")
+
+    # ---------------------------------------------------------------------
+    # SAM2 install + auto-download (NO dialogs) - called only when remove_text
+    # ---------------------------------------------------------------------
+    def ensureSAM2AutoDownload(self, parameterNode=None, force_reinstall=False, force_redownload=False):
+        import importlib
+        import urllib.request
+
+        if not SAM2_PIP_SOURCE:
+            raise RuntimeError("SAM2_PIP_SOURCE is empty. Set it at top of module.")
+        if not SAM2_CKPT_URL or not SAM2_CFG_URL:
+            raise RuntimeError("SAM2_CKPT_URL / SAM2_CFG_URL must be set at top of module.")
+
+        def pip_install(args):
+            slicer.util.pip_install(args)
+
+        # Torch: prefer CPU wheels to avoid CUDA mismatch inside Slicer.
+        # SAM2 will still use GPU if your torch has CUDA and torch.cuda.is_available() is True.
+        try:
+            import torch
+        except Exception:
+            try:
+                # Quick heuristic: nvidia-smi exists
+                import subprocess
+                has_nvidia = False
+                try:
+                    r = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+                    has_nvidia = (r.returncode == 0)
+                except Exception:
+                    has_nvidia = False
+
+                if has_nvidia:
+                    slicer.util.showStatusMessage("Installing PyTorch (CUDA) ...")
+                    pip_install([
+                        "torch", "torchvision",
+                        "--index-url", "https://download.pytorch.org/whl/cu121"
+                    ])
+                else:
+                    slicer.util.showStatusMessage("Installing PyTorch (CPU) ...")
+                    pip_install(["torch", "torchvision"])
+            except Exception:
+                pip_install(["torch", "torchvision"])
+
+        # common deps (best-effort)
+        for pkg in ["opencv-python", "hydra-core", "omegaconf", "tqdm", "pyyaml"]:
+            try:
+                __import__(pkg.split("-")[0])
+            except Exception:
+                try:
+                    pip_install(pkg)
+                except Exception:
+                    pass
+
+        # sam2 pip install
+        need_install = force_reinstall
+        try:
+            import sam2
+        except Exception:
+            need_install = True
+
+        if need_install:
+            slicer.util.showStatusMessage("Installing SAM2 package ...")
+            pip_install(SAM2_PIP_SOURCE)
+
+        importlib.invalidate_caches()
+
+        try:
+            import sam2
+        except Exception as e:
+            raise RuntimeError(f"SAM2 install/import failed: {e}")
+
+        # Local model dir (inside module)
+        module_dir = os.path.dirname(__file__)
+        model_dir = os.path.join(module_dir, "Resources", "models")
+        os.makedirs(model_dir, exist_ok=True)
+
+        default_ckpt_path = os.path.abspath(os.path.join(model_dir, SAM2_CKPT_FILENAME))
+        default_cfg_path = os.path.abspath(os.path.join(model_dir, SAM2_CFG_FILENAME))
+
+        # Read any existing paths from parameter node (if provided)
+        pn_ckpt = ""
+        pn_cfg = ""
+        if parameterNode is not None:
+            pn_ckpt = (parameterNode.GetParameter("SAM2_CKPT") or "").strip()
+            pn_cfg = (parameterNode.GetParameter("SAM2_CONFIG") or "").strip()
+
+        # Use PN paths if they exist; otherwise fall back to defaults
+        ckpt_path = os.path.abspath(pn_ckpt) if (pn_ckpt and os.path.exists(pn_ckpt)) else default_ckpt_path
+        cfg_path = os.path.abspath(pn_cfg) if (pn_cfg and os.path.exists(pn_cfg)) else default_cfg_path
+
+        def _download(url, out_path):
+            tmp = out_path + ".part"
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+            slicer.util.showStatusMessage(f"Downloading {os.path.basename(out_path)} ...")
+            urllib.request.urlretrieve(url, tmp)
+
+            if (not os.path.exists(tmp)) or (os.path.getsize(tmp) < 1024):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Downloaded file looks invalid/too small: {url}")
+
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            os.replace(tmp, out_path)
+
+        if force_redownload or (not os.path.exists(cfg_path)):
+            _download(SAM2_CFG_URL, cfg_path)
+
+        if force_redownload or (not os.path.exists(ckpt_path)):
+            _download(SAM2_CKPT_URL, ckpt_path)
+
+        if not (os.path.exists(cfg_path) and os.path.exists(ckpt_path)):
+            raise RuntimeError("SAM2 config/checkpoint missing after download (check URLs and network).")
+
+        # Update PN with absolute resolved files
+        if parameterNode is not None:
+            parameterNode.SetParameter("SAM2_CKPT", os.path.abspath(ckpt_path))
+            parameterNode.SetParameter("SAM2_CONFIG", os.path.abspath(cfg_path))
+
+        return os.path.abspath(ckpt_path), os.path.abspath(cfg_path)
+
+    def setupPythonRequirements(self, remove_text=False, upgrade=False):
+        def install(package):
+            slicer.util.pip_install(package)
+
+        try:
+            import pandas
+        except ModuleNotFoundError:
+            install("pandas==2.2.3")
+
+        try:
+            import openpyxl
+        except ModuleNotFoundError:
+            install("openpyxl")
+
+        try:
+            import pydicom
+        except ModuleNotFoundError:
+            install("pydicom")
+            install("pylibjpeg")
+            install("pylibjpeg-libjpeg")
+            install("pylibjpeg-openjpeg")
+
+        try:
+            import cv2
+        except ModuleNotFoundError:
+            install("opencv-python")
+
+        if not self._checkModuleInstalled("scikit-image"):
+            install("scikit-image")
+
+        self.dependenciesInstalled = True
 
     def _ensure_logger(self, outputFolder):
         try:
@@ -361,7 +564,17 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         except Exception:
             pass
 
-    def process(self, inputFolder, excelFile, outputFolder, remove_text, remove_CTA, progressBar):
+    def process(
+        self,
+        inputFolder,
+        excelFile,
+        outputFolder,
+        remove_text,
+        remove_CTA,
+        progressBar,
+        sam2_ckpt="",
+        sam2_cfg="",
+    ):
         import pandas
 
         if not os.path.exists(inputFolder):
@@ -402,7 +615,16 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                 try:
                     start_time = time.time()
                     dst_folder = os.path.join(out_path, id_mapping[foldername])
-                    processor = DicomProcessor()
+
+                    sam2_ckpt_abs = os.path.abspath(sam2_ckpt) if sam2_ckpt else ""
+                    sam2_cfg_abs = os.path.abspath(sam2_cfg) if sam2_cfg else ""
+
+                    processor = DicomProcessor(
+                        sam2_ckpt=sam2_ckpt_abs,
+                        sam2_cfg=sam2_cfg_abs,
+                        enable_sam2=bool(remove_text),
+                    )
+
                     src_folder = os.path.join(inputFolder, foldername)
 
                     _ = processor.drown_volume(
@@ -468,33 +690,261 @@ class HeadCTDeidTest(ScriptedLoadableModuleTest):
 
 class DicomProcessor:
     """
-    Phase 1: Walk input tree, mirror structure to out_path and write anonymized DICOMs.
-    Phase 2: For every directory level under out_path, rename its immediate subfolders
-             in sorted order to <id>_<1..N>, preserving the nesting depth.
-    Phase 3: snapshot generation (VR 3D) for every subfolder containing DICOMs.
-             IMPORTANT UPDATE:
-               - Render imports ONLY DICOM files (ignores log.txt/png/etc)
-               - Renders ONLY 4 views: anterior, left, right, posterior
+    Pipeline: de-identification + face/air replacement + optional SAM2 burned-in text removal.
+    SAM2 is ONLY used when:
+      - remove_text is True, AND
+      - dicom_has_burned_in(ds) is True for the current slice.
     """
 
-    def __init__(self):
+    def __init__(self, sam2_ckpt="", sam2_cfg="", enable_sam2=False):
         self.error = ""
         self.net = ""
         self.study_uid_map = defaultdict(str)
         self.series_uid_map = defaultdict(str)
         self.sop_uid_map = defaultdict(str)
         self.uid_map_general = defaultdict(str)
-        self._ocr_reader = None
 
-    def _get_ocr_reader(self):
-        if self._ocr_reader is None:
+        self.logger = logging.getLogger("PatientProcessor")
+
+        # SAM2 state
+        self._sam2_enabled = bool(enable_sam2)
+        self._sam2_ready = False
+        self._sam2_ckpt = os.path.abspath(sam2_ckpt) if sam2_ckpt else ""
+        self._sam2_cfg = os.path.abspath(sam2_cfg) if sam2_cfg else ""
+        self._sam2_device = "cpu"
+        self._sam2_mask_generator = None
+
+        if self._sam2_enabled:
+            self._try_init_sam2()
+
+    # ---------------------------------------------------------
+    # SAM2 init
+    # ---------------------------------------------------------
+    def _try_init_sam2(self):
+        if not self._sam2_enabled:
+            self._sam2_ready = False
+            self._sam2_mask_generator = None
+            return
+
+        try:
+            import os
+            import shutil
+            import torch
+            import sam2
+            from sam2.build_sam import build_sam2
+            from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+        except Exception as e:
+            self._sam2_ready = False
+            self._sam2_mask_generator = None
             try:
-                import easyocr
-                self._ocr_reader = easyocr.Reader(["en"])
+                self.logger.error(f"SAM2 import failed: {e}")
             except Exception:
-                self._ocr_reader = None
-        return self._ocr_reader
+                pass
+            return
 
+        # normalize paths to real filesystem paths
+        ckpt_path = os.path.abspath(self._sam2_ckpt) if self._sam2_ckpt else ""
+        cfg_path  = os.path.abspath(self._sam2_cfg)  if self._sam2_cfg  else ""
+
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            self._sam2_ready = False
+            self._sam2_mask_generator = None
+            try:
+                self.logger.error(f"SAM2 checkpoint missing: {ckpt_path}")
+            except Exception:
+                pass
+            return
+
+        if not cfg_path or not os.path.exists(cfg_path):
+            self._sam2_ready = False
+            self._sam2_mask_generator = None
+            try:
+                self.logger.error(f"SAM2 config missing: {cfg_path}")
+            except Exception:
+                pass
+            return
+
+        # IMPORTANT: build_sam2 expects a Hydra config NAME, not a path
+        cfg_name = os.path.basename(cfg_path)
+
+        # Copy YAML into sam2 package dir so Hydra provider pkg://sam2 can find it
+        try:
+            sam2_pkg_dir = os.path.dirname(sam2.__file__)
+            target_cfg_path = os.path.join(sam2_pkg_dir, cfg_name)
+
+            need_copy = True
+            if os.path.exists(target_cfg_path):
+                try:
+                    if os.path.getsize(target_cfg_path) == os.path.getsize(cfg_path):
+                        need_copy = False
+                except Exception:
+                    need_copy = True
+
+            if need_copy:
+                try:
+                    shutil.copy2(cfg_path, target_cfg_path)
+                except Exception:
+                    with open(cfg_path, "rb") as rf, open(target_cfg_path, "wb") as wf:
+                        wf.write(rf.read())
+
+            # sanity check: if copy failed, Hydra will still fail, so warn early
+            if not os.path.exists(target_cfg_path):
+                raise RuntimeError(f"Failed to place config into sam2 package dir: {target_cfg_path}")
+
+        except Exception as e:
+            # If we cannot copy into package dir (permissions), Hydra won't see the config by name.
+            self._sam2_ready = False
+            self._sam2_mask_generator = None
+            try:
+                self.logger.error(
+                    "SAM2 init failed: cannot place yaml into sam2 package dir for Hydra to find. "
+                    f"Error: {e}"
+                )
+            except Exception:
+                pass
+            return
+
+        # robust GPU detection
+        device = "cpu"
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.current_device()
+                device = "cuda"
+        except Exception:
+            device = "cpu"
+        self._sam2_device = device
+
+        try:
+            self.logger.info(f"SAM2 build with cfg_name={cfg_name}, ckpt={ckpt_path}, device={device}")
+        except Exception:
+            pass
+
+        try:
+            # Pass ONLY cfg_name (Hydra primary config), not a path
+            model = build_sam2(cfg_name, ckpt_path, device=device)
+
+            if device == "cuda":
+                try:
+                    model.to("cuda")
+                except Exception:
+                    try:
+                        self.logger.warning("CUDA detected but model.to(cuda) failed. Falling back to CPU.")
+                    except Exception:
+                        pass
+                    device = "cpu"
+                    self._sam2_device = "cpu"
+                    model = build_sam2(cfg_name, ckpt_path, device="cpu")
+
+            self._sam2_mask_generator = SAM2AutomaticMaskGenerator(
+                model,
+                points_per_side=24,
+                pred_iou_thresh=0.85,
+                stability_score_thresh=0.90,
+                crop_n_layers=1,
+                crop_n_points_downscale_factor=2,
+                min_mask_region_area=128,
+            )
+            self._sam2_ready = True
+            try:
+                self.logger.info("SAM2 initialized successfully.")
+            except Exception:
+                pass
+
+        except Exception as e:
+            self._sam2_ready = False
+            self._sam2_mask_generator = None
+            try:
+                self.logger.error(f"SAM2 init failed: {e}")
+            except Exception:
+                pass
+
+    def _get_sam2_generator(self):
+        if not self._sam2_enabled:
+            return None
+        if self._sam2_mask_generator is None and not self._sam2_ready:
+            self._try_init_sam2()
+        return self._sam2_mask_generator
+
+    # ---------------------------------------------------------
+    # SAM2-based "text overlay" removal
+    # ---------------------------------------------------------
+    def _sam2_text_mask(self, rgb_uint8):
+        gen = self._get_sam2_generator()
+        if gen is None:
+            return None
+        try:
+            H, W = rgb_uint8.shape[:2]
+            masks = gen.generate(rgb_uint8)
+            if not masks:
+                return None
+
+            out = np.zeros((H, W), dtype=np.uint8)
+            border = int(max(8, round(min(H, W) * 0.08)))  # ~8% border band
+
+            for m in masks:
+                seg = m.get("segmentation", None)
+                bbox = m.get("bbox", None)
+                if seg is None or bbox is None:
+                    continue
+
+                x, y, bw, bh = bbox
+                x = int(x); y = int(y); bw = int(bw); bh = int(bh)
+
+                area = int(np.sum(seg))
+                if area <= 0:
+                    continue
+                if area > 0.02 * (H * W):
+                    continue
+
+                near_border = (x <= border) or (y <= border) or ((x + bw) >= (W - border)) or ((y + bh) >= (H - border))
+                if not near_border:
+                    continue
+
+                if bw > 0.9 * W and bh < 0.02 * H:
+                    continue
+                if bh > 0.9 * H and bw < 0.02 * W:
+                    continue
+
+                out[seg.astype(bool)] = 1
+
+            if out.max() == 0:
+                return None
+            return out
+        except Exception:
+            return None
+
+    def _remove_text_with_sam2(self, new_volume_hu, pixels_hu):
+        if not (self._sam2_enabled and self._sam2_ready):
+            return new_volume_hu
+        try:
+            import cv2
+
+            mn, mx = int(np.min(pixels_hu)), int(np.max(pixels_hu))
+            rng = max(1, mx - mn)
+            gray8 = np.uint8(((pixels_hu - mn) / rng) * 255.0)
+            rgb = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+
+            m = self._sam2_text_mask(rgb)
+            if m is None:
+                return new_volume_hu
+
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            m2 = cv2.dilate(m.astype(np.uint8), k, iterations=1).astype(bool)
+
+            out = np.array(new_volume_hu, copy=True)
+            out[m2] = -1000
+            return out
+        except Exception as e:
+            try:
+                self.logger.error(f"_remove_text_with_sam2 {e}")
+            except Exception:
+                pass
+            slicer.util.showStatusMessage(f"_remove_text_with_sam2 {e}")
+            return new_volume_hu
+
+    # ---------------------------------------------------------
+    # CT helpers
+    # ---------------------------------------------------------
     def is_dicom(self, file_path, remove_CTA=False):
         import pydicom
         try:
@@ -543,12 +993,6 @@ class DicomProcessor:
         return self.largest_connected_component(volume)
 
     def _kernel_from_pixel_spacing(self, ds):
-        """
-        Kernel range based on PixelSpacing (0028,0030), first component:
-          lo = ceil(10/pixel)
-          hi = ceil(15/pixel)
-        fallback: random 30..40 if missing/invalid.
-        """
         try:
             ps = ds.get((0x0028, 0x0030), None)
             if ps is None:
@@ -577,27 +1021,15 @@ class DicomProcessor:
         except Exception:
             return random.randint(30, 40)
 
-    def dilate_volume(self, volume, kernel_size):
-        import cv2
-        k = int(kernel_size)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        return cv2.dilate(volume.astype(np.uint8), kernel)
-
     def apply_mask_and_get_values(self, image_volume, mask_volume):
         masked = image_volume * mask_volume
         vals = np.unique(masked)
         vals = vals[(vals > FACE_MIN_VALUE) & (vals < FACE_MAX_VALUE)]
         return vals.tolist()
 
-    def apply_random_values_optimized(self, pixels_hu, dilated_volume, unique_values_list):
-        new_vol = np.copy(pixels_hu)
-        new_vol[dilated_volume == 1] = -1000
-        return new_vol
-
-    def curves_callback(self, ds, elem):
-        if elem.tag.group & 0xFF00 == 0x5000:
-            del ds[elem.tag]
-
+    # ---------------------------------------------------------
+    # CT meta filter
+    # ---------------------------------------------------------
     def is_substring_in_list(self, substring, string_list):
         return any(substring in str(s) for s in string_list)
 
@@ -636,6 +1068,140 @@ class DicomProcessor:
             self.error = "CT meta check failed"
             return 0
 
+    # ---------------------------------------------------------
+    # Anterior region helper
+    # ---------------------------------------------------------
+    def _anterior_axis_and_sign(self, ds):
+        try:
+            iop = ds.get((0x0020, 0x0037), None)
+            if iop is None:
+                return 0, +1
+
+            v = np.array(iop.value, dtype=float).reshape(2, 3)
+            row_cos = v[0]
+            col_cos = v[1]
+            anterior_LPS = np.array([0.0, -1.0, 0.0])
+
+            dr = float(np.dot(row_cos, anterior_LPS))
+            dc = float(np.dot(col_cos, anterior_LPS))
+
+            if abs(dr) >= abs(dc):
+                axis = 0
+                sign = +1 if dr > 0 else -1
+            else:
+                axis = 1
+                sign = +1 if dc > 0 else -1
+            return axis, sign
+        except Exception:
+            return 0, +1
+
+    def _anterior_region_mask(self, shape_hw, ds, front_fraction=0.55):
+        H, W = shape_hw
+        axis, sign = self._anterior_axis_and_sign(ds)
+        Y, X = np.ogrid[:H, :W]
+        cy, cx = H // 2, W // 2
+
+        if axis == 0:
+            if sign > 0:
+                cutoff = int(cy + (1.0 - front_fraction) * (H - 1 - cy))
+                m = (Y >= cutoff)
+            else:
+                cutoff = int(cy - (1.0 - front_fraction) * (cy))
+                m = (Y <= cutoff)
+        else:
+            if sign > 0:
+                cutoff = int(cx + (1.0 - front_fraction) * (W - 1 - cx))
+                m = (X >= cutoff)
+            else:
+                cutoff = int(cx - (1.0 - front_fraction) * (cx))
+                m = (X <= cutoff)
+
+        return m.astype(np.uint8)
+
+    # ---------------------------------------------------------
+    # Dilation with barriers
+    # ---------------------------------------------------------
+    def _keep_only_components_touching_seed(self, mask_uint8, seed_uint8):
+        import cv2
+        m = (mask_uint8 > 0).astype(np.uint8)
+        s = (seed_uint8 > 0).astype(np.uint8)
+        if m.max() == 0:
+            return m
+
+        nlab, labels = cv2.connectedComponents(m, connectivity=8)
+        if nlab <= 1:
+            return m
+
+        overlap_labels = np.unique(labels[s > 0])
+        keep = np.zeros_like(m, dtype=np.uint8)
+        for lab in overlap_labels:
+            if lab == 0:
+                continue
+            keep[labels == lab] = 1
+        return keep
+
+    def bounded_dilate_with_front_boost(
+        self,
+        lcc_air_seed,
+        pixels_hu,
+        ds,
+        k_max,
+        bone_stop_hu=BONE_STOP_HU,
+        front_fraction=0.55,
+    ):
+        import cv2
+
+        seed = (lcc_air_seed > 0).astype(np.uint8)
+        H, W = seed.shape
+
+        allowed = (pixels_hu < int(bone_stop_hu)).astype(np.uint8)
+
+        k_max = int(max(1, k_max))
+        kmax = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_max, k_max))
+        max_once = cv2.dilate(seed, kmax)
+
+        max_once = (max_once & allowed).astype(np.uint8)
+        max_once = self._keep_only_components_touching_seed(max_once, seed)
+
+        k33 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, FRONT_BOOST_KERNEL)
+        anterior_region = self._anterior_region_mask((H, W), ds, front_fraction=front_fraction)
+
+        boosted = cv2.dilate(max_once, k33)
+        boosted = (boosted & anterior_region & max_once).astype(np.uint8)
+
+        combined = (max_once | boosted).astype(np.uint8)
+        combined = (combined & max_once).astype(np.uint8)
+        combined = (combined & allowed).astype(np.uint8)
+        combined = self._keep_only_components_touching_seed(combined, seed)
+
+        return combined
+
+    def apply_random_values_optimized(
+        self,
+        pixels_hu,
+        dilated_mask,
+        unique_values_list,
+        bone_stop_hu=BONE_STOP_HU,
+        fill_mode="air",
+    ):
+        new_vol = np.array(pixels_hu, copy=True)
+        mask = (dilated_mask == 1) & (pixels_hu < int(bone_stop_hu))
+
+        if fill_mode == "sample" and unique_values_list:
+            repl = np.random.choice(unique_values_list, size=int(mask.sum()))
+            new_vol[mask] = repl.astype(new_vol.dtype)
+        else:
+            new_vol[mask] = -1000
+
+        return new_vol
+
+    # ---------------------------------------------------------
+    # DICOM anonymization helpers
+    # ---------------------------------------------------------
+    def curves_callback(self, ds, elem):
+        if elem.tag.group & 0xFF00 == 0x5000:
+            del ds[elem.tag]
+
     def _remap_uid(self, uid_value, uid_dict, generate_uid_fn):
         s = str(uid_value).strip()
         if not s:
@@ -652,9 +1218,6 @@ class DicomProcessor:
         return da, tm, dt
 
     def _set_safe_value_by_vr(self, ds, tag, vr, generate_uid_fn, patient_id_value):
-        """
-        Overwrite element value using VR-aware rules.
-        """
         if tag == (0x0010, 0x0020):  # PatientID
             ds[tag].value = patient_id_value
             return
@@ -748,6 +1311,9 @@ class DicomProcessor:
 
         recurse(ds)
 
+    # ---------------------------------------------------------
+    # Save anonymized dicoms + conditional SAM2 text removal
+    # ---------------------------------------------------------
     def save_new_dicom_files(
         self,
         original_dir,
@@ -803,41 +1369,44 @@ class DicomProcessor:
                 self._anonymize_dataset_recursive(ds, patient_id_value=id)
 
                 pixels_hu = self.get_pixels_hu(ds)
+
                 bin_mask = self.binarize_volume(pixels_hu)
                 lcc = self.get_largest_component_volume(bin_mask)
 
-                ksize = self._kernel_from_pixel_spacing(ds)
-                dilated = self.dilate_volume(lcc, kernel_size=ksize)
+                k_max = int(self._kernel_from_pixel_spacing(ds))
+
+                dilated = self.bounded_dilate_with_front_boost(
+                    lcc_air_seed=lcc,
+                    pixels_hu=pixels_hu,
+                    ds=ds,
+                    k_max=k_max,
+                    bone_stop_hu=BONE_STOP_HU,
+                    front_fraction=0.55,
+                )
+
+                ring = ((dilated > 0) & (lcc == 0)).astype(np.uint8)
 
                 if replacer == "face":
-                    vals = self.apply_mask_and_get_values(pixels_hu, (dilated - lcc))
+                    vals = self.apply_mask_and_get_values(pixels_hu, ring)
                 elif replacer == "air":
                     vals = [0]
                 else:
                     try:
                         vals = [int(replacer)]
                     except Exception:
-                        vals = self.apply_mask_and_get_values(pixels_hu, (dilated - lcc))
+                        vals = self.apply_mask_and_get_values(pixels_hu, ring)
 
-                new_volume = self.apply_random_values_optimized(pixels_hu, dilated, vals)
+                new_volume = self.apply_random_values_optimized(
+                    pixels_hu,
+                    dilated,
+                    vals,
+                    bone_stop_hu=BONE_STOP_HU,
+                    fill_mode="air",
+                )
 
-                if remove_text:
-                    try:
-                        import cv2
-                        reader = self._get_ocr_reader()
-                        if reader is not None:
-                            mn, mx = int(np.min(pixels_hu)), int(np.max(pixels_hu))
-                            rng = max(1, mx - mn)
-                            gray8 = np.uint8(((pixels_hu - mn) / rng) * 255.0)
-                            img = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
-                            results = reader.readtext(img)
-                            for (bbox, text, prob) in results:
-                                if prob > 0.8:
-                                    tl = tuple(map(int, bbox[0]))
-                                    br = tuple(map(int, bbox[2]))
-                                    cv2.rectangle(new_volume, tl, br, (0, 0, 0), thickness=cv2.FILLED)
-                    except Exception as e:
-                        errors.append((fname, str(e)))
+                # Run SAM2 only if enabled + ds says burned-in text present
+                if remove_text and dicom_has_burned_in(ds):
+                    new_volume = self._remove_text_with_sam2(new_volume, pixels_hu)
 
                 slope = float(getattr(ds, "RescaleSlope", 1)) or 1.0
                 intercept = float(getattr(ds, "RescaleIntercept", 0))
@@ -866,13 +1435,10 @@ class DicomProcessor:
         return errors
 
     # -----------------------------------------------------------------------
-    # UPDATED SNAPSHOT RENDER (DICOM-ONLY IMPORT + 4 VIEWS)
+    # Snapshot rendering
     # -----------------------------------------------------------------------
-
     def _capture_threeDView_png(self, threeDView, out_png_path):
         import vtk
-        import slicer
-
         try:
             threeDView.forceRender()
             slicer.app.processEvents()
@@ -893,12 +1459,6 @@ class DicomProcessor:
         writer.Write()
 
     def _set_view_and_zoom(self, threeDView, axisIndex, dollyFactor=2.0, viewAngleDeg=12.0):
-        """
-        axisIndex matches Slicer rotateToViewAxis:
-          0=Right, 1=Left, 2=Posterior, 3=Anterior, 4=Superior, 5=Inferior
-        """
-        import slicer
-
         threeDView.rotateToViewAxis(int(axisIndex))
         threeDView.resetFocalPoint()
         threeDView.resetCamera()
@@ -955,7 +1515,6 @@ class DicomProcessor:
             pass
 
     def _choose_best_volume_node(self, loadedNodeIDs):
-        """Pick the most suitable scalar volume for rendering (avoid BONE if possible)."""
         candidates = []
         for nid in loadedNodeIDs:
             n = slicer.mrmlScene.GetNodeByID(nid)
@@ -975,9 +1534,6 @@ class DicomProcessor:
         return candidates[0][2]
 
     def _apply_new_soft_tissue_opacity(self, displayNode):
-        """
-        Apply YOUR NEW opacity tuning after preset Copy().
-        """
         try:
             propNode = displayNode.GetVolumePropertyNode()
             if not propNode:
@@ -989,16 +1545,11 @@ class DicomProcessor:
             sof = vp.GetScalarOpacity()
             sof.RemoveAllPoints()
 
-            # Start rendering at -40 HU (opacity 0 at/under -40)
             sof.AddPoint(-200, 0.0)
             sof.AddPoint(-40,  0.0)
-
-            # Soft tissue becomes visible
             sof.AddPoint(0,    0.05)
             sof.AddPoint(50,   0.15)
             sof.AddPoint(150,  0.35)
-
-            # Bone becomes strong
             sof.AddPoint(300,  0.6)
             sof.AddPoint(700,  1.0)
 
@@ -1013,10 +1564,6 @@ class DicomProcessor:
             pass
 
     def _find_all_dicom_dirs(self, rootFolder):
-        """
-        Return ALL directories (under rootFolder) that contain at least one DICOM file.
-        Uses pydicom header read only.
-        """
         import pydicom
 
         def _has_any_dicom(d):
@@ -1042,15 +1589,10 @@ class DicomProcessor:
         return sorted(set(dicom_dirs))
 
     def _render_one_dicom_folder(self, dicomDir, out_prefix="view"):
-        """
-        NEW RENDER (your code), but FIXED to import ONLY dicom slices (ignore log.txt/png/etc).
-        Renders ONLY 4 files: anterior, left, right, posterior.
-        """
         import tempfile
         import shutil as _shutil
         from DICOMLib import DICOMUtils
 
-        # collect only DICOM files in dicomDir
         dicom_files = []
         for fn in os.listdir(dicomDir):
             fp = os.path.join(dicomDir, fn)
@@ -1066,11 +1608,9 @@ class DicomProcessor:
         if lm is None:
             raise RuntimeError("No layoutManager available. Run with Slicer GUI (3D view required).")
 
-        # Clear scene each folder (your behavior)
         slicer.mrmlScene.Clear(False)
         slicer.app.processEvents()
 
-        # temp folder with only dicoms => prevents Qt errors on log.txt/png
         tmp_root = tempfile.mkdtemp(prefix="slicer_dicoms_")
         try:
             for i, src in enumerate(sorted(dicom_files), start=1):
@@ -1080,7 +1620,6 @@ class DicomProcessor:
                 except Exception:
                     _shutil.copy(src, dst)
 
-            # Import/load DICOM
             with DICOMUtils.TemporaryDICOMDatabase() as db:
                 DICOMUtils.importDicom(tmp_root, db)
                 patientUIDs = db.patients()
@@ -1110,7 +1649,6 @@ class DicomProcessor:
         if displayNode is None:
             raise RuntimeError("Failed to create Volume Rendering display node.")
 
-        # your preset list
         preset_names_to_try = ["CT-Soft-Tissue", "CT Abdomen", "CT-AAA", "CT Air", "CT Bone"]
         presetNode = None
         for pname in preset_names_to_try:
@@ -1127,7 +1665,6 @@ class DicomProcessor:
                 except Exception:
                     pass
 
-        # apply your NEW opacity tuning
         self._apply_new_soft_tissue_opacity(displayNode)
 
         displayNode.SetVisibility(1)
@@ -1136,35 +1673,20 @@ class DicomProcessor:
         except Exception:
             pass
 
-        threeDView = lm.threeDWidget(0).threeDView()
+        threeDView = slicer.app.layoutManager().threeDWidget(0).threeDView()
 
-        # ONLY 4 views (no superior)
-        views = [
-            ("anterior", 3, 1.4, 12.0),
-            ("left",     1, 2.2, 12.0),
-            ("right",    0, 2.2, 12.0),
-            ("posterior", 2, 2.2, 12.0),
-        ]
+        self._set_view_and_zoom(
+            threeDView,
+            axisIndex=3,       # anterior
+            dollyFactor=1.4,
+            viewAngleDeg=12.0,
+        )
 
-        outputs = []
-        for name, axisIndex, dolly, angle in views:
-            self._set_view_and_zoom(
-                threeDView,
-                axisIndex=axisIndex,
-                dollyFactor=dolly,
-                viewAngleDeg=angle,
-            )
-            out_path = os.path.join(dicomDir, f"{out_prefix}_{name}.png")
-            self._capture_threeDView_png(threeDView, out_path)
-            outputs.append(out_path)
-
-        return outputs
+        out_path = os.path.join(dicomDir, f"{out_prefix}_anterior.png")
+        self._capture_threeDView_png(threeDView, out_path)
+        return [out_path]
 
     def _create_and_save_multi_view_snapshots(self, patientFolder, out_prefix="view"):
-        """
-        - Find ALL subfolders/sub-subfolders under patientFolder that contain DICOM slices.
-        - For EACH DICOM-containing folder => render 4 PNGs in that folder.
-        """
         dicom_dirs = self._find_all_dicom_dirs(patientFolder)
         if not dicom_dirs:
             raise RuntimeError("No snapshots produced (no DICOM-containing subfolders found).")
@@ -1191,7 +1713,6 @@ class DicomProcessor:
     # -----------------------------------------------------------------------
     # MAIN PIPELINE
     # -----------------------------------------------------------------------
-
     def drown_volume(
         self,
         in_path,
@@ -1203,13 +1724,8 @@ class DicomProcessor:
         remove_text=False,
         remove_CTA=False,
     ):
-        """
-        Phase 1: mirror + write anonymized slices
-        Phase 2: rename immediate subdirectories at each level to <id>_<n>
-        Phase 3: snapshots (DICOM-only import), 4 views
-        """
         try:
-            # Phase 1
+            # Phase 1: anonymize + drown + optional text removal
             for root, dirs, files in os.walk(in_path):
                 rel = os.path.relpath(root, in_path)
                 out_dir = os.path.join(out_path, rel)
@@ -1227,13 +1743,12 @@ class DicomProcessor:
                         remove_CTA=remove_CTA,
                     )
 
-            # Phase 2
+            # Phase 2: rename subfolders
             for curr, subdirs, files in os.walk(out_path, topdown=True):
                 if not subdirs:
                     continue
 
                 subdirs_sorted = sorted(subdirs)
-
                 tmp_map = []
                 for i, d in enumerate(subdirs_sorted, start=1):
                     src = os.path.join(curr, d)
@@ -1251,7 +1766,7 @@ class DicomProcessor:
 
                 subdirs[:] = new_names
 
-            # Phase 3
+            # Phase 3: snapshots
             try:
                 self._create_and_save_multi_view_snapshots(out_path, out_prefix="view")
             except Exception as e:
