@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 HeadCTDeid (3D Slicer scripted module)
+
 """
 
 import glob
@@ -173,6 +174,10 @@ def _to_str(x):
 
 
 def dicom_has_burned_in(ds) -> bool:
+    """
+    Return True if BurnedInAnnotation indicates YES.
+    Common DICOM CS values are "YES"/"NO". We accept several truthy variants.
+    """
     try:
         bia_val = getattr(ds, "BurnedInAnnotation", None)
         if bia_val is None:
@@ -288,7 +293,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-            import gdcm  # noqa: F401
+            import gdcm  
             try:
                 slicer.util.infoDisplay(
                     "This tool is a work-in-progress being validated in project. "
@@ -296,20 +301,22 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     windowTitle="Warning",
                 )
 
-                remove_text = self.ui.deidentifyCheckbox.isChecked()
+                # NEW meaning of checkbox:
+                #   checked   => SAM for all slices (force)
+                #   unchecked => SAM only when BurnedInAnnotation==YES
+                force_sam_all = self.ui.deidentifyCheckbox.isChecked()
                 remove_cta = self.ui.deidentifyCTACheckbox.isChecked()
 
-                # Base deps always; SAM2 deps only if remove_text
-                self.logic.setupPythonRequirements(remove_text=remove_text)
+                # base deps always
+                self.logic.setupPythonRequirements()
 
                 pn = self.logic.getParameterNode()
 
-                # Ensure SAM2 and download ONLY when remove_text True
-                if remove_text:
-                    ckpt_path, cfg_path = self.logic.ensureSAM2AutoDownload(parameterNode=pn)
-                    if pn is not None:
-                        pn.SetParameter("SAM2_CKPT", os.path.abspath(ckpt_path))
-                        pn.SetParameter("SAM2_CONFIG", os.path.abspath(cfg_path))
+                # OPTION 1: ALWAYS ensure SAM2 install + download (no dialogs)
+                ckpt_path, cfg_path = self.logic.ensureSAM2AutoDownload(parameterNode=pn)
+                if pn is not None:
+                    pn.SetParameter("SAM2_CKPT", os.path.abspath(ckpt_path))
+                    pn.SetParameter("SAM2_CONFIG", os.path.abspath(cfg_path))
 
                 if self.ui.progressBar:
                     self.ui.progressBar.setValue(0)
@@ -321,9 +328,9 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     self.ui.inputFolderButton.directory,
                     self.ui.excelFileButton.text,
                     self.ui.outputFolderButton.directory,
-                    remove_text,
-                    remove_cta,
-                    self.ui.progressBar,
+                    force_sam_all=force_sam_all,
+                    remove_CTA=remove_cta,
+                    progressBar=self.ui.progressBar,
                     sam2_ckpt=ckpt,
                     sam2_cfg=cfg,
                 )
@@ -383,7 +390,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             parameterNode.SetParameter("SAM2_CONFIG", "")
 
     # ---------------------------------------------------------------------
-    # SAM2 install + auto-download (NO dialogs) - called only when remove_text
+    # SAM2 install + auto-download (NO dialogs) - ALWAYS called (Option 1)
     # ---------------------------------------------------------------------
     def ensureSAM2AutoDownload(self, parameterNode=None, force_reinstall=False, force_redownload=False):
         import importlib
@@ -397,32 +404,11 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         def pip_install(args):
             slicer.util.pip_install(args)
 
-        # Torch: prefer CPU wheels to avoid CUDA mismatch inside Slicer.
-        # SAM2 will still use GPU if your torch has CUDA and torch.cuda.is_available() is True.
+        # torch
         try:
-            import torch
+            import torch  
         except Exception:
-            try:
-                # Quick heuristic: nvidia-smi exists
-                import subprocess
-                has_nvidia = False
-                try:
-                    r = subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
-                    has_nvidia = (r.returncode == 0)
-                except Exception:
-                    has_nvidia = False
-
-                if has_nvidia:
-                    slicer.util.showStatusMessage("Installing PyTorch (CUDA) ...")
-                    pip_install([
-                        "torch", "torchvision",
-                        "--index-url", "https://download.pytorch.org/whl/cu121"
-                    ])
-                else:
-                    slicer.util.showStatusMessage("Installing PyTorch (CPU) ...")
-                    pip_install(["torch", "torchvision"])
-            except Exception:
-                pip_install(["torch", "torchvision"])
+            pip_install(["torch", "torchvision"])
 
         # common deps (best-effort)
         for pkg in ["opencv-python", "hydra-core", "omegaconf", "tqdm", "pyyaml"]:
@@ -437,7 +423,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         # sam2 pip install
         need_install = force_reinstall
         try:
-            import sam2
+            import sam2  
         except Exception:
             need_install = True
 
@@ -448,7 +434,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         importlib.invalidate_caches()
 
         try:
-            import sam2
+            import sam2  
         except Exception as e:
             raise RuntimeError(f"SAM2 install/import failed: {e}")
 
@@ -460,14 +446,12 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         default_ckpt_path = os.path.abspath(os.path.join(model_dir, SAM2_CKPT_FILENAME))
         default_cfg_path = os.path.abspath(os.path.join(model_dir, SAM2_CFG_FILENAME))
 
-        # Read any existing paths from parameter node (if provided)
         pn_ckpt = ""
         pn_cfg = ""
         if parameterNode is not None:
             pn_ckpt = (parameterNode.GetParameter("SAM2_CKPT") or "").strip()
             pn_cfg = (parameterNode.GetParameter("SAM2_CONFIG") or "").strip()
 
-        # Use PN paths if they exist; otherwise fall back to defaults
         ckpt_path = os.path.abspath(pn_ckpt) if (pn_ckpt and os.path.exists(pn_ckpt)) else default_ckpt_path
         cfg_path = os.path.abspath(pn_cfg) if (pn_cfg and os.path.exists(pn_cfg)) else default_cfg_path
 
@@ -506,29 +490,28 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         if not (os.path.exists(cfg_path) and os.path.exists(ckpt_path)):
             raise RuntimeError("SAM2 config/checkpoint missing after download (check URLs and network).")
 
-        # Update PN with absolute resolved files
         if parameterNode is not None:
             parameterNode.SetParameter("SAM2_CKPT", os.path.abspath(ckpt_path))
             parameterNode.SetParameter("SAM2_CONFIG", os.path.abspath(cfg_path))
 
         return os.path.abspath(ckpt_path), os.path.abspath(cfg_path)
 
-    def setupPythonRequirements(self, remove_text=False, upgrade=False):
+    def setupPythonRequirements(self, upgrade=False):
         def install(package):
             slicer.util.pip_install(package)
 
         try:
-            import pandas
+            import pandas  # noqa
         except ModuleNotFoundError:
             install("pandas==2.2.3")
 
         try:
-            import openpyxl
+            import openpyxl  # noqa
         except ModuleNotFoundError:
             install("openpyxl")
 
         try:
-            import pydicom
+            import pydicom  # noqa
         except ModuleNotFoundError:
             install("pydicom")
             install("pylibjpeg")
@@ -536,7 +519,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             install("pylibjpeg-openjpeg")
 
         try:
-            import cv2
+            import cv2  # noqa
         except ModuleNotFoundError:
             install("opencv-python")
 
@@ -569,7 +552,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         inputFolder,
         excelFile,
         outputFolder,
-        remove_text,
+        force_sam_all,
         remove_CTA,
         progressBar,
         sam2_ckpt="",
@@ -622,7 +605,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     processor = DicomProcessor(
                         sam2_ckpt=sam2_ckpt_abs,
                         sam2_cfg=sam2_cfg_abs,
-                        enable_sam2=bool(remove_text),
+                        force_sam_all=bool(force_sam_all),
                     )
 
                     src_folder = os.path.join(inputFolder, foldername)
@@ -634,7 +617,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                         id=id_mapping[foldername],
                         patient_id="0",
                         name=f"Processed for Anonymization {id_mapping[foldername]}",
-                        remove_text=remove_text,
                         remove_CTA=remove_CTA,
                     )
 
@@ -691,12 +673,15 @@ class HeadCTDeidTest(ScriptedLoadableModuleTest):
 class DicomProcessor:
     """
     Pipeline: de-identification + face/air replacement + optional SAM2 burned-in text removal.
-    SAM2 is ONLY used when:
-      - remove_text is True, AND
-      - dicom_has_burned_in(ds) is True for the current slice.
+
+    SAM2 run decision per slice:
+      if force_sam_all == True:
+          run SAM on every slice
+      else:
+          run SAM only when dicom_has_burned_in(ds) == True
     """
 
-    def __init__(self, sam2_ckpt="", sam2_cfg="", enable_sam2=False):
+    def __init__(self, sam2_ckpt="", sam2_cfg="", force_sam_all=False):
         self.error = ""
         self.net = ""
         self.study_uid_map = defaultdict(str)
@@ -706,28 +691,25 @@ class DicomProcessor:
 
         self.logger = logging.getLogger("PatientProcessor")
 
-        # SAM2 state
-        self._sam2_enabled = bool(enable_sam2)
+        self._force_sam_all = bool(force_sam_all)
+
+        # SAM2 state (lazy init: build only when a slice actually needs SAM)
         self._sam2_ready = False
         self._sam2_ckpt = os.path.abspath(sam2_ckpt) if sam2_ckpt else ""
         self._sam2_cfg = os.path.abspath(sam2_cfg) if sam2_cfg else ""
         self._sam2_device = "cpu"
         self._sam2_mask_generator = None
 
-        if self._sam2_enabled:
-            self._try_init_sam2()
-
     # ---------------------------------------------------------
-    # SAM2 init
+    # SAM2 init (lazy)
     # ---------------------------------------------------------
     def _try_init_sam2(self):
-        if not self._sam2_enabled:
-            self._sam2_ready = False
-            self._sam2_mask_generator = None
-            return
-
+        """
+        Hydra fix: build_sam2 expects a Hydra *primary config name* (like "sam2_hiera_s.yaml"),
+        not a filesystem path. Therefore we copy the yaml into the installed sam2 package dir,
+        and pass ONLY the basename to build_sam2.
+        """
         try:
-            import os
             import shutil
             import torch
             import sam2
@@ -742,9 +724,8 @@ class DicomProcessor:
                 pass
             return
 
-        # normalize paths to real filesystem paths
         ckpt_path = os.path.abspath(self._sam2_ckpt) if self._sam2_ckpt else ""
-        cfg_path  = os.path.abspath(self._sam2_cfg)  if self._sam2_cfg  else ""
+        cfg_path = os.path.abspath(self._sam2_cfg) if self._sam2_cfg else ""
 
         if not ckpt_path or not os.path.exists(ckpt_path):
             self._sam2_ready = False
@@ -764,7 +745,6 @@ class DicomProcessor:
                 pass
             return
 
-        # IMPORTANT: build_sam2 expects a Hydra config NAME, not a path
         cfg_name = os.path.basename(cfg_path)
 
         # Copy YAML into sam2 package dir so Hydra provider pkg://sam2 can find it
@@ -787,12 +767,10 @@ class DicomProcessor:
                     with open(cfg_path, "rb") as rf, open(target_cfg_path, "wb") as wf:
                         wf.write(rf.read())
 
-            # sanity check: if copy failed, Hydra will still fail, so warn early
             if not os.path.exists(target_cfg_path):
                 raise RuntimeError(f"Failed to place config into sam2 package dir: {target_cfg_path}")
 
         except Exception as e:
-            # If we cannot copy into package dir (permissions), Hydra won't see the config by name.
             self._sam2_ready = False
             self._sam2_mask_generator = None
             try:
@@ -804,7 +782,7 @@ class DicomProcessor:
                 pass
             return
 
-        # robust GPU detection
+        # GPU detection
         device = "cpu"
         try:
             if torch.cuda.is_available():
@@ -820,7 +798,6 @@ class DicomProcessor:
             pass
 
         try:
-            # Pass ONLY cfg_name (Hydra primary config), not a path
             model = build_sam2(cfg_name, ckpt_path, device=device)
 
             if device == "cuda":
@@ -846,7 +823,7 @@ class DicomProcessor:
             )
             self._sam2_ready = True
             try:
-                self.logger.info("SAM2 initialized successfully.")
+                self.logger.info(f"SAM2 initialized successfully on {self._sam2_device}.")
             except Exception:
                 pass
 
@@ -859,8 +836,6 @@ class DicomProcessor:
                 pass
 
     def _get_sam2_generator(self):
-        if not self._sam2_enabled:
-            return None
         if self._sam2_mask_generator is None and not self._sam2_ready:
             self._try_init_sam2()
         return self._sam2_mask_generator
@@ -914,8 +889,7 @@ class DicomProcessor:
             return None
 
     def _remove_text_with_sam2(self, new_volume_hu, pixels_hu):
-        if not (self._sam2_enabled and self._sam2_ready):
-            return new_volume_hu
+        # If SAM isn't ready, do nothing (lazy init will have been attempted in _sam2_text_mask)
         try:
             import cv2
 
@@ -1322,9 +1296,13 @@ class DicomProcessor:
         id="new_folder_name",
         patient_id="0",
         new_patient_id="Processed for anonymization",
-        remove_text=False,
         remove_CTA=False,
     ):
+        """
+        SAM decision:
+          - if self._force_sam_all: run SAM on ALL slices
+          - else: run SAM only if dicom_has_burned_in(ds) is True
+        """
         import pydicom
 
         os.makedirs(out_dir, exist_ok=True)
@@ -1404,8 +1382,11 @@ class DicomProcessor:
                     fill_mode="air",
                 )
 
-                # Run SAM2 only if enabled + ds says burned-in text present
-                if remove_text and dicom_has_burned_in(ds):
+                # --------------------------
+                # NEW SAM rule
+                # --------------------------
+                want_sam = self._force_sam_all or dicom_has_burned_in(ds)
+                if want_sam:
                     new_volume = self._remove_text_with_sam2(new_volume, pixels_hu)
 
                 slope = float(getattr(ds, "RescaleSlope", 1)) or 1.0
@@ -1721,11 +1702,10 @@ class DicomProcessor:
         id="new_folder_name",
         patient_id="0",
         name="",
-        remove_text=False,
         remove_CTA=False,
     ):
         try:
-            # Phase 1: anonymize + drown + optional text removal
+            # Phase 1: anonymize + drown + conditional SAM
             for root, dirs, files in os.walk(in_path):
                 rel = os.path.relpath(root, in_path)
                 out_dir = os.path.join(out_path, rel)
@@ -1739,7 +1719,6 @@ class DicomProcessor:
                         id=id,
                         patient_id=patient_id,
                         new_patient_id="Processed for anonymization",
-                        remove_text=remove_text,
                         remove_CTA=remove_CTA,
                     )
 
