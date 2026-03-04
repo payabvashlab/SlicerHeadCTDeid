@@ -73,7 +73,7 @@
    <item>
      <widget class="QCheckBox" name="deidentifyCheckbox">
       <property name="text">
-       <string>Remove text inside dicom</string>
+       <string>Search to remove text in images even if not tagged for burned-in text</string>
       </property>
       <property name="toolTip">
        <string>Check to remove text inside dicom.</string>
