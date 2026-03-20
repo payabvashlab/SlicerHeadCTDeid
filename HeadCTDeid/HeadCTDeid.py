@@ -3,7 +3,7 @@
 HeadCTDeid (3D Slicer scripted module)
 """
 
-import glob
+import csv
 import logging
 import os
 import random
@@ -25,16 +25,62 @@ from slicer.util import VTKObservationMixin
 
 warnings.filterwarnings("ignore")
 
-# =============================================================================
-# SAM1 (Segment Anything v1)
-# =============================================================================
-SAM1_PIP_SOURCE = "git+https://github.com/facebookresearch/segment-anything.git"
-SAM1_CKPT_FILENAME = "sam_vit_b_01ec64.pth"
-SAM1_CKPT_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-SAM1_DEFAULT_MODEL_TYPE = "vit_b"  # "vit_h", "vit_l", "vit_b"
+EASYOCR_LANG = "en"
+
+# Recognition filters (match standalone)
+EASYOCR_MIN_ALNUM = 2
+EASYOCR_CONF_THRESH = 0.40
+
+# Geometry filters (not used; kept only for compatibility/readability)
+EASYOCR_MIN_BOX_AREA = 0
+EASYOCR_MAX_BOX_AREA_FRAC = 1.0
+EASYOCR_MAX_BOX_H_FRAC = 1.0
+EASYOCR_MAX_BOX_W_FRAC = 1.0
+EASYOCR_MIN_ASPECT = 0.0
+
+# Preprocess: standalone behavior
+EASYOCR_USE_CLAHE = False
+EASYOCR_USE_INVERTED_PASS = False
+EASYOCR_USE_RAW_PASS = True
+EASYOCR_USE_ROTATED_180_PASS = False
+
+# Optional border restriction: disabled to match standalone
+EASYOCR_RESTRICT_TO_BORDER_BAND = False
+EASYOCR_BORDER_FRAC = 0.30
+
+# Brightness heuristic: disabled to match standalone
+EASYOCR_BRIGHT_PIXEL_THR = 0
+EASYOCR_BRIGHT_FRAC_THRESH = 0.0
+
+# CT windowing for OCR: disabled to match standalone
+EASYOCR_USE_CT_WINDOWING = False
+EASYOCR_DEFAULT_WC = 40.0
+EASYOCR_DEFAULT_WW = 80.0
+
+# EasyOCR inference knobs — exact standalone call settings
+EASYOCR_DECODER = "greedy"
+EASYOCR_MIN_SIZE = 15
+EASYOCR_TEXT_THRESHOLD = 0.85
+EASYOCR_LOW_TEXT = 0.50
+EASYOCR_LINK_THRESHOLD = 0.60
+EASYOCR_MAG_RATIO = 1.0
+EASYOCR_CONTRAST_THS = 0.10
+EASYOCR_ADJUST_CONTRAST = 0.5
+EASYOCR_ADD_MARGIN = 0.0
+EASYOCR_WIDTH_THS = 0.5
+EASYOCR_SLOPE_THS = 0.5
+EASYOCR_HEIGHT_THS = 0.5
+EASYOCR_YCENTER_THS = 0.5
+
+EASYOCR_ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz:-_/(). "
+
+# Plausibility
+EASYOCR_ACCEPT_DIGITS_ONLY = True
+EASYOCR_ACCEPT_SINGLE_TOKEN = True
 
 # =============================================================================
-
+# Face/air drowning parameters (unchanged)
+# =============================================================================
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 AIR_THRESHOLD = -800
@@ -42,7 +88,7 @@ BONE_STOP_HU = 250
 FRONT_BOOST_KERNEL = (3, 3)
 
 # ---------------------------------------------------------------------------
-# DICOM tags to de-id
+# DICOM tags to de-id (unchanged)
 # ---------------------------------------------------------------------------
 PDF_TAGS_TO_DEID = {
     (0x0008, 0x0014),
@@ -148,10 +194,11 @@ PDF_TAGS_TO_DEID = {
     (0x4008, 0x0212),
 }
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
+GLOBAL_DROPPED_CSV_NAME = "global_removed_slices_detected_text.csv"
 
+# =============================================================================
+# Small helpers
+# =============================================================================
 def _to_str(x):
     try:
         if x is None:
@@ -179,11 +226,6 @@ def dicom_has_burned_in(ds) -> bool:
 
 
 def _subprocess_import_ok(module_name: str, timeout_sec: int = 25) -> bool:
-    """
-    Crash-safe module import check.
-    If importing the module would hard-crash Slicer (native crash),
-    it will only crash the subprocess.
-    """
     try:
         cmd = [sys.executable, "-c", f"import {module_name}; print('OK')"]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
@@ -192,10 +234,16 @@ def _subprocess_import_ok(module_name: str, timeout_sec: int = 25) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Module
-# ---------------------------------------------------------------------------
+def _safe_show_status(msg: str, ms: int = 2000):
+    try:
+        slicer.util.showStatusMessage(str(msg), int(ms))
+    except Exception:
+        pass
 
+
+# =============================================================================
+# Module
+# =============================================================================
 class HeadCTDeid(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
@@ -207,10 +255,9 @@ class HeadCTDeid(ScriptedLoadableModule):
         self.parent.acknowledgementText = "This file was developed by Anh Tuan Tran, Sam Payabvash (Columbia University)."
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Widget
-# ---------------------------------------------------------------------------
-
+# =============================================================================
 class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def __init__(self, parent=None):
         ScriptedLoadableModuleWidget.__init__(self, parent)
@@ -293,52 +340,29 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-            import gdcm  # noqa
-            try:
-                slicer.util.infoDisplay(
-                    "This tool is a work-in-progress being validated in project. "
-                    "Contact sp4479@columbia.edu for details. Use at your own risk.",
-                    windowTitle="Warning",
-                )
+            import gdcm  
+            slicer.util.infoDisplay(
+                "This tool is a work-in-progress being validated in project. "
+                "Contact sp4479@columbia.edu for details. Use at your own risk.",
+                windowTitle="Warning",
+            )
 
-                force_sam_all = self.ui.deidentifyCheckbox.isChecked()
-                remove_cta = self.ui.deidentifyCTACheckbox.isChecked()
+            force_ocr_all = self.ui.deidentifyCheckbox.isChecked()
+            remove_CTA = self.ui.deidentifyCTACheckbox.isChecked()
 
-                self.logic.setupPythonRequirements()
+            self.logic.setupPythonRequirements()
 
-                pn = self.logic.getParameterNode()
+            if self.ui.progressBar:
+                self.ui.progressBar.setValue(0)
 
-                # Ensure SAM1 installed + checkpoint downloaded
-                ckpt_path, model_type = self.logic.ensureSAM1AutoDownload(parameterNode=pn)
-                if pn is not None:
-                    pn.SetParameter("SAM1_CKPT", os.path.abspath(ckpt_path))
-                    pn.SetParameter("SAM1_MODEL_TYPE", str(model_type))
-
-                # HARD GATE: do not start processing until checkpoint is fully present
-                self.logic._wait_for_file_ready(
-                    ckpt_path,
-                    min_bytes=50 * 1024 * 1024,
-                    timeout_sec=3600,
-                )
-
-                if self.ui.progressBar:
-                    self.ui.progressBar.setValue(0)
-
-                ckpt = pn.GetParameter("SAM1_CKPT") if pn else ""
-                mtype = pn.GetParameter("SAM1_MODEL_TYPE") if pn else SAM1_DEFAULT_MODEL_TYPE
-
-                self.logic.process(
-                    self.ui.inputFolderButton.directory,
-                    self.ui.excelFileButton.text,
-                    self.ui.outputFolderButton.directory,
-                    force_sam_all=force_sam_all,
-                    remove_CTA=remove_cta,
-                    progressBar=self.ui.progressBar,
-                    sam_ckpt=ckpt,
-                    sam_model_type=mtype,
-                )
-            except Exception as e:
-                slicer.util.errorDisplay(f"Error: {str(e)}")
+            self.logic.process(
+                self.ui.inputFolderButton.directory,
+                self.ui.excelFileButton.text,
+                self.ui.outputFolderButton.directory,
+                force_ocr_all=force_ocr_all,
+                remove_CTA=remove_CTA,
+                progressBar=self.ui.progressBar,
+            )
         except Exception:
             slicer.util.pip_install("python-gdcm==3.0.25")
             slicer.util.infoDisplay(
@@ -360,10 +384,9 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.updateGUIFromParameterNode()
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Logic
-# ---------------------------------------------------------------------------
-
+# =============================================================================
 class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
     def __init__(self):
         ScriptedLoadableModuleLogic.__init__(self)
@@ -373,8 +396,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         try:
             __import__(moduleName)
             return True
-        except ModuleNotFoundError:
-            return False
         except Exception:
             return False
 
@@ -390,171 +411,22 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         if not parameterNode.GetParameter("DeidentifyCTA"):
             parameterNode.SetParameter("DeidentifyCTA", "false")
 
-        if not parameterNode.GetParameter("SAM1_CKPT"):
-            parameterNode.SetParameter("SAM1_CKPT", "")
-        if not parameterNode.GetParameter("SAM1_MODEL_TYPE"):
-            parameterNode.SetParameter("SAM1_MODEL_TYPE", SAM1_DEFAULT_MODEL_TYPE)
-
-    def _wait_for_file_ready(self, path, min_bytes=1024 * 1024, timeout_sec=3600):
-        t0 = time.time()
-        last_size = -1
-        stable_count = 0
-
-        while True:
-            if os.path.exists(path):
-                try:
-                    sz = os.path.getsize(path)
-                except Exception:
-                    sz = 0
-
-                if sz >= int(min_bytes):
-                    if sz == last_size:
-                        stable_count += 1
-                    else:
-                        stable_count = 0
-                    last_size = sz
-
-                    if stable_count >= 2:
-                        return True
-
-            if (time.time() - t0) > float(timeout_sec):
-                raise RuntimeError(f"SAM checkpoint not ready after {timeout_sec}s: {path}")
-
-            time.sleep(1.0)
-
-    # ---------------------------------------------------------------------
-    # Torch / SAM1 checks (CRASH-SAFE)
-    # ---------------------------------------------------------------------
-    def _require_torch_or_stop(self):
-        """
-        Do NOT import torch in-process (may hard-crash Slicer).
-        Use a subprocess import check. If not OK, raise with clear instructions.
-        """
-        if _subprocess_import_ok("torch"):
-            return True
-
-        msg = (
-            "PyTorch (torch) is not usable in this Slicer Python (or it crashes on import).\n\n"
-            "Fix options (recommended on macOS):\n"
-            "1) Install a Slicer-compatible PyTorch via a Slicer extension (often called 'SlicerPyTorch') if available for your Slicer build.\n"
-            "2) Or use a Slicer version/preview that ships with a compatible torch build.\n\n"
-            "After installing, restart Slicer and try again.\n"
-        )
-        raise RuntimeError(msg)
-
-    # ---------------------------------------------------------------------
-    # SAM1 install + auto-download
-    # ---------------------------------------------------------------------
-    def ensureSAM1AutoDownload(self, parameterNode=None, force_reinstall=False, force_redownload=False):
-        import importlib
-        import urllib.request
-
-        def pip_install(args):
-            slicer.util.pip_install(args)
-
-        # CRASH-SAFE: verify torch without importing in-process
-        self._require_torch_or_stop()
-
-        # Best-effort deps (do not install torch here)
-        for pkg in ["opencv-python", "numpy"]:
-            try:
-                __import__(pkg.split("-")[0])
-            except Exception:
-                try:
-                    pip_install(pkg)
-                except Exception:
-                    pass
-
-        # install SAM1 python package (safe; pure python + small native deps)
-        need_install = force_reinstall
-        try:
-            import segment_anything  # noqa
-        except Exception:
-            need_install = True
-
-        if need_install:
-            slicer.util.showStatusMessage("Installing Segment Anything (SAM1) package ...")
-            pip_install(SAM1_PIP_SOURCE)
-
-        importlib.invalidate_caches()
-
-        try:
-            import segment_anything  # noqa
-        except Exception as e:
-            raise RuntimeError(f"SAM1 install/import failed: {e}")
-
-        module_dir = os.path.dirname(__file__)
-        model_dir = os.path.join(module_dir, "Resources", "models")
-        os.makedirs(model_dir, exist_ok=True)
-
-        default_ckpt_path = os.path.abspath(os.path.join(model_dir, SAM1_CKPT_FILENAME))
-
-        pn_ckpt = ""
-        pn_model_type = SAM1_DEFAULT_MODEL_TYPE
-
-        if parameterNode is not None:
-            pn_ckpt = (parameterNode.GetParameter("SAM1_CKPT") or "").strip()
-            pn_model_type = (parameterNode.GetParameter("SAM1_MODEL_TYPE") or SAM1_DEFAULT_MODEL_TYPE).strip()
-
-        ckpt_path = os.path.abspath(pn_ckpt) if (pn_ckpt and os.path.exists(pn_ckpt)) else default_ckpt_path
-        model_type = pn_model_type if pn_model_type else SAM1_DEFAULT_MODEL_TYPE
-
-        def _download(url, out_path):
-            tmp = out_path + ".part"
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-
-            slicer.util.showStatusMessage(f"Downloading {os.path.basename(out_path)} ...")
-            urllib.request.urlretrieve(url, tmp)
-
-            if (not os.path.exists(tmp)) or (os.path.getsize(tmp) < 1024 * 1024):
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
-                raise RuntimeError(f"Downloaded file looks invalid/too small: {url}")
-
-            try:
-                if os.path.exists(out_path):
-                    os.remove(out_path)
-            except Exception:
-                pass
-            os.replace(tmp, out_path)
-
-        if force_redownload or (not os.path.exists(ckpt_path)):
-            _download(SAM1_CKPT_URL, ckpt_path)
-
-        if not os.path.exists(ckpt_path):
-            raise RuntimeError("SAM1 checkpoint missing after download (check URL/network).")
-
-        if parameterNode is not None:
-            parameterNode.SetParameter("SAM1_CKPT", os.path.abspath(ckpt_path))
-            parameterNode.SetParameter("SAM1_MODEL_TYPE", str(model_type))
-
-        return os.path.abspath(ckpt_path), str(model_type)
-
     def setupPythonRequirements(self, upgrade=False):
         def install(package):
             slicer.util.pip_install(package)
 
-        # NOTE: do NOT install torch here (mac Slicer often hard-crashes from pip torch)
-        # We only verify torch via subprocess later.
         try:
-            import pandas  # noqa
+            import pandas  
         except ModuleNotFoundError:
             install("pandas==2.2.3")
 
         try:
-            import openpyxl  # noqa
+            import openpyxl  
         except ModuleNotFoundError:
             install("openpyxl")
 
         try:
-            import pydicom  # noqa
+            import pydicom  
         except ModuleNotFoundError:
             install("pydicom")
             install("pylibjpeg")
@@ -562,12 +434,30 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             install("pylibjpeg-openjpeg")
 
         try:
-            import cv2  # noqa
+            import cv2  
         except ModuleNotFoundError:
             install("opencv-python")
 
         if not self._checkModuleInstalled("scikit-image"):
             install("scikit-image")
+
+        try:
+            if not self._checkModuleInstalled("torch"):
+                install("torch")
+        except Exception:
+            pass
+
+        try:
+            if not self._checkModuleInstalled("easyocr"):
+                install("easyocr")
+        except Exception:
+            pass
+
+        if not _subprocess_import_ok("easyocr"):
+            slicer.util.infoDisplay(
+                "WARNING: easyocr may not be importable. Text detection may be skipped.",
+                windowTitle="OCR Warning",
+            )
 
         self.dependenciesInstalled = True
 
@@ -590,16 +480,41 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         except Exception:
             pass
 
+    def _init_global_drop_csv(self, csv_path):
+        try:
+            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+            if not os.path.exists(csv_path):
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=[
+                        "timestamp",
+                        "patient_old_id",
+                        "patient_new_id",
+                        "series_folder",
+                        "source_dir",
+                        "source_filename",
+                        "instance_number",
+                        "series_instance_uid",
+                        "study_instance_uid",
+                        "sop_instance_uid",
+                        "burned_in_annotation",
+                        "decision",
+                        "reason",
+                        "hit_text",
+                        "hit_conf",
+                        "hit_bbox",
+                    ])
+                    w.writeheader()
+        except Exception as e:
+            self.logger.error(f"Failed to initialize global drop csv: {e}")
+
     def process(
         self,
         inputFolder,
         excelFile,
         outputFolder,
-        force_sam_all,
+        force_ocr_all,
         remove_CTA,
         progressBar,
-        sam_ckpt="",
-        sam_model_type=SAM1_DEFAULT_MODEL_TYPE,
     ):
         import pandas
 
@@ -607,22 +522,9 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             raise ValueError(f"Input folder does not exist: {inputFolder}")
         if not os.path.exists(excelFile):
             raise ValueError(f"Excel/CSV file does not exist: {excelFile}")
+
         os.makedirs(outputFolder, exist_ok=True)
         self._ensure_logger(outputFolder)
-
-        # SAFETY: ensure torch usable before processing (crash-safe check)
-        self._require_torch_or_stop()
-
-        # SAFETY: ensure SAM1 checkpoint exists + finished download BEFORE any processing
-        sam_ckpt = (sam_ckpt or "").strip()
-        sam_model_type = (sam_model_type or SAM1_DEFAULT_MODEL_TYPE).strip()
-
-        if (not sam_ckpt) or (not os.path.exists(sam_ckpt)) or (os.path.getsize(sam_ckpt) < 50 * 1024 * 1024):
-            pn = self.getParameterNode()
-            ckpt_path, model_type = self.ensureSAM1AutoDownload(parameterNode=pn)
-            self._wait_for_file_ready(ckpt_path, min_bytes=50 * 1024 * 1024, timeout_sec=3600)
-            sam_ckpt = ckpt_path
-            sam_model_type = model_type
 
         columns_as_text = ["original_folder_name", "new_folder_name"]
         ext = os.path.splitext(excelFile)[1].lower()
@@ -641,287 +543,335 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         id_mapping = dict(zip(df["original_folder_name"], df["new_folder_name"]))
 
         dicom_folders = [d for d in os.listdir(inputFolder) if os.path.isdir(os.path.join(inputFolder, d))]
-        total_rows = max(1, df.shape[0])
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(outputFolder, f"Processed for Anonymization_{current_time}")
         os.makedirs(out_path, exist_ok=True)
 
-        total_time = 0.0
-        successful = 0
+        global_drop_csv_path = os.path.join(out_path, GLOBAL_DROPPED_CSV_NAME)
+        self._init_global_drop_csv(global_drop_csv_path)
 
-        for i, foldername in enumerate(sorted(dicom_folders)):
-            if foldername in id_mapping:
-                dst_folder = ""
-                try:
-                    start_time = time.time()
-                    dst_folder = os.path.join(out_path, id_mapping[foldername])
+        folders_to_process = [f for f in sorted(dicom_folders) if f in id_mapping]
+        total = max(1, len(folders_to_process))
+        done = 0
 
-                    processor = DicomProcessor(
-                        sam_ckpt=os.path.abspath(sam_ckpt),
-                        sam_model_type=str(sam_model_type),
-                        force_sam_all=bool(force_sam_all),
-                    )
+        processors = []
 
-                    src_folder = os.path.join(inputFolder, foldername)
+        if progressBar:
+            progressBar.setValue(0)
 
-                    _ = processor.drown_volume(
-                        in_path=src_folder,
-                        out_path=dst_folder,
-                        replacer="face",
-                        id=id_mapping[foldername],
-                        patient_id="0",
-                        name=f"Processed for Anonymization {id_mapping[foldername]}",
-                        remove_CTA=remove_CTA,
-                    )
+        for foldername in folders_to_process:
+            dst_folder = ""
+            try:
+                dst_folder = os.path.join(out_path, id_mapping[foldername])
 
-                    if progressBar:
-                        progressBar.setValue(int((i + 1) * 100 / total_rows))
-                    slicer.util.showStatusMessage(f"Finished processing folder {foldername}")
-                    self.logger.info(f"Finished processing folder: {foldername}")
+                processor = DicomProcessor(force_ocr_all=bool(force_ocr_all))
+                processors.append(processor)
 
-                    elapsed = time.time() - start_time
-                    total_time += elapsed
-                    successful += 1
-                except Exception as e:
-                    self.logger.error(f"Error processing folder {foldername}: {str(e)}")
-                    if dst_folder and os.path.exists(dst_folder):
-                        shutil.rmtree(dst_folder)
+                src_folder = os.path.join(inputFolder, foldername)
 
-        if successful > 0:
-            avg = total_time / successful
-            self.logger.info(f"Average time per folder: {avg:.2f}s")
-        else:
-            self.logger.info("No folders were processed successfully.")
+                _safe_show_status(f"Processing patient folder: {foldername} → {id_mapping[foldername]}", 4000)
+                self.logger.info(f"Processing patient folder: {foldername} → {id_mapping[foldername]}")
 
-        try:
-            requested = df["original_folder_name"].tolist()
-            actual = set(dicom_folders)
-            missing = [f for f in requested if f not in actual]
-            if missing:
-                self.logger.error(f"Missing Folders {missing}")
-                slicer.util.showStatusMessage(f"Missing Folders {missing}")
-        except Exception as e:
-            self.logger.error(f"Post-check error: {str(e)}")
+                _ = processor.drown_volume(
+                    in_path=src_folder,
+                    out_path=dst_folder,
+                    replacer="face",
+                    id=id_mapping[foldername],
+                    patient_old_id=foldername,
+                    patient_id="0",
+                    name=f"Processed for Anonymization {id_mapping[foldername]}",
+                    remove_CTA=remove_CTA,
+                    global_drop_csv_path=global_drop_csv_path,
+                )
 
+                processor.wait_for_all_subprocesses(timeout_total_sec=7200)
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+                done += 1
+                if progressBar:
+                    progressBar.setValue(int(done * 99 / total) if done < total else 99)
 
-class HeadCTDeidTest(ScriptedLoadableModuleTest):
-    def setUp(self):
-        slicer.mrmlScene.Clear()
+                _safe_show_status(f"Finished: {foldername}", 3000)
+                self.logger.info(f"Finished processing folder: {foldername}")
 
-    def runTest(self):
-        self.setUp()
-        self.test_HeadCTDeid1()
+            except Exception as e:
+                self.logger.error(f"Error processing folder {foldername}: {str(e)}")
+                if dst_folder and os.path.exists(dst_folder):
+                    shutil.rmtree(dst_folder)
 
-    def test_HeadCTDeid1(self):
-        self.assertTrue(True)
+        for p in processors:
+            try:
+                p.wait_for_all_subprocesses(timeout_total_sec=7200)
+            except Exception as e:
+                self.logger.error(f"Final wait_for_all_subprocesses error: {e}")
+
+        if progressBar:
+            progressBar.setValue(100)
+
+        _safe_show_status("All processing finished.", 5000)
+        self.logger.info("All processing finished.")
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # DICOM Processor
-# ---------------------------------------------------------------------------
-
+# =============================================================================
 class DicomProcessor:
     """
-    Pipeline: de-identification + face/air replacement + optional SAM1 burned-in text removal.
+    Pipeline: de-identification + face/air replacement + EasyOCR detect->drop.
 
-    SAM run decision per slice:
-      if force_sam_all == True:
-          run SAM on every slice
+    Detection run decision per slice:
+      if force_ocr_all == True:
+          run OCR detect on every slice
       else:
-          run SAM only when BurnedInAnnotation==YES
-
-    RENDER (CRASH-SAFE):
-      - Try VTK offscreen in subprocess
-      - If fails => fallback to 2D middle-slice PNG
+          run OCR detect only when BurnedInAnnotation==YES
     """
 
-    def __init__(self, sam_ckpt="", sam_model_type=SAM1_DEFAULT_MODEL_TYPE, force_sam_all=False):
-        self.error = ""
-        self.net = ""
+    def __init__(self, force_ocr_all=False):
         self.study_uid_map = defaultdict(str)
         self.series_uid_map = defaultdict(str)
         self.sop_uid_map = defaultdict(str)
         self.uid_map_general = defaultdict(str)
 
         self.logger = logging.getLogger("PatientProcessor")
+        self._force_ocr_all = bool(force_ocr_all)
 
-        self._force_sam_all = bool(force_sam_all)
+        self._running_subprocesses = []
 
-        # SAM1 state (lazy init)
-        self._sam_ready = False
-        self._sam_ckpt = os.path.abspath(sam_ckpt) if sam_ckpt else ""
-        self._sam_model_type = str(sam_model_type or SAM1_DEFAULT_MODEL_TYPE)
-        self._sam_device = "cpu"
-        self._sam_mask_generator = None
+        self._ocr = None
+        self._ocr_langs = [EASYOCR_LANG] if EASYOCR_LANG else ["en"]
 
-    # ---------------------------------------------------------
-    # SAM1 init (lazy)
-    # ---------------------------------------------------------
-    def _try_init_sam(self):
-        # IMPORTANT: by the time we reach here, torch should already be usable
+    # -------------------------------------------------------------------------
+    # Subprocess utilities (render only)
+    # -------------------------------------------------------------------------
+    def _popen_and_wait(self, cmd, timeout_sec):
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            return -1, "", str(e)
+
+        self._running_subprocesses.append(proc)
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_sec)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except Exception:
+                    stdout, stderr = "", ""
+            rc = proc.returncode if proc.returncode is not None else -1
+        except Exception as e:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
+            rc = proc.returncode if proc.returncode is not None else -1
+            stderr = (stderr or "") + f"\ncommunicate_error: {e}"
+        finally:
+            try:
+                self._running_subprocesses = [p for p in self._running_subprocesses if p is not proc]
+            except Exception:
+                pass
+
+        return rc, (stdout or ""), (stderr or "")
+
+    def wait_for_all_subprocesses(self, timeout_total_sec=7200):
+        start = time.time()
+        procs = list(self._running_subprocesses)
+        for proc in procs:
+            try:
+                remaining = max(0.1, timeout_total_sec - (time.time() - start))
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        self._running_subprocesses = [p for p in self._running_subprocesses if p.poll() is None]
+        return len(self._running_subprocesses) == 0
+
+    # -------------------------------------------------------------------------
+    # EasyOCR detection
+    # -------------------------------------------------------------------------
+    def _detect_gpu_available(self):
         try:
             import torch
-            from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                try:
+                    return True, torch.cuda.get_device_name(0)
+                except Exception:
+                    return True, "CUDA GPU"
+            return False, "CPU"
+        except Exception:
+            return False, "CPU"
+
+    def _ensure_ocr(self):
+        if self._ocr is not None:
+            return True
+
+        try:
+            import easyocr
+
+            use_gpu, device_name = self._detect_gpu_available()
+
+            try:
+                self._ocr = easyocr.Reader(self._ocr_langs, gpu=use_gpu)
+            except TypeError:
+                self._ocr = easyocr.Reader(language_list=self._ocr_langs, gpu=use_gpu)
+
+            if use_gpu:
+                msg = f"EasyOCR initialized (GPU: {device_name})"
+            else:
+                msg = "EasyOCR initialized (CPU)"
+
+            try:
+                self.logger.info(msg)
+            except Exception:
+                pass
+            _safe_show_status(msg, 2500)
+            return True
+
         except Exception as e:
-            self._sam_ready = False
-            self._sam_mask_generator = None
             try:
-                self.logger.error(f"SAM1 import failed: {e}")
+                self.logger.error(f"Failed to init EasyOCR in-process: {e}")
             except Exception:
                 pass
-            return
+            _safe_show_status(f"EasyOCR init failed; OCR will be skipped. ({e})", 5000)
+            self._ocr = None
+            return False
 
-        ckpt_path = os.path.abspath(self._sam_ckpt) if self._sam_ckpt else ""
-        if not ckpt_path or not os.path.exists(ckpt_path):
-            self._sam_ready = False
-            self._sam_mask_generator = None
+    def _alnum_count(self, s: str) -> int:
+        import re
+        return len(re.findall(r"[A-Za-z0-9]", str(s) if s is not None else ""))
+
+    def _text_plausible(self, txt: str) -> bool:
+        s = str(txt).strip() if txt is not None else ""
+        if not s:
+            return False
+        return self._alnum_count(s) >= int(EASYOCR_MIN_ALNUM)
+
+    def _parse_easyocr_output(self, res):
+        out = []
+        if res is None:
+            return out
+        for it in res:
             try:
-                self.logger.error(f"SAM1 checkpoint missing: {ckpt_path}")
+                bbox = it[0]
+                txt = str(it[1]).strip()
+                sc = None
+                try:
+                    sc = float(it[2])
+                except Exception:
+                    sc = None
+                quad = np.asarray(bbox, np.float32).reshape(4, 2)
+                out.append((quad, txt, sc))
             except Exception:
-                pass
-            return
+                continue
+        return out
 
-        model_type = self._sam_model_type if self._sam_model_type else SAM1_DEFAULT_MODEL_TYPE
-        if model_type not in ("vit_h", "vit_l", "vit_b"):
-            model_type = SAM1_DEFAULT_MODEL_TYPE
+    def _dicom_pixels_to_gray8_for_ocr(self, ds):
+        pixels = ds.pixel_array
 
-        device = "cpu"
+        if pixels.ndim == 3:
+            pixels = pixels[0]
+
+        pixels = pixels.astype(np.float32)
+
+        slope = float(getattr(ds, "RescaleSlope", 1.0))
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+        pixels_hu = pixels * slope + intercept
+
+        mn = float(np.min(pixels_hu))
+        mx = float(np.max(pixels_hu))
+        if mx <= mn:
+            mx = mn + 1.0
+
+        gray8 = ((pixels_hu - mn) / (mx - mn) * 255.0).clip(0, 255).astype(np.uint8)
+        return gray8
+
+    def _run_easyocr_variant(self, bgr):
         try:
-            if torch.cuda.is_available():
-                torch.cuda.current_device()
-                device = "cuda"
-        except Exception:
-            device = "cpu"
-        self._sam_device = device
-
-        try:
-            self.logger.info(f"SAM1 build with model_type={model_type}, ckpt={ckpt_path}, device={device}")
-        except Exception:
-            pass
-
-        try:
-            sam = sam_model_registry[model_type](checkpoint=ckpt_path)
-            try:
-                sam.to(device=device)
-            except Exception:
-                device = "cpu"
-                self._sam_device = "cpu"
-                sam = sam_model_registry[model_type](checkpoint=ckpt_path)
-                sam.to(device="cpu")
-
-            self._sam_mask_generator = SamAutomaticMaskGenerator(
-                model=sam,
-                points_per_side=24,
-                pred_iou_thresh=0.88,
-                stability_score_thresh=0.92,
-                crop_n_layers=1,
-                crop_n_points_downscale_factor=2,
-                min_mask_region_area=128,
+            return self._ocr.readtext(
+                bgr,
+                text_threshold=EASYOCR_TEXT_THRESHOLD,
+                low_text=EASYOCR_LOW_TEXT,
+                link_threshold=EASYOCR_LINK_THRESHOLD,
+                min_size=EASYOCR_MIN_SIZE,
+                allowlist=EASYOCR_ALLOWLIST,
             )
-            self._sam_ready = True
+        except TypeError:
             try:
-                self.logger.info(f"SAM1 initialized successfully on {self._sam_device}.")
+                return self._ocr.readtext(bgr)
             except Exception:
-                pass
-
-        except Exception as e:
-            self._sam_ready = False
-            self._sam_mask_generator = None
-            try:
-                self.logger.error(f"SAM1 init failed: {e}")
-            except Exception:
-                pass
-
-    def _get_sam_generator(self):
-        if self._sam_mask_generator is None and not self._sam_ready:
-            self._try_init_sam()
-        return self._sam_mask_generator
-
-    # ---------------------------------------------------------
-    # SAM1-based "text overlay" removal
-    # ---------------------------------------------------------
-    def _sam_text_mask(self, rgb_uint8):
-        gen = self._get_sam_generator()
-        if gen is None:
-            return None
-        try:
-            H, W = rgb_uint8.shape[:2]
-            masks = gen.generate(rgb_uint8)
-            if not masks:
                 return None
-
-            out = np.zeros((H, W), dtype=np.uint8)
-            border = int(max(8, round(min(H, W) * 0.08)))
-
-            for m in masks:
-                seg = m.get("segmentation", None)
-                bbox = m.get("bbox", None)
-                if seg is None or bbox is None:
-                    continue
-
-                x, y, bw, bh = bbox
-                x = int(x); y = int(y); bw = int(bw); bh = int(bh)
-
-                area = int(np.sum(seg))
-                if area <= 0:
-                    continue
-                if area > 0.02 * (H * W):
-                    continue
-
-                near_border = (
-                    (x <= border) or (y <= border) or
-                    ((x + bw) >= (W - border)) or ((y + bh) >= (H - border))
-                )
-                if not near_border:
-                    continue
-
-                if bw > 0.9 * W and bh < 0.02 * H:
-                    continue
-                if bh > 0.9 * H and bw < 0.02 * W:
-                    continue
-
-                out[seg.astype(bool)] = 1
-
-            if out.max() == 0:
-                return None
-            return out
         except Exception:
             return None
 
-    def _remove_text_with_sam(self, new_volume_hu, pixels_hu):
+    def slice_has_text_info(self, pixels_hu_unused, ds):
+        """
+        Returns:
+          (has_text: bool,
+           hit_text: str or "",
+           hit_conf: float or None,
+           hit_bbox: [[x,y]...]*4 or None)
+        """
+        import cv2
+
+        if not self._ensure_ocr():
+            return False, "", None, None
+
         try:
-            import cv2
+            gray8 = self._dicom_pixels_to_gray8_for_ocr(ds)
+        except Exception:
+            return False, "", None, None
 
-            mn, mx = int(np.min(pixels_hu)), int(np.max(pixels_hu))
-            rng = max(1, mx - mn)
-            gray8 = np.uint8(((pixels_hu - mn) / rng) * 255.0)
-            rgb = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+        try:
+            bgr = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+        except Exception:
+            return False, "", None, None
 
-            m = self._sam_text_mask(rgb)
-            if m is None:
-                return new_volume_hu
+        res = self._run_easyocr_variant(bgr)
+        items = self._parse_easyocr_output(res)
+        if not items:
+            return False, "", None, None
 
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            m2 = cv2.dilate(m.astype(np.uint8), k, iterations=1).astype(bool)
+        for quad, txt, sc in items:
+            if sc is None:
+                continue
+            if float(sc) < float(EASYOCR_CONF_THRESH):
+                continue
+            if not self._text_plausible(txt):
+                continue
 
-            out = np.array(new_volume_hu, copy=True)
-            out[m2] = -1000
-            return out
-        except Exception as e:
-            try:
-                self.logger.error(f"_remove_text_with_sam {e}")
-            except Exception:
-                pass
-            slicer.util.showStatusMessage(f"_remove_text_with_sam {e}")
-            return new_volume_hu
+            bbox_list = np.asarray(quad, np.float32).reshape(4, 2).tolist()
+            return True, txt, float(sc), bbox_list
 
-    # ---------------------------------------------------------
+        return False, "", None, None
+
+    # -------------------------------------------------------------------------
     # CT helpers
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     def is_dicom(self, file_path, remove_CTA=False):
         import pydicom
         try:
@@ -1004,9 +954,9 @@ class DicomProcessor:
         vals = vals[(vals > FACE_MIN_VALUE) & (vals < FACE_MAX_VALUE)]
         return vals.tolist()
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # CT meta filter
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     def is_substring_in_list(self, substring, string_list):
         return any(substring in str(s) for s in string_list)
 
@@ -1022,14 +972,51 @@ class DicomProcessor:
             imageType = [str(x).lower().replace(" ", "") for x in imageType]
             status2 = all(self.is_substring_in_list(c, imageType) for c in ["original", "primary", "axial"])
 
-            return int(status1 and status2)
+            studyDes = None
+            for tag in [(0x08, 0x1030), (0x08, 0x103e), (0x18, 0x0015), (0x18, 0x1160)]:
+                if tag in ds:
+                    studyDes = ds[tag].value
+                    break
+            studyDes = [studyDes] if isinstance(studyDes, str) else [studyDes]
+            studyDes = [str(x).lower().replace(" ", "") for x in studyDes if x is not None]
+
+            include = ["head", "brain", "skull"]
+            exclude = ["angio", "cta", "perfusion"]
+
+            status3 = any(self.is_substring_in_list(c, studyDes) for c in include)
+
+            status4 = True
+            if not remove_CTA:
+                if any(self.is_substring_in_list(e, studyDes) for e in exclude):
+                    status4 = False
+
+            return int(status1 and status2 and status3 and status4)
         except Exception:
             self.error = "CT meta check failed"
             return 0
 
-    # ---------------------------------------------------------
-    # Anterior region helper
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Dilation with barriers
+    # -------------------------------------------------------------------------
+    def _keep_only_components_touching_seed(self, mask_uint8, seed_uint8):
+        import cv2
+        m = (mask_uint8 > 0).astype(np.uint8)
+        s = (seed_uint8 > 0).astype(np.uint8)
+        if m.max() == 0:
+            return m
+
+        nlab, labels = cv2.connectedComponents(m, connectivity=8)
+        if nlab <= 1:
+            return m
+
+        overlap_labels = np.unique(labels[s > 0])
+        keep = np.zeros_like(m, dtype=np.uint8)
+        for lab in overlap_labels:
+            if lab == 0:
+                continue
+            keep[labels == lab] = 1
+        return keep
+
     def _anterior_axis_and_sign(self, ds):
         try:
             iop = ds.get((0x0020, 0x0037), None)
@@ -1076,28 +1063,6 @@ class DicomProcessor:
                 m = (X <= cutoff)
 
         return m.astype(np.uint8)
-
-    # ---------------------------------------------------------
-    # Dilation with barriers
-    # ---------------------------------------------------------
-    def _keep_only_components_touching_seed(self, mask_uint8, seed_uint8):
-        import cv2
-        m = (mask_uint8 > 0).astype(np.uint8)
-        s = (seed_uint8 > 0).astype(np.uint8)
-        if m.max() == 0:
-            return m
-
-        nlab, labels = cv2.connectedComponents(m, connectivity=8)
-        if nlab <= 1:
-            return m
-
-        overlap_labels = np.unique(labels[s > 0])
-        keep = np.zeros_like(m, dtype=np.uint8)
-        for lab in overlap_labels:
-            if lab == 0:
-                continue
-            keep[labels == lab] = 1
-        return keep
 
     def bounded_dilate_with_front_boost(
         self,
@@ -1154,9 +1119,9 @@ class DicomProcessor:
 
         return new_vol
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # DICOM anonymization helpers
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     def curves_callback(self, ds, elem):
         if elem.tag.group & 0xFF00 == 0x5000:
             del ds[elem.tag]
@@ -1270,24 +1235,68 @@ class DicomProcessor:
 
         recurse(ds)
 
-    # ---------------------------------------------------------
-    # Save anonymized dicoms + conditional SAM1 text removal
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Global CSV helpers
+    # -------------------------------------------------------------------------
+    def _append_global_drop_rows(self, csv_path, rows):
+        if not csv_path or not rows:
+            return
+        try:
+            file_exists = os.path.exists(csv_path)
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                fieldnames = [
+                    "timestamp",
+                    "patient_old_id",
+                    "patient_new_id",
+                    "series_folder",
+                    "source_dir",
+                    "source_filename",
+                    "instance_number",
+                    "series_instance_uid",
+                    "study_instance_uid",
+                    "sop_instance_uid",
+                    "burned_in_annotation",
+                    "decision",
+                    "reason",
+                    "hit_text",
+                    "hit_conf",
+                    "hit_bbox",
+                ]
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    w.writeheader()
+                for row in rows:
+                    w.writerow(row)
+        except Exception as e:
+            try:
+                self.logger.error(f"Failed writing global dropped rows: {e}")
+            except Exception:
+                pass
+
+    # -------------------------------------------------------------------------
+    # Save anonymized dicoms + OCR detect -> DROP slice
+    # Enforces: OCR-all-first, save-after via temp staging
+    # Writes only global CSV, no per-folder CSV/JSON
+    # -------------------------------------------------------------------------
     def save_new_dicom_files(
         self,
         original_dir,
         out_dir,
         replacer="face",
         id="new_folder_name",
+        patient_old_id="",
         patient_id="0",
         new_patient_id="Processed for anonymization",
         remove_CTA=False,
+        global_drop_csv_path=None,
     ):
         import pydicom
 
         os.makedirs(out_dir, exist_ok=True)
         files = [f for f in os.listdir(original_dir) if self.is_dicom(os.path.join(original_dir, f), remove_CTA)]
         errors = []
+
+        dropped_rows = []
 
         def _instnum(path):
             try:
@@ -1298,117 +1307,195 @@ class DicomProcessor:
 
         files.sort(key=lambda fn: (_instnum(os.path.join(original_dir, fn)), fn))
 
-        for i, fname in enumerate(files, start=1):
-            try:
-                ds = self.load_scan(os.path.join(original_dir, fname))
+        tmp_root = None
+        prepared = []
+
+        kept_count = 0
+        drop_count = 0
+        err_count = 0
+
+        progress_every = 50
+
+        try:
+            tmp_root = tempfile.mkdtemp(prefix="headctdeid_tmpdicom_")
+
+            if files:
+                _safe_show_status(f"[{id}] Series: {os.path.basename(original_dir)} | slices={len(files)}", 2500)
+
+            for i, fname in enumerate(files, start=1):
+                src_path = os.path.join(original_dir, fname)
                 try:
-                    ds.decompress()
+                    ds = self.load_scan(src_path)
+                    try:
+                        ds.decompress()
+                    except Exception:
+                        pass
+
+                    inst = None
+                    try:
+                        inst = int(getattr(ds, "InstanceNumber", 1))
+                    except Exception:
+                        inst = None
+
+                    burned_flag = dicom_has_burned_in(ds)
+
+                    series_uid = str(getattr(ds, "SeriesInstanceUID", "") or "")
+                    study_uid = str(getattr(ds, "StudyInstanceUID", "") or "")
+                    sop_uid = str(getattr(ds, "SOPInstanceUID", "") or "")
+
+                    ds.remove_private_tags()
+                    ds.walk(self.curves_callback)
+
+                    if (0x0010, 0x0020) not in ds:
+                        ds.add_new((0x0010, 0x0020), "LO", id)
+                    else:
+                        ds[(0x0010, 0x0020)].value = id
+
+                    if (0x0010, 0x0010) not in ds:
+                        ds.add_new((0x0010, 0x0010), "PN", "Processed for anonymization")
+                    else:
+                        ds[(0x0010, 0x0010)].value = "Processed for anonymization"
+
+                    if (0x0008, 0x0050) not in ds:
+                        ds.add_new((0x0008, 0x0050), "SH", id)
+                    else:
+                        ds[(0x0008, 0x0050)].value = id
+
+                    self._anonymize_dataset_recursive(ds, patient_id_value=id)
+
+                    pixels_hu = self.get_pixels_hu(ds)
+
+                    want_detect = self._force_ocr_all or burned_flag
+                    if want_detect:
+                        has_text, hit_txt, hit_conf, hit_bbox = self.slice_has_text_info(pixels_hu, ds)
+                        if has_text:
+                            drop_count += 1
+                            dropped_rows.append({
+                                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                "patient_old_id": patient_old_id,
+                                "patient_new_id": id,
+                                "series_folder": os.path.basename(original_dir),
+                                "source_dir": original_dir,
+                                "source_filename": fname,
+                                "instance_number": inst,
+                                "series_instance_uid": series_uid,
+                                "study_instance_uid": study_uid,
+                                "sop_instance_uid": sop_uid,
+                                "burned_in_annotation": bool(burned_flag),
+                                "decision": "DROPPED",
+                                "reason": "easyocr_detected_text",
+                                "hit_text": hit_txt,
+                                "hit_conf": hit_conf,
+                                "hit_bbox": hit_bbox,
+                            })
+                            del ds, pixels_hu
+                            continue
+
+                    bin_mask = self.binarize_volume(pixels_hu)
+                    lcc = self.largest_connected_component(bin_mask)
+
+                    k_max = int(self._kernel_from_pixel_spacing(ds))
+                    dilated = self.bounded_dilate_with_front_boost(
+                        lcc_air_seed=lcc,
+                        pixels_hu=pixels_hu,
+                        ds=ds,
+                        k_max=k_max,
+                        bone_stop_hu=BONE_STOP_HU,
+                        front_fraction=0.55,
+                    )
+
+                    ring = ((dilated > 0) & (lcc == 0)).astype(np.uint8)
+
+                    if replacer == "face":
+                        vals = self.apply_mask_and_get_values(pixels_hu, ring)
+                    elif replacer == "air":
+                        vals = [0]
+                    else:
+                        try:
+                            vals = [int(replacer)]
+                        except Exception:
+                            vals = self.apply_mask_and_get_values(pixels_hu, ring)
+
+                    new_volume = self.apply_random_values_optimized(
+                        pixels_hu,
+                        dilated,
+                        vals,
+                        bone_stop_hu=BONE_STOP_HU,
+                        fill_mode="air",
+                    )
+
+                    slope = float(getattr(ds, "RescaleSlope", 1)) or 1.0
+                    intercept = float(getattr(ds, "RescaleIntercept", 0))
+                    new_slice = (new_volume - intercept) / slope
+
+                    ds.PixelData = new_slice.astype(np.int16).tobytes()
+                    ds.BitsAllocated = 16
+                    ds.BitsStored = 16
+                    ds.HighBit = 15
+                    ds.PixelRepresentation = 1
+
+                    out_name = f"{id}_{i:05d}.dcm"
+                    tmp_path = os.path.join(tmp_root, out_name)
+                    final_path = os.path.join(out_dir, out_name)
+
+                    ds.save_as(tmp_path, write_like_original=False)
+                    prepared.append((tmp_path, final_path))
+                    kept_count += 1
+
+                    del ds, pixels_hu, new_volume
+
+                except Exception as e:
+                    err_count += 1
+                    errors.append((fname, str(e)))
+
+                if (i % progress_every == 0) or (i == len(files)):
+                    _safe_show_status(
+                        f"[{id}] slices {i}/{len(files)} | kept={kept_count} dropped={drop_count} errors={err_count}",
+                        1500,
+                    )
+
+            if files and not prepared:
+                errors.append((os.path.basename(original_dir), "all_slices_removed_due_to_detected_text"))
+
+            for tmp_path, final_path in prepared:
+                try:
+                    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+                    shutil.copy2(tmp_path, final_path)
+                except Exception as e:
+                    errors.append((os.path.basename(tmp_path), f"finalize_copy_failed: {e}"))
+
+        finally:
+            if errors:
+                try:
+                    with open(os.path.join(out_dir, "log.txt"), "a") as error_file:
+                        for dicom_file, err in errors:
+                            error_file.write(f"File: {dicom_file}, Error: {err}\n")
                 except Exception:
                     pass
 
-                ds.remove_private_tags()
-                ds.walk(self.curves_callback)
+            self._append_global_drop_rows(global_drop_csv_path, dropped_rows)
 
-                if (0x0010, 0x0020) not in ds:
-                    ds.add_new((0x0010, 0x0020), "LO", id)
-                else:
-                    ds[(0x0010, 0x0020)].value = id
-
-                if (0x0010, 0x0010) not in ds:
-                    ds.add_new((0x0010, 0x0010), "PN", "Processed for anonymization")
-                else:
-                    ds[(0x0010, 0x0010)].value = "Processed for anonymization"
-
-                if (0x0008, 0x0050) not in ds:
-                    ds.add_new((0x0008, 0x0050), "SH", id)
-                else:
-                    ds[(0x0008, 0x0050)].value = id
-
-                self._anonymize_dataset_recursive(ds, patient_id_value=id)
-
-                pixels_hu = self.get_pixels_hu(ds)
-
-                bin_mask = self.binarize_volume(pixels_hu)
-                lcc = self.get_largest_component_volume(bin_mask)
-
-                k_max = int(self._kernel_from_pixel_spacing(ds))
-
-                dilated = self.bounded_dilate_with_front_boost(
-                    lcc_air_seed=lcc,
-                    pixels_hu=pixels_hu,
-                    ds=ds,
-                    k_max=k_max,
-                    bone_stop_hu=BONE_STOP_HU,
-                    front_fraction=0.55,
-                )
-
-                ring = ((dilated > 0) & (lcc == 0)).astype(np.uint8)
-
-                if replacer == "face":
-                    vals = self.apply_mask_and_get_values(pixels_hu, ring)
-                elif replacer == "air":
-                    vals = [0]
-                else:
-                    try:
-                        vals = [int(replacer)]
-                    except Exception:
-                        vals = self.apply_mask_and_get_values(pixels_hu, ring)
-
-                new_volume = self.apply_random_values_optimized(
-                    pixels_hu,
-                    dilated,
-                    vals,
-                    bone_stop_hu=BONE_STOP_HU,
-                    fill_mode="air",
-                )
-
-                want_sam = self._force_sam_all or dicom_has_burned_in(ds)
-                if want_sam:
-                    new_volume = self._remove_text_with_sam(new_volume, pixels_hu)
-
-                slope = float(getattr(ds, "RescaleSlope", 1)) or 1.0
-                intercept = float(getattr(ds, "RescaleIntercept", 0))
-                new_slice = (new_volume - intercept) / slope
-                ds.PixelData = new_slice.astype(np.int16).tobytes()
-                ds.BitsAllocated = 16
-                ds.BitsStored = 16
-                ds.HighBit = 15
-                ds.PixelRepresentation = 1
-
-                out_name = f"{id}_{i:05d}.dcm"
-                ds.save_as(os.path.join(out_dir, out_name), write_like_original=False)
-
-                del ds, pixels_hu, new_volume
-            except Exception as e:
-                errors.append((fname, str(e)))
-
-        if errors:
-            try:
-                with open(os.path.join(out_dir, "log.txt"), "a") as error_file:
-                    for dicom_file, err in errors:
-                        error_file.write(f"File: {dicom_file}, Error: {err}\n")
-            except Exception:
-                pass
+            if tmp_root and os.path.isdir(tmp_root):
+                try:
+                    shutil.rmtree(tmp_root)
+                except Exception:
+                    pass
 
         return errors
 
     # -----------------------------------------------------------------------
-    # Snapshot rendering (CRASH-SAFE)
+    # Snapshot rendering (subprocess)
     # -----------------------------------------------------------------------
     def _render_fallback_middle_slice(self, dicom_dir: str, out_png: str):
-        """
-        Very safe fallback: read DICOM stack with pydicom, save middle axial slice as PNG.
-        """
         import pydicom
         import cv2
 
-        # find dicoms
         paths = []
         for fn in os.listdir(dicom_dir):
             fp = os.path.join(dicom_dir, fn)
             if os.path.isfile(fp):
                 try:
-                    ds = pydicom.dcmread(fp, force=True, stop_before_pixels=True)
+                    _ = pydicom.dcmread(fp, force=True, stop_before_pixels=True)
                     paths.append(fp)
                 except Exception:
                     pass
@@ -1423,7 +1510,6 @@ class DicomProcessor:
                 return sys.maxsize
 
         paths.sort(key=instnum)
-
         mid = paths[len(paths) // 2]
         ds = pydicom.dcmread(mid, force=True)
         try:
@@ -1432,7 +1518,6 @@ class DicomProcessor:
             pass
         img = ds.pixel_array.astype(np.float32)
 
-        # simple window for face-ish visibility (can tweak)
         intercept = float(getattr(ds, "RescaleIntercept", 0))
         slope = float(getattr(ds, "RescaleSlope", 1) or 1.0)
         hu = img * slope + intercept
@@ -1457,14 +1542,10 @@ class DicomProcessor:
         rotate_180: bool = True,
         view_angle_deg: float = 12.0,
         min_slices: int = 16,
-        timeout_sec: int = 45,
+        timeout_sec: int = 60,
     ):
-        """
-        Run VTK offscreen render in a subprocess to prevent Slicer hard-crash.
-        """
         script = f"""
 import os
-import sys
 import vtk
 
 dicom_dir = r\"\"\"{dicom_dir}\"\"\"
@@ -1486,7 +1567,6 @@ mapper.SetInputConnection(reader.GetOutputPort())
 mapper.SetImageSampleDistance(1.0)
 mapper.SetSampleDistance(0.5)
 
-# transfer functions (face-friendly)
 ctf = vtk.vtkColorTransferFunction()
 ctf.AddRGBPoint(-1000, 0.0, 0.0, 0.0)
 ctf.AddRGBPoint(-600,  0.0, 0.0, 0.0)
@@ -1549,7 +1629,8 @@ dist = diag * float({zoom_out})
 cam = ren.GetActiveCamera()
 cam.SetFocalPoint(cx, cy, cz)
 cam.SetViewUp(0, 0, 1)
-cam.SetPosition(cx, cy + dist, cz)  # anterior
+cam.SetPosition(cx, cy + dist, cz)
+
 try:
     cam.SetViewAngle(float({view_angle_deg}))
 except Exception:
@@ -1581,16 +1662,14 @@ renwin.Finalize()
 
 print(out_png)
 """
-
         with tempfile.NamedTemporaryFile("w", suffix="_vtk_render.py", delete=False) as tf:
             tf.write(script)
             script_path = tf.name
 
         try:
-            cmd = [sys.executable, script_path]
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-            if p.returncode != 0:
-                raise RuntimeError(f"VTK render subprocess failed: {p.stderr or p.stdout}")
+            rc, stdout, stderr = self._popen_and_wait([sys.executable, script_path], timeout_sec=timeout_sec)
+            if rc != 0:
+                raise RuntimeError(f"VTK render subprocess failed: {stderr or stdout}")
             if not os.path.exists(out_png):
                 raise RuntimeError("VTK render subprocess did not produce output PNG")
             return out_png
@@ -1605,8 +1684,6 @@ print(out_png)
             raise RuntimeError(f"Not a folder: {dicomDir}")
 
         out_path = os.path.join(dicomDir, f"{out_prefix}_anterior.png")
-
-        # First try VTK offscreen in subprocess (prevents Slicer exit)
         try:
             self._render_one_anterior_vtk_folder_subprocess(
                 dicom_dir=dicomDir,
@@ -1620,13 +1697,11 @@ print(out_png)
             )
             return [out_path]
         except Exception as e:
-            # fallback: middle slice
             try:
                 with open(os.path.join(dicomDir, "render_log.txt"), "a") as f:
                     f.write(f"[{datetime.now()}] VTK render failed; fallback to middle-slice. Reason: {e}\n")
             except Exception:
                 pass
-
             self._render_fallback_middle_slice(dicomDir, out_path)
             return [out_path]
 
@@ -1688,12 +1763,13 @@ print(out_png)
         out_path,
         replacer="face",
         id="new_folder_name",
+        patient_old_id="",
         patient_id="0",
         name="",
         remove_CTA=False,
+        global_drop_csv_path=None,
     ):
         try:
-            # Phase 1: anonymize + drown + conditional SAM
             for root, dirs, files in os.walk(in_path):
                 rel = os.path.relpath(root, in_path)
                 out_dir = os.path.join(out_path, rel)
@@ -1705,12 +1781,13 @@ print(out_png)
                         out_dir=out_dir,
                         replacer=replacer,
                         id=id,
+                        patient_old_id=patient_old_id,
                         patient_id=patient_id,
                         new_patient_id="Processed for anonymization",
                         remove_CTA=remove_CTA,
+                        global_drop_csv_path=global_drop_csv_path,
                     )
 
-            # Phase 2: rename subfolders
             for curr, subdirs, files in os.walk(out_path, topdown=True):
                 if not subdirs:
                     continue
@@ -1733,7 +1810,6 @@ print(out_png)
 
                 subdirs[:] = new_names
 
-            # Phase 3: snapshots (CRASH-SAFE)
             try:
                 self._create_and_save_multi_view_snapshots(out_path, out_prefix="view")
             except Exception as e:
@@ -1742,6 +1818,8 @@ print(out_png)
                         f.write(f"[{datetime.now()}] Snapshot phase failed: {e}\n")
                 except Exception:
                     pass
+
+            self.wait_for_all_subprocesses(timeout_total_sec=7200)
 
         except Exception as e:
             try:
@@ -1753,3 +1831,18 @@ print(out_png)
             return 0
 
         return 1
+
+
+# =============================================================================
+# Tests
+# =============================================================================
+class HeadCTDeidTest(ScriptedLoadableModuleTest):
+    def setUp(self):
+        slicer.mrmlScene.Clear()
+
+    def runTest(self):
+        self.setUp()
+        self.test_HeadCTDeid1()
+
+    def test_HeadCTDeid1(self):
+        self.assertTrue(True)
