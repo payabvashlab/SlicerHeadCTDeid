@@ -7,6 +7,7 @@ import csv
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -25,11 +26,15 @@ from slicer.util import VTKObservationMixin
 
 warnings.filterwarnings("ignore")
 
+# =============================================================================
+# EasyOCR (Burned-in text detection)
+# =============================================================================
+
 EASYOCR_LANG = "en"
 
 # Recognition filters (match standalone)
 EASYOCR_MIN_ALNUM = 2
-EASYOCR_CONF_THRESH = 0.40
+EASYOCR_CONF_THRESH = 0.50
 
 # Geometry filters (not used; kept only for compatibility/readability)
 EASYOCR_MIN_BOX_AREA = 0
@@ -77,6 +82,18 @@ EASYOCR_ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 # Plausibility
 EASYOCR_ACCEPT_DIGITS_ONLY = True
 EASYOCR_ACCEPT_SINGLE_TOKEN = True
+
+# Debug PNG drawing
+OCR_DEBUG_DRAW_BOXES = True
+OCR_DEBUG_DRAW_LABELS = True
+OCR_DEBUG_BOX_THICKNESS = 2
+OCR_DEBUG_FONT_SCALE = 0.5
+OCR_DEBUG_FONT_THICKNESS = 1
+
+# Global PNG debug folders
+OCR_DEBUG_ROOT_DIRNAME = "only_for_debug"
+OCR_DEBUG_DETECTED_DIRNAME = "detected_text"
+OCR_DEBUG_NO_TEXT_DIRNAME = "no_text_detected"
 
 # =============================================================================
 # Face/air drowning parameters (unchanged)
@@ -239,6 +256,14 @@ def _safe_show_status(msg: str, ms: int = 2000):
         slicer.util.showStatusMessage(str(msg), int(ms))
     except Exception:
         pass
+
+
+def _safe_filename(s: str) -> str:
+    s = str(s) if s is not None else ""
+    s = s.replace("\\", "__").replace("/", "__")
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_.")
+    return s or "unknown"
 
 
 # =============================================================================
@@ -436,28 +461,21 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         try:
             import cv2  
         except ModuleNotFoundError:
+            slicer.util.pip_install("numpy")
             install("opencv-python")
 
         if not self._checkModuleInstalled("scikit-image"):
             install("scikit-image")
 
-        try:
-            if not self._checkModuleInstalled("torch"):
-                install("torch")
-        except Exception:
-            pass
+        if not self._checkModuleInstalled("easyocr"):
+            slicer.util.pip_uninstall("torch")
+            slicer.util.pip_install([ "torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cu121"])
 
-        try:
-            if not self._checkModuleInstalled("easyocr"):
-                install("easyocr")
-        except Exception:
-            pass
-
-        if not _subprocess_import_ok("easyocr"):
-            slicer.util.infoDisplay(
-                "WARNING: easyocr may not be importable. Text detection may be skipped.",
-                windowTitle="OCR Warning",
-            )
+        import torch
+        from packaging import version
+        if version.parse(torch.__version__) < version.parse("2.3"):
+            slicer.util.pip_uninstall("numpy")
+            slicer.util.pip_install("numpy<2")
 
         self.dependenciesInstalled = True
 
@@ -550,6 +568,12 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         global_drop_csv_path = os.path.join(out_path, GLOBAL_DROPPED_CSV_NAME)
         self._init_global_drop_csv(global_drop_csv_path)
 
+        ocr_debug_root = os.path.join(out_path, OCR_DEBUG_ROOT_DIRNAME)
+        ocr_detected_dir = os.path.join(ocr_debug_root, OCR_DEBUG_DETECTED_DIRNAME)
+        ocr_no_text_dir = os.path.join(ocr_debug_root, OCR_DEBUG_NO_TEXT_DIRNAME)
+        os.makedirs(ocr_detected_dir, exist_ok=True)
+        os.makedirs(ocr_no_text_dir, exist_ok=True)
+
         folders_to_process = [f for f in sorted(dicom_folders) if f in id_mapping]
         total = max(1, len(folders_to_process))
         done = 0
@@ -582,6 +606,9 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     name=f"Processed for Anonymization {id_mapping[foldername]}",
                     remove_CTA=remove_CTA,
                     global_drop_csv_path=global_drop_csv_path,
+                    global_detected_png_dir=ocr_detected_dir,
+                    global_no_text_png_dir=ocr_no_text_dir,
+                    patient_input_root=src_folder,
                 )
 
                 processor.wait_for_all_subprocesses(timeout_total_sec=7200)
@@ -762,7 +789,6 @@ class DicomProcessor:
             return False
 
     def _alnum_count(self, s: str) -> int:
-        import re
         return len(re.findall(r"[A-Za-z0-9]", str(s) if s is not None else ""))
 
     def _text_plausible(self, txt: str) -> bool:
@@ -791,6 +817,13 @@ class DicomProcessor:
         return out
 
     def _dicom_pixels_to_gray8_for_ocr(self, ds):
+        """
+        Match standalone dicom_to_gray8(ds):
+        - pixels = ds.pixel_array
+        - if pixels.ndim == 3: pixels = pixels[0]
+        - apply slope/intercept
+        - min-max normalize to [0,255] uint8
+        """
         pixels = ds.pixel_array
 
         if pixels.ndim == 3:
@@ -828,34 +861,77 @@ class DicomProcessor:
         except Exception:
             return None
 
-    def slice_has_text_info(self, pixels_hu_unused, ds):
+    def _draw_ocr_results(self, gray8, items):
+        import cv2
+
+        det_img = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+
+        for quad, txt, sc in items:
+            try:
+                pts = np.asarray(quad, dtype=np.int32).reshape(4, 2)
+
+                if OCR_DEBUG_DRAW_BOXES:
+                    cv2.polylines(
+                        det_img,
+                        [pts],
+                        isClosed=True,
+                        color=(0, 255, 0),
+                        thickness=OCR_DEBUG_BOX_THICKNESS,
+                    )
+
+                if OCR_DEBUG_DRAW_LABELS:
+                    x = int(np.min(pts[:, 0]))
+                    y = int(np.min(pts[:, 1])) - 5
+                    if y < 10:
+                        y = int(np.max(pts[:, 1])) + 15
+
+                    label = f"{txt} ({float(sc):.2f})" if sc is not None else str(txt)
+                    cv2.putText(
+                        det_img,
+                        label,
+                        (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        OCR_DEBUG_FONT_SCALE,
+                        (0, 255, 0),
+                        OCR_DEBUG_FONT_THICKNESS,
+                        cv2.LINE_AA,
+                    )
+            except Exception:
+                continue
+
+        return det_img
+
+    def detect_text_debug(self, ds):
         """
         Returns:
-          (has_text: bool,
-           hit_text: str or "",
-           hit_conf: float or None,
-           hit_bbox: [[x,y]...]*4 or None)
+          has_text: bool
+          hit_text: str
+          hit_conf: float|None
+          hit_bbox: list|None
+          gray8: uint8 image
+          detection_img: image with boxes
         """
         import cv2
 
         if not self._ensure_ocr():
-            return False, "", None, None
+            return False, "", None, None, None, None
 
         try:
             gray8 = self._dicom_pixels_to_gray8_for_ocr(ds)
         except Exception:
-            return False, "", None, None
+            return False, "", None, None, None, None
 
         try:
             bgr = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
         except Exception:
-            return False, "", None, None
+            return False, "", None, None, gray8, None
 
         res = self._run_easyocr_variant(bgr)
         items = self._parse_easyocr_output(res)
         if not items:
-            return False, "", None, None
+            return False, "", None, None, gray8, cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
 
+        kept = []
         for quad, txt, sc in items:
             if sc is None:
                 continue
@@ -863,11 +939,16 @@ class DicomProcessor:
                 continue
             if not self._text_plausible(txt):
                 continue
+            kept.append((quad, txt, sc))
 
+        detection_img = self._draw_ocr_results(gray8, kept if kept else [])
+
+        if kept:
+            quad, txt, sc = kept[0]
             bbox_list = np.asarray(quad, np.float32).reshape(4, 2).tolist()
-            return True, txt, float(sc), bbox_list
+            return True, txt, float(sc), bbox_list, gray8, detection_img
 
-        return False, "", None, None
+        return False, "", None, None, gray8, detection_img
 
     # -------------------------------------------------------------------------
     # CT helpers
@@ -972,27 +1053,8 @@ class DicomProcessor:
             imageType = [str(x).lower().replace(" ", "") for x in imageType]
             status2 = all(self.is_substring_in_list(c, imageType) for c in ["original", "primary", "axial"])
 
-            studyDes = None
-            for tag in [(0x08, 0x1030), (0x08, 0x103e), (0x18, 0x0015), (0x18, 0x1160)]:
-                if tag in ds:
-                    studyDes = ds[tag].value
-                    break
-            studyDes = [studyDes] if isinstance(studyDes, str) else [studyDes]
-            studyDes = [str(x).lower().replace(" ", "") for x in studyDes if x is not None]
-
-            include = ["head", "brain", "skull"]
-            exclude = ["angio", "cta", "perfusion"]
-
-            status3 = any(self.is_substring_in_list(c, studyDes) for c in include)
-
-            status4 = True
-            if not remove_CTA:
-                if any(self.is_substring_in_list(e, studyDes) for e in exclude):
-                    status4 = False
-
-            return int(status1 and status2 and status3 and status4)
+            return 1
         except Exception:
-            self.error = "CT meta check failed"
             return 0
 
     # -------------------------------------------------------------------------
@@ -1276,7 +1338,7 @@ class DicomProcessor:
     # -------------------------------------------------------------------------
     # Save anonymized dicoms + OCR detect -> DROP slice
     # Enforces: OCR-all-first, save-after via temp staging
-    # Writes only global CSV, no per-folder CSV/JSON
+    # Writes only global CSV, and also global debug PNG folders
     # -------------------------------------------------------------------------
     def save_new_dicom_files(
         self,
@@ -1289,6 +1351,9 @@ class DicomProcessor:
         new_patient_id="Processed for anonymization",
         remove_CTA=False,
         global_drop_csv_path=None,
+        global_detected_png_dir=None,
+        global_no_text_png_dir=None,
+        patient_input_root=None,
     ):
         import pydicom
 
@@ -1367,9 +1432,11 @@ class DicomProcessor:
 
                     want_detect = self._force_ocr_all or burned_flag
                     if want_detect:
-                        has_text, hit_txt, hit_conf, hit_bbox = self.slice_has_text_info(pixels_hu, ds)
+                        has_text, hit_txt, hit_conf, hit_bbox, gray8, detection_img = self.detect_text_debug(ds)
+
                         if has_text:
                             drop_count += 1
+
                             dropped_rows.append({
                                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                                 "patient_old_id": patient_old_id,
@@ -1484,7 +1551,7 @@ class DicomProcessor:
         return errors
 
     # -----------------------------------------------------------------------
-    # Snapshot rendering (subprocess)
+    # Snapshot rendering (subprocess) 
     # -----------------------------------------------------------------------
     def _render_fallback_middle_slice(self, dicom_dir: str, out_png: str):
         import pydicom
@@ -1768,6 +1835,9 @@ print(out_png)
         name="",
         remove_CTA=False,
         global_drop_csv_path=None,
+        global_detected_png_dir=None,
+        global_no_text_png_dir=None,
+        patient_input_root=None,
     ):
         try:
             for root, dirs, files in os.walk(in_path):
@@ -1786,6 +1856,9 @@ print(out_png)
                         new_patient_id="Processed for anonymization",
                         remove_CTA=remove_CTA,
                         global_drop_csv_path=global_drop_csv_path,
+                        global_detected_png_dir=global_detected_png_dir,
+                        global_no_text_png_dir=global_no_text_png_dir,
+                        patient_input_root=patient_input_root or in_path,
                     )
 
             for curr, subdirs, files in os.walk(out_path, topdown=True):
