@@ -375,11 +375,9 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             force_ocr_all = self.ui.deidentifyCheckbox.isChecked()
             remove_CTA = self.ui.deidentifyCTACheckbox.isChecked()
 
-            self.logic.setupPythonRequirements()
-
             if self.ui.progressBar:
                 self.ui.progressBar.setValue(0)
-
+            
             self.logic.process(
                 self.ui.inputFolderButton.directory,
                 self.ui.excelFileButton.text,
@@ -390,6 +388,23 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             )
         except Exception:
             slicer.util.pip_install("python-gdcm==3.0.25")
+            slicer.util.pip_uninstall("torch")
+            slicer.util.pip_install([ "torch", "--extra-index-url", "https://download.pytorch.org/whl/cu121"])
+            slicer.util.pip_install("pandas==2.2.3")
+            slicer.util.pip_install("openpyxl")
+            slicer.util.pip_install("pydicom")
+            slicer.util.pip_install("pylibjpeg")
+            slicer.util.pip_install("pylibjpeg-libjpeg")
+            slicer.util.pip_install("pylibjpeg-openjpeg")
+            slicer.util.pip_install("scikit-image")
+            slicer.util.pip_install("opencv-python")
+            slicer.util.pip_install("opencv-python-headless")
+            slicer.util.pip_install("easyocr")
+            import torch
+            from packaging import version
+            if version.parse(torch.__version__) < version.parse("2.3"):
+                slicer.util.pip_uninstall("numpy")
+                slicer.util.pip_install("numpy<2")
             slicer.util.infoDisplay(
                 "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
                 windowTitle="Warning",
@@ -417,13 +432,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         ScriptedLoadableModuleLogic.__init__(self)
         self.logger = logging.getLogger("PatientProcessor")
 
-    def _checkModuleInstalled(self, moduleName):
-        try:
-            __import__(moduleName)
-            return True
-        except Exception:
-            return False
-
     def setDefaultParameters(self, parameterNode):
         if not parameterNode.GetParameter("InputFolder"):
             parameterNode.SetParameter("InputFolder", "")
@@ -435,49 +443,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             parameterNode.SetParameter("Deidentify", "false")
         if not parameterNode.GetParameter("DeidentifyCTA"):
             parameterNode.SetParameter("DeidentifyCTA", "false")
-
-    def setupPythonRequirements(self, upgrade=False):
-        def install(package):
-            slicer.util.pip_install(package)
-
-        try:
-            import pandas  
-        except ModuleNotFoundError:
-            install("pandas==2.2.3")
-
-        try:
-            import openpyxl  
-        except ModuleNotFoundError:
-            install("openpyxl")
-
-        try:
-            import pydicom  
-        except ModuleNotFoundError:
-            install("pydicom")
-            install("pylibjpeg")
-            install("pylibjpeg-libjpeg")
-            install("pylibjpeg-openjpeg")
-
-        try:
-            import cv2  
-        except ModuleNotFoundError:
-            slicer.util.pip_install("numpy")
-            install("opencv-python")
-
-        if not self._checkModuleInstalled("scikit-image"):
-            install("scikit-image")
-
-        if not self._checkModuleInstalled("easyocr"):
-            slicer.util.pip_uninstall("torch")
-            slicer.util.pip_install([ "torch", "easyocr", "--extra-index-url", "https://download.pytorch.org/whl/cu121"])
-
-        import torch
-        from packaging import version
-        if version.parse(torch.__version__) < version.parse("2.3"):
-            slicer.util.pip_uninstall("numpy")
-            slicer.util.pip_install("numpy<2")
-
-        self.dependenciesInstalled = True
 
     def _ensure_logger(self, outputFolder):
         try:
