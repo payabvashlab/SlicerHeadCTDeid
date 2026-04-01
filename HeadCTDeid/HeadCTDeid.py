@@ -1007,6 +1007,10 @@ class DicomProcessor:
         return any(substring in str(s) for s in string_list)
 
     def checkCTmeta(self, ds, remove_CTA=False):
+        """
+        Accept only CT head (original/primary/axial). By default, exclude CTA/perfusion.
+        If remove_CTA=True -> do not exclude CTA (i.e., include such series as well).
+        """
         try:
             modality = ds.get((0x08, 0x60), "")
             modality = [modality.value] if hasattr(modality, "value") else [modality]
@@ -1018,8 +1022,27 @@ class DicomProcessor:
             imageType = [str(x).lower().replace(" ", "") for x in imageType]
             status2 = all(self.is_substring_in_list(c, imageType) for c in ["original", "primary", "axial"])
 
-            return 1
-        except Exception:
+            studyDes = None
+            for tag in [(0x08, 0x1030), (0x08, 0x103e), (0x18, 0x0015), (0x18, 0x1160)]:
+                if tag in ds:
+                    studyDes = ds[tag].value
+                    break
+            studyDes = [studyDes] if isinstance(studyDes, str) else [studyDes]
+            studyDes = [str(x).lower().replace(" ", "") for x in studyDes if x is not None]
+
+            include = ["head", "brain", "skull"]
+            exclude = ["angio", "cta", "perfusion"]
+
+            status3 = any(self.is_substring_in_list(c, studyDes) for c in include)
+
+            status4 = True
+            if not remove_CTA:
+                if any(self.is_substring_in_list(e, studyDes) for e in exclude):
+                    status4 = False
+
+            return int(status1 and status2 and status3 and status4)
+        except Exception as e:
+            self.error = str(e)
             return 0
 
     # -------------------------------------------------------------------------
