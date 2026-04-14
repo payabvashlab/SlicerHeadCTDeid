@@ -1273,10 +1273,6 @@ class DicomProcessor:
 
                     tag = (elem.tag.group, elem.tag.element)
 
-                    if elem.VR in {"DA", "DT", "TM"} and tag in dataset:
-                        self._set_safe_value_by_vr(dataset, tag, elem.VR, generate_uid, patient_id_value)
-                        continue
-
                     if tag in PDF_TAGS_TO_DEID and tag in dataset:
                         self._set_safe_value_by_vr(dataset, tag, elem.VR, generate_uid, patient_id_value)
 
