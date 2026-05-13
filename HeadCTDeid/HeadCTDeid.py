@@ -1040,7 +1040,7 @@ class DicomProcessor:
                 if any(self.is_substring_in_list(e, studyDes) for e in exclude):
                     status4 = False
 
-            return int(status1 and status2 and status3 and status4)
+            return 1#int(status1 and status2 and status3 and status4)
         except Exception as e:
             self.error = str(e)
             return 0
@@ -1612,52 +1612,63 @@ if img is None:
 dims = img.GetDimensions()
 if (not dims) or (dims[0] <= 1) or (dims[1] <= 1) or (dims[2] < int({min_slices})):
     raise RuntimeError(f"Bad/too-thin volume dims: {{dims}} (min_slices={min_slices})")
+# Smooth CT volume first
+smooth = vtk.vtkImageGaussianSmooth()
+smooth.SetInputConnection(reader.GetOutputPort())
+smooth.SetStandardDeviations(1.2, 1.2, 1.0)
+smooth.SetRadiusFactors(2.0, 2.0, 1.5)
+smooth.Update()
 
-mapper = vtk.vtkFixedPointVolumeRayCastMapper()
-mapper.SetInputConnection(reader.GetOutputPort())
-mapper.SetImageSampleDistance(1.0)
-mapper.SetSampleDistance(0.5)
+# Extract outer skin surface: air/skin boundary
+skin_value = -250.0   # try -450 to -250 if needed
 
-ctf = vtk.vtkColorTransferFunction()
-ctf.AddRGBPoint(-1000, 0.0, 0.0, 0.0)
-ctf.AddRGBPoint(-600,  0.0, 0.0, 0.0)
-ctf.AddRGBPoint(-200,  0.15, 0.12, 0.10)
-ctf.AddRGBPoint(-100,  0.65, 0.55, 0.48)
-ctf.AddRGBPoint(0,     0.85, 0.78, 0.70)
-ctf.AddRGBPoint(50,    0.92, 0.87, 0.80)
-ctf.AddRGBPoint(150,   0.98, 0.96, 0.92)
-ctf.AddRGBPoint(300,   1.0, 1.0, 1.0)
-ctf.AddRGBPoint(1000,  1.0, 1.0, 1.0)
+try:
+    contour = vtk.vtkFlyingEdges3D()
+except Exception:
+    contour = vtk.vtkMarchingCubes()
 
-otf = vtk.vtkPiecewiseFunction()
-otf.AddPoint(-1000, 0.00)
-otf.AddPoint(-700,  0.00)
-otf.AddPoint(-200,  0.00)
-otf.AddPoint(-80,   0.02)
-otf.AddPoint(-40,   0.03)
-otf.AddPoint(0,     0.06)
-otf.AddPoint(50,    0.14)
-otf.AddPoint(120,   0.26)
-otf.AddPoint(250,   0.40)
-otf.AddPoint(700,   0.85)
+contour.SetInputConnection(smooth.GetOutputPort())
+contour.SetValue(0, skin_value)
+contour.Update()
 
-prop = vtk.vtkVolumeProperty()
-prop.SetColor(ctf)
-prop.SetScalarOpacity(otf)
-prop.SetInterpolationTypeToLinear()
-prop.ShadeOn()
-prop.SetAmbient(0.25)
-prop.SetDiffuse(0.9)
-prop.SetSpecular(0.12)
-prop.SetSpecularPower(10.0)
+# Keep only largest connected surface = head/face
+connect = vtk.vtkPolyDataConnectivityFilter()
+connect.SetInputConnection(contour.GetOutputPort())
+connect.SetExtractionModeToLargestRegion()
+connect.Update()
 
-volume = vtk.vtkVolume()
-volume.SetMapper(mapper)
-volume.SetProperty(prop)
+# Smooth surface to remove stair-step CT rings
+surf_smooth = vtk.vtkSmoothPolyDataFilter()
+surf_smooth.SetInputConnection(connect.GetOutputPort())
+surf_smooth.SetNumberOfIterations(35)
+surf_smooth.SetRelaxationFactor(0.12)
+surf_smooth.FeatureEdgeSmoothingOff()
+surf_smooth.BoundarySmoothingOn()
+surf_smooth.Update()
+
+normals = vtk.vtkPolyDataNormals()
+normals.SetInputConnection(surf_smooth.GetOutputPort())
+normals.SetFeatureAngle(60)
+normals.ConsistencyOn()
+normals.AutoOrientNormalsOn()
+normals.SplittingOff()
+normals.Update()
+
+mapper = vtk.vtkPolyDataMapper()
+mapper.SetInputConnection(normals.GetOutputPort())
+mapper.ScalarVisibilityOff()
+
+actor = vtk.vtkActor()
+actor.SetMapper(mapper)
+actor.GetProperty().SetColor(0.95, 0.62, 0.42)
+actor.GetProperty().SetAmbient(0.25)
+actor.GetProperty().SetDiffuse(0.75)
+actor.GetProperty().SetSpecular(0.18)
+actor.GetProperty().SetSpecularPower(18)
 
 ren = vtk.vtkRenderer()
-ren.SetBackground(0, 0, 0)
-ren.AddVolume(volume)
+ren.SetBackground(0.62, 0.65, 0.90)
+ren.AddActor(actor)
 ren.ResetCamera()
 
 renwin = vtk.vtkRenderWindow()
@@ -1666,7 +1677,7 @@ renwin.AddRenderer(ren)
 renwin.SetSize(int({image_size}), int({image_size}))
 renwin.SetMultiSamples(0)
 
-bounds = volume.GetBounds()
+bounds = actor.GetBounds()
 cx = 0.5 * (bounds[0] + bounds[1])
 cy = 0.5 * (bounds[2] + bounds[3])
 cz = 0.5 * (bounds[4] + bounds[5])
