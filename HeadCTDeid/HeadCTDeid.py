@@ -132,6 +132,11 @@ PDF_TAGS_TO_DEID = {
     (0x0010, 0x0010),
     (0x0010, 0x0020),
     (0x0010, 0x0021),
+    (0x0010, 0x0030),
+    (0x0010, 0x0032),
+    (0x0010, 0x0033),
+    (0x0010, 0x0034),
+    (0x0010, 0x0035),
     (0x0010, 0x1000),
     (0x0010, 0x1001),
     (0x0010, 0x1005),
@@ -1006,9 +1011,29 @@ class DicomProcessor:
     def is_substring_in_list(self, substring, string_list):
         return any(substring in str(s) for s in string_list)
 
+    def _is_secondary_capture_sop_class(self, ds):
+        """Return True for Secondary Capture SOP Class UIDs in (0008,0016)."""
+        try:
+            sop_class = ds.get((0x0008, 0x0016), "")
+            sop_class = sop_class.value if hasattr(sop_class, "value") else sop_class
+            sop_class = str(sop_class).strip()
+
+            secondary_capture_uids = {
+                "1.2.840.10008.5.1.4.1.1.7",    # Secondary Capture Image Storage
+                "1.2.840.10008.5.1.4.1.1.7.1",  # Multi-frame Single Bit Secondary Capture Image Storage
+                "1.2.840.10008.5.1.4.1.1.7.2",  # Multi-frame Grayscale Byte Secondary Capture Image Storage
+                "1.2.840.10008.5.1.4.1.1.7.3",  # Multi-frame Grayscale Word Secondary Capture Image Storage
+                "1.2.840.10008.5.1.4.1.1.7.4",  # Multi-frame True Color Secondary Capture Image Storage
+            }
+
+            return sop_class in secondary_capture_uids
+        except Exception:
+            return False
+
     def checkCTmeta(self, ds, remove_CTA=False):
         """
-        Accept only CT head (original/primary/axial). By default, exclude CTA/perfusion.
+        Accept only CT head (original/primary/axial), and exclude Secondary Capture.
+        By default, exclude CTA/perfusion.
         If remove_CTA=True -> do not exclude CTA (i.e., include such series as well).
         """
         try:
@@ -1040,7 +1065,10 @@ class DicomProcessor:
                 if any(self.is_substring_in_list(e, studyDes) for e in exclude):
                     status4 = False
 
-            return 1#int(status1 and status2 and status3 and status4)
+            # Exclude Secondary Capture objects because they can contain burned-in text annotations.
+            status5 = not self._is_secondary_capture_sop_class(ds)
+
+            return int(status1 and status2 and status3 and status4 and status5)
         except Exception as e:
             self.error = str(e)
             return 0
