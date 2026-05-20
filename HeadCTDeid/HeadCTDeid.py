@@ -988,8 +988,8 @@ class DicomProcessor:
             if not (pixel > 0):
                 raise ValueError("PixelSpacing <= 0")
 
-            lo = int(ceil(10.0 / pixel))
-            hi = int(ceil(15.0 / pixel))
+            lo = int(ceil(30.0 / pixel))
+            hi = int(ceil(40.0 / pixel))
             if hi < lo:
                 hi = lo
 
