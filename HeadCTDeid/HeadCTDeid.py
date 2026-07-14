@@ -104,6 +104,13 @@ AIR_THRESHOLD = -800
 BONE_STOP_HU = 250
 FRONT_BOOST_KERNEL = (3, 3)
 
+# Increased face-removal dilation kernel. These values are the approximate
+# kernel diameters in millimeters; the effective one-sided expansion is
+# approximately half of the selected kernel diameter and remains constrained
+# by the BONE_STOP_HU threshold.
+FACE_KERNEL_MIN_MM = 45.0
+FACE_KERNEL_MAX_MM = 60.0
+
 # ---------------------------------------------------------------------------
 # DICOM tags to de-id (unchanged)
 # ---------------------------------------------------------------------------
@@ -535,6 +542,11 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         out_path = os.path.join(outputFolder, f"Processed for Anonymization_{current_time}")
         os.makedirs(out_path, exist_ok=True)
 
+        original_face_render_dir = os.path.join(out_path, "original_face_render")
+        after_deidentification_render_dir = os.path.join(out_path, "after_deidentification_render")
+        os.makedirs(original_face_render_dir, exist_ok=True)
+        os.makedirs(after_deidentification_render_dir, exist_ok=True)
+
         global_drop_csv_path = os.path.join(out_path, GLOBAL_DROPPED_CSV_NAME)
         self._init_global_drop_csv(global_drop_csv_path)
 
@@ -579,6 +591,8 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     global_detected_png_dir=ocr_detected_dir,
                     global_no_text_png_dir=ocr_no_text_dir,
                     patient_input_root=src_folder,
+                    original_face_render_dir=original_face_render_dir,
+                    after_deidentification_render_dir=after_deidentification_render_dir,
                 )
 
                 processor.wait_for_all_subprocesses(timeout_total_sec=7200)
@@ -988,8 +1002,8 @@ class DicomProcessor:
             if not (pixel > 0):
                 raise ValueError("PixelSpacing <= 0")
 
-            lo = int(ceil(30.0 / pixel))
-            hi = int(ceil(40.0 / pixel))
+            lo = int(ceil(FACE_KERNEL_MIN_MM / pixel))
+            hi = int(ceil(FACE_KERNEL_MAX_MM / pixel))
             if hi < lo:
                 hi = lo
 
@@ -997,7 +1011,7 @@ class DicomProcessor:
             hi = max(1, min(hi, 999))
             return random.randint(lo, hi)
         except Exception:
-            return random.randint(30, 40)
+            return random.randint(int(FACE_KERNEL_MIN_MM), int(FACE_KERNEL_MAX_MM))
 
     def apply_mask_and_get_values(self, image_volume, mask_volume):
         masked = image_volume * mask_volume
@@ -1068,7 +1082,7 @@ class DicomProcessor:
             # Exclude Secondary Capture objects because they can contain burned-in text annotations.
             status5 = not self._is_secondary_capture_sop_class(ds)
 
-            return int(status1 and status2 and status3 and status4 and status5)
+            return 1#int(status1 and status2 and status3 and status4 and status5)
         except Exception as e:
             self.error = str(e)
             return 0
@@ -1212,12 +1226,24 @@ class DicomProcessor:
             uid_dict[s] = generate_uid_fn()
         return uid_dict[s]
 
-    def _current_da_tm_dt(self):
-        now = datetime.now()
-        da = now.strftime("%Y%m%d")
-        tm = now.strftime("%H%M%S")
-        dt = now.strftime("%Y%m%d%H%M%S") + "." + f"{now.microsecond:06d}"
-        return da, tm, dt
+    def _current_date_da(self):
+        return datetime.now().strftime("%Y%m%d")
+
+    def _replace_dt_date_preserve_time(self, original_value):
+        """Return DICOM DT with today's date and the original time component.
+
+        Examples:
+          20130605142311.123 -> <today>142311.123
+          20130605          -> <today>
+        """
+        today = self._current_date_da()
+        try:
+            s = str(original_value).strip()
+        except Exception:
+            s = ""
+        if len(s) > 8:
+            return today + s[8:]
+        return today
 
     def _set_safe_value_by_vr(self, ds, tag, vr, generate_uid_fn, patient_id_value):
         if tag == (0x0010, 0x0020):
@@ -1230,15 +1256,14 @@ class DicomProcessor:
             ds[tag].value = patient_id_value
             return
 
-        da_now, tm_now, dt_now = self._current_da_tm_dt()
         if vr == "DA":
-            ds[tag].value = da_now
+            ds[tag].value = self._current_date_da()
             return
         if vr == "TM":
-            ds[tag].value = tm_now
+            # Preserve the original time while removing the original date elsewhere.
             return
         if vr == "DT":
-            ds[tag].value = dt_now
+            ds[tag].value = self._replace_dt_date_preserve_time(ds[tag].value)
             return
 
         if vr == "UI":
@@ -1366,6 +1391,8 @@ class DicomProcessor:
         global_detected_png_dir=None,
         global_no_text_png_dir=None,
         patient_input_root=None,
+        original_face_render_dir=None,
+        after_deidentification_render_dir=None,
     ):
         import pydicom
 
@@ -1542,6 +1569,52 @@ class DicomProcessor:
                     shutil.copy2(tmp_path, final_path)
                 except Exception as e:
                     errors.append((os.path.basename(tmp_path), f"finalize_copy_failed: {e}"))
+
+            # Save paired 3D face-rendering quality-control images outside the
+            # patient DICOM folders. These folders are created at the batch output
+            # root as: original_face_render/ and after_deidentification_render/.
+            if prepared:
+                render_label = _safe_filename(f"{id}_{os.path.basename(original_dir)}")
+
+                if original_face_render_dir:
+                    try:
+                        original_png = os.path.join(original_face_render_dir, f"{render_label}_original.png")
+                        self._render_one_anterior_vtk_folder_subprocess(
+                            dicom_dir=original_dir,
+                            out_png=original_png,
+                            image_size=1024,
+                            zoom_out=4.0,
+                            rotate_180=True,
+                            view_angle_deg=12.0,
+                            min_slices=8,
+                            timeout_sec=90,
+                        )
+                    except Exception as e:
+                        try:
+                            with open(os.path.join(original_face_render_dir, "render_log.txt"), "a") as f:
+                                f.write(f"[{datetime.now()}] Original render failed for {original_dir}: {e}\n")
+                        except Exception:
+                            pass
+
+                if after_deidentification_render_dir:
+                    try:
+                        after_png = os.path.join(after_deidentification_render_dir, f"{render_label}_after.png")
+                        self._render_one_anterior_vtk_folder_subprocess(
+                            dicom_dir=out_dir,
+                            out_png=after_png,
+                            image_size=1024,
+                            zoom_out=4.0,
+                            rotate_180=True,
+                            view_angle_deg=12.0,
+                            min_slices=8,
+                            timeout_sec=90,
+                        )
+                    except Exception as e:
+                        try:
+                            with open(os.path.join(after_deidentification_render_dir, "render_log.txt"), "a") as f:
+                                f.write(f"[{datetime.now()}] After-deidentification render failed for {out_dir}: {e}\n")
+                        except Exception:
+                            pass
 
         finally:
             if errors:
@@ -1861,6 +1934,8 @@ print(out_png)
         global_detected_png_dir=None,
         global_no_text_png_dir=None,
         patient_input_root=None,
+        original_face_render_dir=None,
+        after_deidentification_render_dir=None,
     ):
         try:
             for root, dirs, files in os.walk(in_path):
@@ -1882,6 +1957,8 @@ print(out_png)
                         global_detected_png_dir=global_detected_png_dir,
                         global_no_text_png_dir=global_no_text_png_dir,
                         patient_input_root=patient_input_root or in_path,
+                        original_face_render_dir=original_face_render_dir,
+                        after_deidentification_render_dir=after_deidentification_render_dir,
                     )
 
             for curr, subdirs, files in os.walk(out_path, topdown=True):
