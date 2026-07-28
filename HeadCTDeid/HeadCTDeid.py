@@ -1,17 +1,44 @@
 # -*- coding: utf-8 -*-
 """
 HeadCTDeid (3D Slicer scripted module)
+
+Burned-in text detection engine: Florence-2 (vision-language OCR).
+This is the EasyOCR-free version: detection is performed by
+`microsoft/Florence-2-large` through transformers, instead of easyocr.Reader.
+
+Requirements (installed automatically on first Apply, then restart Slicer):
+    torch, transformers>=4.56, accelerate, pillow,
+    opencv-python-headless, pydicom, python-gdcm, pandas, openpyxl
+    (timm + einops only for the legacy remote-code fallback)
+
+Model loading
+-------------
+transformers >= 4.56 ships a native Florence-2 implementation, used through the
+"florence-community/*" repos with no trust_remote_code. The old microsoft/*
+repos rely on remote code that breaks on transformers >= 4.50, so legacy ids are
+remapped automatically. Inference runs in a separate worker process by default.
+
+Notes
+-----
+* Florence-2 GENERATES text rather than reading it, so every hit is scored with
+  hallucination heuristics (too long / repetitive / character runs / blank
+  source image). Flagged hits are kept by default so they remain reviewable.
+* Florence-2 has no per-line confidence. The `confidence` reported here is the
+  sequence-level generation probability (exp of the length-normalised log-prob).
 """
 
 import csv
+import json
 import logging
 import os
+import queue
 import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import warnings
 from collections import defaultdict
@@ -27,68 +54,166 @@ from slicer.util import VTKObservationMixin
 warnings.filterwarnings("ignore")
 
 # =============================================================================
-# EasyOCR (Burned-in text detection)
+# Florence-2 (Burned-in text detection)  --  replaces EasyOCR
 # =============================================================================
 
-EASYOCR_LANG = "en"
+# Master switch for burned-in text detection.
+#   True  -> slices where Florence-2 finds text are DROPPED and logged
+#   False -> detection is skipped entirely (old `if 0:` behaviour)
+ENABLE_TEXT_DETECTION = True
 
-# Recognition filters (match standalone)
-EASYOCR_MIN_ALNUM = 2
-EASYOCR_CONF_THRESH = 0.50
+# ---------------------------------------------------------------------------
+# Process isolation
+# ---------------------------------------------------------------------------
+# Florence-2 runs in a separate Python process by default, exactly like the VTK
+# renderer in this module already does. Importing torch/transformers into
+# Slicer's own process risks native library conflicts (segfault) and OOM kills
+# that take the whole application down mid-study. In a worker, both degrade to
+# a logged error for that slice.
+FLORENCE_RUN_IN_SUBPROCESS = True
 
-# Geometry filters (not used; kept only for compatibility/readability)
-EASYOCR_MIN_BOX_AREA = 0
-EASYOCR_MAX_BOX_AREA_FRAC = 1.0
-EASYOCR_MAX_BOX_H_FRAC = 1.0
-EASYOCR_MAX_BOX_W_FRAC = 1.0
-EASYOCR_MIN_ASPECT = 0.0
+# Interpreter used for the worker. "" = sys.executable (Slicer's PythonSlicer).
+# Point this at a separate venv python that has torch/transformers installed to
+# isolate the model from Slicer's libraries completely, e.g.
+#   FLORENCE_WORKER_PYTHON = "/mnt/mydrive/SlicerHeadCTDeid/deid/.venv/bin/python"
+FLORENCE_WORKER_PYTHON = ""
 
-# Preprocess: standalone behavior
-EASYOCR_USE_CLAHE = False
-EASYOCR_USE_INVERTED_PASS = False
-EASYOCR_USE_RAW_PASS = True
-EASYOCR_USE_ROTATED_180_PASS = False
+# First launch downloads the weights, so the load timeout is generous.
+FLORENCE_WORKER_LOAD_TIMEOUT_SEC = 3600
+FLORENCE_WORKER_CALL_TIMEOUT_SEC = 300
+FLORENCE_WORKER_MAX_RESTARTS = 3
 
-# Optional border restriction: disabled to match standalone
-EASYOCR_RESTRICT_TO_BORDER_BAND = False
-EASYOCR_BORDER_FRAC = 0.30
+# Free the model (and its RAM/VRAM) when a batch run finishes. The next Apply
+# reloads from the local cache, which is fast once the weights are downloaded.
+FLORENCE_SHUTDOWN_WORKER_AFTER_RUN = True
 
-# Brightness heuristic: disabled to match standalone
-EASYOCR_BRIGHT_PIXEL_THR = 0
-EASYOCR_BRIGHT_FRAC_THRESH = 0.0
+# ---------------------------------------------------------------------------
+# Model / weights
+# ---------------------------------------------------------------------------
+# Florence-2 became a first-class transformers model on 2025-08-20, under the
+# "florence-community/*" repos. That path needs NO trust_remote_code, which is
+# what fixes the errors the old microsoft/* repos throw on transformers >= 4.50
+# ('Florence2LanguageConfig' object has no attribute 'forced_bos_token_id',
+# '_supports_sdpa', "Unrecognized configuration class", ...).
+FLORENCE_MODEL_ID = "florence-community/Florence-2-large"
+# Lighter option when RAM/VRAM is tight: "florence-community/Florence-2-base"
 
-# CT windowing for OCR: disabled to match standalone
-EASYOCR_USE_CT_WINDOWING = False
-EASYOCR_DEFAULT_WC = 40.0
-EASYOCR_DEFAULT_WW = 80.0
+# Legacy microsoft/* ids are remapped to their native equivalents automatically
+# unless this is turned off. With it off, the old remote-code path is used and
+# transformers must be < 4.50.
+FLORENCE_PREFER_NATIVE = True
 
-# EasyOCR inference knobs — exact standalone call settings
-EASYOCR_DECODER = "greedy"
-EASYOCR_MIN_SIZE = 15
-EASYOCR_TEXT_THRESHOLD = 0.85
-EASYOCR_LOW_TEXT = 0.50
-EASYOCR_LINK_THRESHOLD = 0.60
-EASYOCR_MAG_RATIO = 1.0
-EASYOCR_CONTRAST_THS = 0.10
-EASYOCR_ADJUST_CONTRAST = 0.5
-EASYOCR_ADD_MARGIN = 0.0
-EASYOCR_WIDTH_THS = 0.5
-EASYOCR_SLOPE_THS = 0.5
-EASYOCR_HEIGHT_THS = 0.5
-EASYOCR_YCENTER_THS = 0.5
+FLORENCE_NATIVE_EQUIVALENT = {
+    "microsoft/Florence-2-large": "florence-community/Florence-2-large",
+    "microsoft/Florence-2-base": "florence-community/Florence-2-base",
+    "microsoft/Florence-2-large-ft": "florence-community/Florence-2-large-ft",
+    "microsoft/Florence-2-base-ft": "florence-community/Florence-2-base-ft",
+}
 
-EASYOCR_ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz:-_/(). "
+# Weights are downloaded from HuggingFace on first use (~1.5 GB for -large,
+# ~0.5 GB for -base) and cached on disk. Set this to keep the cache somewhere
+# specific, e.g. a shared drive; "" uses HF_HOME / ~/.cache/huggingface.
+FLORENCE_HF_CACHE_DIR = ""
 
-# Plausibility
-EASYOCR_ACCEPT_DIGITS_ONLY = True
-EASYOCR_ACCEPT_SINGLE_TOKEN = True
+# "<OCR_WITH_REGION>" returns text + quad boxes. "<OCR>" returns text only.
+FLORENCE_TASK = "<OCR_WITH_REGION>"
+# If <OCR_WITH_REGION> returns nothing, retry the slice with plain <OCR>.
+FLORENCE_FALLBACK_PLAIN_OCR = True
 
+FLORENCE_MAX_NEW_TOKENS = 64       # burned-in text on CT is short
+FLORENCE_NUM_BEAMS = 3             # 1 = greedy, lowest memory
+FLORENCE_DTYPE = "float16"         # "float16" | "bfloat16" | "float32"
+FLORENCE_DEVICE = "auto"           # "auto" | "cuda" | "cpu"
+FLORENCE_ATTN_IMPL = "sdpa"        # avoids the flash_attn dependency
+FLORENCE_LOCAL_FILES_ONLY = False  # True if the machine is offline (pre-cached)
+
+# Upscale the grayscale slice before inference (Florence-2 works at ~768 px).
+FLORENCE_UPSCALE = 1.0
+
+# Release CUDA cache every N inference calls (useful when VRAM is tight).
+FLORENCE_EMPTY_CACHE_EVERY_N_CALLS = 50
+
+# Load the model once per Slicer session and share it across patients.
+FLORENCE_SHARE_MODEL_ACROSS_PATIENTS = True
+
+# ---------------------------------------------------------------------------
+# Confidence / text post-filters
+# ---------------------------------------------------------------------------
+# Florence-2 does not return a per-line confidence like EasyOCR. The value used
+# here is derived from the model's own token probabilities (length-normalised
+# log-prob, mapped back to 0..1):
+#     1.0 = the model is very sure about the string it just produced
+#     0.3 = the model is guessing
+# IMPORTANT: this is confidence in the string it WROTE, not evidence that the
+# string is actually present in the image. Raising this reduces false alarms but
+# increases the risk of MISSING PHI, which is the dangerous direction.
+FLORENCE_MIN_CONFIDENCE = 0.8
+
+# What to do when the model gives no usable score (some transformers versions
+# return neither sequences_scores nor scores). True keeps the hit, which is the
+# safe direction for PHI but means the threshold above cannot filter it. A
+# warning is logged the first time this happens.
+FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN = True
+
+FLORENCE_MIN_ALNUM = 2   # minimum alphanumeric characters for a plausible hit
+FLORENCE_MIN_BOX_SIDE = 6  # minimum box side in px (boxless <OCR> hits exempt)
+
+# Burned-in annotation sits near the image edges, while hallucinated text tends
+# to land over the head. When enabled, hits whose box centre falls in the middle
+# of the image are rejected. Boxless <OCR> hits cannot be tested and are kept.
+# Off by default: it trades recall for precision, so enable deliberately.
+FLORENCE_RESTRICT_TO_BORDER_BAND = False
+FLORENCE_BORDER_FRAC = 0.30   # fraction of width/height treated as "border"
+
+FLORENCE_APPLY_ALLOWLIST_FILTER = True
+FLORENCE_ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz:-_/(). "
+
+# Hallucination heuristics (VLMs can invent text on empty images)
+FLORENCE_MAX_PLAUSIBLE_BLOCK_CHARS = 300
+FLORENCE_REPEAT_FLAG_COUNT = 6
+FLORENCE_BLANK_IMAGE_STD = 3.0
+# Keep flagged hits by default: for PHI removal a suspicious hit should still
+# cause the slice to be dropped and reviewed, not be silently discarded.
+FLORENCE_DROP_SUSPECTED_HALLUCINATIONS = False
+
+# ---------------------------------------------------------------------------
+# OpenCV pre-screen (image processing, not OCR)
+# ---------------------------------------------------------------------------
+# Florence-2 is far slower than EasyOCR, so obviously-empty slices can be
+# skipped with a cheap top-hat morphology test.
+#   "on"  -> skip slices that fail the pre-screen (fastest)
+#   "off" -> every slice goes through Florence-2 (safest, slowest)
+PRESCREEN_MODE = "on"
+
+PRESCREEN_MIN_CHAR_H = 5
+PRESCREEN_MAX_CHAR_H = 48
+PRESCREEN_MIN_CHAR_W = 2
+PRESCREEN_MAX_CHAR_W = 48
+PRESCREEN_MIN_CHAR_AREA = 6
+PRESCREEN_MIN_COMPONENTS = 3
+PRESCREEN_TOPHAT_KERNEL = 15
+
+# Slices with BurnedInAnnotation == YES always go through the model.
+PRESCREEN_ALWAYS_RUN_ON_GROUND_TRUTH = True
+
+# Invert MONOCHROME1 slices so burned-in text is bright on a dark background.
+RESPECT_MONOCHROME1 = True
+
+# ---------------------------------------------------------------------------
 # Debug PNG drawing
+# ---------------------------------------------------------------------------
 OCR_DEBUG_DRAW_BOXES = True
 OCR_DEBUG_DRAW_LABELS = True
 OCR_DEBUG_BOX_THICKNESS = 2
 OCR_DEBUG_FONT_SCALE = 0.5
 OCR_DEBUG_FONT_THICKNESS = 1
+OCR_DEBUG_COLOR_OK = (0, 255, 0)
+OCR_DEBUG_COLOR_FLAGGED = (0, 0, 255)
+
+# Write a PNG for every dropped slice; no-text PNGs are off by default because
+# a full study would otherwise produce thousands of images.
+SAVE_DETECTED_DEBUG_PNG = True
+SAVE_NO_TEXT_DEBUG_PNG = False
 
 # Global PNG debug folders
 OCR_DEBUG_ROOT_DIRNAME = "only_for_debug"
@@ -108,7 +233,7 @@ FRONT_BOOST_KERNEL = (3, 3)
 # kernel diameters in millimeters; the effective one-sided expansion is
 # approximately half of the selected kernel diameter and remains constrained
 # by the BONE_STOP_HU threshold.
-FACE_KERNEL_MIN_MM = 45.0
+FACE_KERNEL_MIN_MM = 50.0
 FACE_KERNEL_MAX_MM = 60.0
 
 # ---------------------------------------------------------------------------
@@ -279,6 +404,1253 @@ def _safe_filename(s: str) -> str:
 
 
 # =============================================================================
+# Florence-2 text helpers (allowlist / plausibility / hallucination heuristics)
+# =============================================================================
+def _apply_allowlist(text):
+    if not FLORENCE_APPLY_ALLOWLIST_FILTER:
+        return str(text or "")
+    allowed = set(FLORENCE_ALLOWLIST)
+    return "".join(ch for ch in str(text or "") if ch in allowed)
+
+
+def _alnum_count(text) -> int:
+    return len(re.findall(r"[A-Za-z0-9]", str(text) if text is not None else ""))
+
+
+def _text_plausible(text) -> bool:
+    s = _apply_allowlist(text).strip()
+    return bool(s) and _alnum_count(s) >= int(FLORENCE_MIN_ALNUM)
+
+
+def _box_big_enough(points) -> bool:
+    if points is None:
+        return True  # plain <OCR> hits carry no box; do not reject on size
+    try:
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if pts.size == 0:
+            return True
+        w = float(np.max(pts[:, 0]) - np.min(pts[:, 0]))
+        h = float(np.max(pts[:, 1]) - np.min(pts[:, 1]))
+        return min(w, h) >= float(FLORENCE_MIN_BOX_SIDE)
+    except Exception:
+        return True
+
+
+def _in_border_band(points, shape_hw) -> bool:
+    """True when the box centre lies in the outer band of the image."""
+    if points is None:
+        return True  # boxless <OCR> hit: cannot test, do not reject
+    try:
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if pts.size == 0:
+            return True
+        h, w = int(shape_hw[0]), int(shape_hw[1])
+        cx = float(np.mean(pts[:, 0]))
+        cy = float(np.mean(pts[:, 1]))
+        fx = float(FLORENCE_BORDER_FRAC) * w
+        fy = float(FLORENCE_BORDER_FRAC) * h
+        return (cx <= fx) or (cx >= w - fx) or (cy <= fy) or (cy >= h - fy)
+    except Exception:
+        return True
+
+
+def _hallucination_flags(text, image):
+    """Heuristics for text the model invented rather than read."""
+    flags = []
+    s = str(text or "")
+
+    if len(s) > int(FLORENCE_MAX_PLAUSIBLE_BLOCK_CHARS):
+        flags.append("too_long")
+
+    tokens = re.findall(r"\S+", s)
+    if tokens:
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        if max(counts.values()) >= int(FLORENCE_REPEAT_FLAG_COUNT):
+            flags.append("repetitive")
+
+    if re.search(r"(.)\1{9,}", s):
+        flags.append("char_run")
+
+    try:
+        if float(np.std(np.asarray(image, dtype=np.float32))) < float(FLORENCE_BLANK_IMAGE_STD):
+            flags.append("blank_source_image")
+    except Exception:
+        pass
+
+    return flags
+
+
+def _strip_special(text) -> str:
+    """<OCR_WITH_REGION> labels usually carry </s>, <s> and <loc_*> markers."""
+    s = str(text or "")
+    s = re.sub(r"</?s>", "", s)
+    s = re.sub(r"<pad>", "", s)
+    s = re.sub(r"<loc_\d+>", "", s)
+    return s.strip()
+
+
+def _coerce_points(raw):
+    if raw is None:
+        return None
+    try:
+        arr = np.asarray(raw, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if arr.size == 4:
+        x1, y1, x2, y2 = [float(v) for v in arr]
+        return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+    if arr.size >= 8 and arr.size % 2 == 0:
+        return arr.reshape(-1, 2)
+    return None
+
+
+# =============================================================================
+# OpenCV pre-screen (cheap "is there anything text-like here?" test)
+# =============================================================================
+def _count_textlike_components(gray8) -> int:
+    """Count connected components whose size looks like a burned-in character.
+
+    Top-hat morphology highlights small BRIGHT regions on a darker background,
+    which is what burned-in annotation looks like on CT. This is plain image
+    processing, not OCR.
+    """
+    try:
+        import cv2
+
+        k = int(PRESCREEN_TOPHAT_KERNEL)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        tophat = cv2.morphologyEx(gray8, cv2.MORPH_TOPHAT, kernel)
+        if float(np.max(tophat)) < 1.0:
+            return 0
+        _, bw = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        num, _labels, stats, _cent = cv2.connectedComponentsWithStats(bw, 8)
+        count = 0
+        for i in range(1, num):
+            x, y, w, h, area = stats[i]
+            if (PRESCREEN_MIN_CHAR_H <= h <= PRESCREEN_MAX_CHAR_H
+                    and PRESCREEN_MIN_CHAR_W <= w <= PRESCREEN_MAX_CHAR_W
+                    and area >= PRESCREEN_MIN_CHAR_AREA):
+                count += 1
+        return count
+    except Exception:
+        # On failure, assume text may be present (safer for PHI removal).
+        return int(PRESCREEN_MIN_COMPONENTS)
+
+
+def _prescreen_says_maybe_text(gray8):
+    n = _count_textlike_components(gray8)
+    return (n >= int(PRESCREEN_MIN_COMPONENTS)), n
+
+
+# =============================================================================
+# Florence-2 engine
+# =============================================================================
+def _fixed_get_imports(filename):
+    """Drop the flash_attn requirement from Florence-2's remote code.
+
+    modeling_florence2.py imports flash_attn at module scope, so transformers
+    treats it as mandatory even though the model runs fine with sdpa
+    (huggingface/transformers#31793).
+    """
+    from transformers.dynamic_module_utils import get_imports
+
+    imports = get_imports(filename)
+    if str(filename).endswith("modeling_florence2.py") and "flash_attn" in imports:
+        imports = [im for im in imports if im != "flash_attn"]
+    return imports
+
+
+def _resolve_florence_device():
+    if str(FLORENCE_DEVICE).lower() != "auto":
+        return str(FLORENCE_DEVICE)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _resolve_florence_dtype(device):
+    try:
+        import torch
+    except Exception:
+        return None
+    if device == "cpu":
+        return torch.float32
+    return {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }.get(str(FLORENCE_DTYPE).lower(), torch.float16)
+
+
+class Florence2Engine:
+    """Thin wrapper around microsoft/Florence-2-* for burned-in text OCR."""
+
+    def __init__(self):
+        import torch
+        from unittest.mock import patch
+        from transformers import AutoModelForCausalLM, AutoProcessor
+
+        try:
+            from transformers import Florence2ForConditionalGeneration
+            has_native = True
+        except Exception:
+            Florence2ForConditionalGeneration = None
+            has_native = False
+
+        self.torch = torch
+        self.device = _resolve_florence_device()
+        self.dtype = _resolve_florence_dtype(self.device)
+        self._calls_done = 0
+
+        if FLORENCE_HF_CACHE_DIR:
+            os.environ["HF_HOME"] = str(FLORENCE_HF_CACHE_DIR)
+            os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(str(FLORENCE_HF_CACHE_DIR), "hub")
+
+        model_id = FLORENCE_MODEL_ID
+        if FLORENCE_PREFER_NATIVE and has_native and model_id in FLORENCE_NATIVE_EQUIVALENT:
+            model_id = FLORENCE_NATIVE_EQUIVALENT[model_id]
+        self.model_id = model_id
+
+        local_only = bool(FLORENCE_LOCAL_FILES_ONLY)
+        use_native = bool(FLORENCE_PREFER_NATIVE and has_native
+                          and not str(model_id).startswith("microsoft/"))
+
+        def _load_native():
+            base = {"attn_implementation": FLORENCE_ATTN_IMPL, "local_files_only": local_only}
+            for dtype_key in ("dtype", "torch_dtype"):
+                kw = dict(base)
+                if self.dtype is not None:
+                    kw[dtype_key] = self.dtype
+                try:
+                    mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **kw)
+                    prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only)
+                    return mdl, prc, f"native({dtype_key})"
+                except TypeError:
+                    continue
+            mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **base)
+            prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only)
+            return mdl, prc, "native(no-dtype)"
+
+        def _load_remote_code():
+            kw = {
+                "trust_remote_code": True,
+                "attn_implementation": FLORENCE_ATTN_IMPL,
+                "local_files_only": local_only,
+                # Avoids holding a second full copy of the weights during load.
+                "low_cpu_mem_usage": True,
+            }
+            if self.dtype is not None:
+                kw["torch_dtype"] = self.dtype
+            with patch("transformers.dynamic_module_utils.get_imports", _fixed_get_imports):
+                try:
+                    mdl = AutoModelForCausalLM.from_pretrained(model_id, **kw)
+                except TypeError:
+                    kw.pop("attn_implementation", None)
+                    mdl = AutoModelForCausalLM.from_pretrained(model_id, **kw)
+                prc = AutoProcessor.from_pretrained(
+                    model_id, trust_remote_code=True, local_files_only=local_only)
+            return mdl, prc, "remote_code"
+
+        try:
+            if use_native:
+                try:
+                    self.model, self.processor, self.impl = _load_native()
+                except Exception:
+                    self.model, self.processor, self.impl = _load_remote_code()
+            else:
+                try:
+                    self.model, self.processor, self.impl = _load_remote_code()
+                except Exception:
+                    if not has_native:
+                        raise
+                    self.model, self.processor, self.impl = _load_native()
+        except Exception as exc:
+            text = str(exc)
+            if ("forced_bos_token_id" in text or "_supports_sdpa" in text
+                    or "Unrecognized configuration class" in text):
+                raise RuntimeError(
+                    f"{exc} -- known Florence-2 remote-code break on transformers "
+                    f">= 4.50. Set FLORENCE_MODEL_ID = 'florence-community/Florence-2-large' "
+                    f"(transformers >= 4.56), or pin transformers==4.49.0."
+                ) from exc
+            raise
+
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+    # ------------------------------------------------------------------
+    # Image preparation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def to_pil(gray8):
+        import cv2
+        from PIL import Image
+
+        scale = float(FLORENCE_UPSCALE) if FLORENCE_UPSCALE and FLORENCE_UPSCALE > 0 else 1.0
+        work = gray8
+        if abs(scale - 1.0) > 1e-6:
+            work = cv2.resize(
+                gray8,
+                (max(1, int(round(gray8.shape[1] * scale))),
+                 max(1, int(round(gray8.shape[0] * scale)))),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        rgb = cv2.cvtColor(work, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(rgb), scale
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    def _generate(self, prompt, images):
+        torch = self.torch
+
+        try:
+            inputs = self.processor(text=[prompt] * len(images), images=images,
+                                    return_tensors="pt", padding=True)
+        except Exception:
+            inputs = self.processor(text=[prompt] * len(images), images=images,
+                                    return_tensors="pt")
+        try:
+            inputs = inputs.to(self.device)
+        except Exception:
+            inputs = {k: (v.to(self.device) if hasattr(v, "to") else v)
+                      for k, v in dict(inputs).items()}
+        if self.dtype is not None and self.device != "cpu" and "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
+
+        # output_scores=True is REQUIRED for any confidence at all: `scores` and
+        # beam search's `sequences_scores` are only returned when it is set.
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=int(FLORENCE_MAX_NEW_TOKENS),
+                num_beams=int(FLORENCE_NUM_BEAMS),
+                do_sample=False,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+        sequences = getattr(out, "sequences", out)
+        texts = self.processor.batch_decode(sequences, skip_special_tokens=False)
+        confs = self._sequence_confidences(out, len(texts))
+        return texts, confs
+
+    def _sequence_confidences(self, out, n):
+        """Sequence-level probability in 0..1 (exp of mean token log-prob).
+
+        Beam search provides `sequences_scores` (length-normalised log-prob)
+        whenever output_scores=True; otherwise it is recomputed from `scores`.
+        Returns None per item when nothing can be derived, so "unknown" is
+        distinguishable from "certain".
+        """
+        torch = self.torch
+        default = [None] * n
+
+        try:
+            seq_scores = getattr(out, "sequences_scores", None)
+            if seq_scores is not None:
+                vals = [float(v) for v in seq_scores.detach().float().cpu().tolist()]
+                return [float(np.clip(np.exp(v), 0.0, 1.0)) for v in vals][:n] or default
+        except Exception:
+            pass
+
+        try:
+            scores = getattr(out, "scores", None)
+            sequences = getattr(out, "sequences", None)
+            if scores is None or sequences is None:
+                return default
+            trans = self.model.compute_transition_scores(
+                sequences, scores, normalize_logits=True
+            ).detach().float().cpu()
+            finite = torch.isfinite(trans)
+            totals = torch.where(finite, trans, torch.zeros_like(trans)).sum(dim=-1)
+            counts = finite.sum(dim=-1).clamp(min=1)
+            means = (totals / counts).tolist()
+            return [float(np.clip(np.exp(v), 0.0, 1.0)) for v in means][:n] or default
+        except Exception:
+            return default
+
+    def _generate_with_oom_retry(self, prompt, images):
+        """Halve the batch and retry on CUDA OOM instead of failing the run."""
+        try:
+            return self._generate(prompt, images)
+        except Exception as exc:
+            is_oom = "out of memory" in str(exc).lower()
+            if not is_oom or len(images) == 1:
+                raise
+            try:
+                self.torch.cuda.empty_cache()
+            except Exception:
+                pass
+            mid = len(images) // 2
+            left_t, left_c = self._generate_with_oom_retry(prompt, images[:mid])
+            right_t, right_c = self._generate_with_oom_retry(prompt, images[mid:])
+            return left_t + right_t, left_c + right_c
+
+    def _parse(self, decoded, task, size):
+        """Turn a Florence-2 completion into [(points|None, text), ...]."""
+        try:
+            parsed = self.processor.post_process_generation(decoded, task=task, image_size=size)
+        except Exception:
+            return []
+
+        payload = parsed.get(task) if isinstance(parsed, dict) else None
+        out = []
+        if payload is None:
+            return out
+
+        # <OCR> -> a single string, no boxes
+        if isinstance(payload, str):
+            txt = _strip_special(payload)
+            if txt:
+                out.append((None, txt))
+            return out
+
+        if isinstance(payload, dict):
+            labels = payload.get("labels") or []
+            quads = payload.get("quad_boxes")
+            if quads is None:
+                quads = payload.get("bboxes")
+
+            for i, lab in enumerate(labels):
+                txt = _strip_special(str(lab))
+                if not txt:
+                    continue
+                pts = None
+                if quads is not None and i < len(quads):
+                    pts = _coerce_points(quads[i])
+                out.append((pts, txt))
+        return out
+
+    def readtext_batch(self, grays):
+        """Return, per image, a list of (points|None, text, confidence)."""
+        if not grays:
+            return []
+
+        prepared = [self.to_pil(g) for g in grays]
+        images = [pr[0] for pr in prepared]
+        scales = [pr[1] for pr in prepared]
+        sizes = [im.size for im in images]  # (W, H) after upscaling
+
+        decoded, confs = self._generate_with_oom_retry(FLORENCE_TASK, images)
+
+        if len(decoded) != len(images):
+            raise RuntimeError(f"Florence-2 returned {len(decoded)} results for {len(images)} images")
+        if len(confs) != len(images):
+            confs = [None] * len(images)
+
+        results = []
+        need_fallback = []
+
+        for i, txt in enumerate(decoded):
+            hits = self._parse(txt, FLORENCE_TASK, sizes[i])
+            if not hits and FLORENCE_FALLBACK_PLAIN_OCR and FLORENCE_TASK != "<OCR>":
+                need_fallback.append(i)
+            # Sequence-level score: every box from one image shares this value.
+            c_i = None if confs[i] is None else float(confs[i])
+            results.append([(pnt, t, c_i) for pnt, t in hits])
+
+        if need_fallback:
+            try:
+                sub = [images[i] for i in need_fallback]
+                decoded2, confs2 = self._generate_with_oom_retry("<OCR>", sub)
+                for j, i in enumerate(need_fallback):
+                    if j < len(decoded2):
+                        c = float(confs2[j]) if (j < len(confs2) and confs2[j] is not None) else None
+                        results[i] = [(pnt, t, c) for pnt, t in self._parse(decoded2[j], "<OCR>", sizes[i])]
+            except Exception:
+                pass
+
+        # Map boxes back to original image coordinates
+        final = []
+        for hits, scale in zip(results, scales):
+            if abs(scale - 1.0) > 1e-6:
+                hits = [((pnt / scale) if pnt is not None else None, t, c) for pnt, t, c in hits]
+            final.append(hits)
+
+        self._calls_done += 1
+        if (FLORENCE_EMPTY_CACHE_EVERY_N_CALLS
+                and self.device == "cuda"
+                and self._calls_done % int(FLORENCE_EMPTY_CACHE_EVERY_N_CALLS) == 0):
+            try:
+                self.torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        return final
+
+    def readtext(self, gray8):
+        out = self.readtext_batch([gray8])
+        return out[0] if out else []
+
+
+# =============================================================================
+# Florence-2 worker subprocess
+# =============================================================================
+# Standalone program: loads the model once, then answers one JSON request per
+# stdin line. Only numpy / torch / transformers / PIL are imported here - cv2 is
+# deliberately absent, because opencv-python links its own Qt and is a known
+# cause of hard crashes inside Qt applications such as Slicer.
+FLORENCE_WORKER_SOURCE = r"""
+import sys, os, json, traceback
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def emit(obj):
+    try:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def log(msg):
+    try:
+        sys.stderr.write(str(msg) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def main():
+    cfg = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
+
+    cache_dir = cfg.get("hf_cache_dir") or ""
+    if cache_dir:
+        os.environ["HF_HOME"] = cache_dir
+        os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(cache_dir, "hub")
+
+    try:
+        import numpy as np
+        import torch
+        import transformers
+        from PIL import Image
+        from unittest.mock import patch
+        from transformers import AutoModelForCausalLM, AutoProcessor
+    except Exception as exc:
+        emit({"ready": False, "error": "import failed: %s" % exc})
+        log(traceback.format_exc())
+        return 1
+
+    tf_version = getattr(transformers, "__version__", "?")
+
+    # Native Florence-2 support landed in transformers on 2025-08-20. When the
+    # class exists we use it and skip trust_remote_code entirely.
+    try:
+        from transformers import Florence2ForConditionalGeneration
+        HAS_NATIVE = True
+    except Exception:
+        Florence2ForConditionalGeneration = None
+        HAS_NATIVE = False
+
+    def fixed_get_imports(filename):
+        # Florence-2's remote code imports flash_attn at module scope even
+        # though it runs fine with sdpa (huggingface/transformers#31793).
+        from transformers.dynamic_module_utils import get_imports
+        imports = get_imports(filename)
+        if str(filename).endswith("modeling_florence2.py") and "flash_attn" in imports:
+            imports = [im for im in imports if im != "flash_attn"]
+        return imports
+
+    device = str(cfg.get("device", "auto"))
+    if device == "auto":
+        try:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+
+    if device == "cpu":
+        dtype = torch.float32
+    else:
+        dtype = {"float16": torch.float16,
+                 "bfloat16": torch.bfloat16,
+                 "float32": torch.float32}.get(str(cfg.get("dtype", "float16")).lower(),
+                                               torch.float16)
+
+    model_id = cfg.get("model_id", "florence-community/Florence-2-large")
+    local_only = bool(cfg.get("local_files_only", False))
+    native_map = cfg.get("native_equivalent") or {}
+    prefer_native = bool(cfg.get("prefer_native", True))
+
+    # Remap legacy microsoft/* ids onto their native equivalents.
+    if prefer_native and HAS_NATIVE and model_id in native_map:
+        log("remapping %s -> %s (native transformers implementation)"
+            % (model_id, native_map[model_id]))
+        model_id = native_map[model_id]
+
+    use_native = bool(prefer_native and HAS_NATIVE
+                      and not str(model_id).startswith("microsoft/"))
+
+    def load_native():
+        # transformers v5 renamed torch_dtype to dtype; try both.
+        base = {"attn_implementation": cfg.get("attn_impl", "sdpa"),
+                "local_files_only": local_only}
+        for dtype_key in ("dtype", "torch_dtype"):
+            kw = dict(base)
+            kw[dtype_key] = dtype
+            try:
+                mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **kw)
+                prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only)
+                return mdl, prc, "native(%s)" % dtype_key
+            except TypeError as exc:
+                log("native load with %s failed: %s" % (dtype_key, exc))
+                continue
+        # Last resort: no dtype argument at all.
+        mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **base)
+        prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only)
+        return mdl, prc, "native(no-dtype)"
+
+    def load_remote_code():
+        kw = {"trust_remote_code": True,
+              "attn_implementation": cfg.get("attn_impl", "sdpa"),
+              "local_files_only": local_only,
+              "low_cpu_mem_usage": True,
+              "torch_dtype": dtype}
+        with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports):
+            try:
+                mdl = AutoModelForCausalLM.from_pretrained(model_id, **kw)
+            except TypeError:
+                kw.pop("attn_implementation", None)
+                mdl = AutoModelForCausalLM.from_pretrained(model_id, **kw)
+            prc = AutoProcessor.from_pretrained(
+                model_id, trust_remote_code=True, local_files_only=local_only)
+        return mdl, prc, "remote_code"
+
+    impl = "?"
+    errors = []
+    try:
+        if use_native:
+            try:
+                model, processor, impl = load_native()
+            except Exception as exc:
+                errors.append("native: %s" % exc)
+                log(traceback.format_exc())
+                log("native load failed; falling back to remote code")
+                model, processor, impl = load_remote_code()
+        else:
+            try:
+                model, processor, impl = load_remote_code()
+            except Exception as exc:
+                errors.append("remote_code: %s" % exc)
+                log(traceback.format_exc())
+                if not HAS_NATIVE:
+                    raise
+                log("remote code failed; falling back to the native implementation")
+                model, processor, impl = load_native()
+
+        model = model.to(device)
+        model.eval()
+    except Exception as exc:
+        hint = ""
+        text = " ".join(errors) + " " + str(exc)
+        if ("forced_bos_token_id" in text or "_supports_sdpa" in text
+                or "Unrecognized configuration class" in text):
+            hint = (" -- this is the known Florence-2 remote-code break on "
+                    "transformers >= 4.50. Use FLORENCE_MODEL_ID = "
+                    "'florence-community/Florence-2-large' (needs transformers "
+                    ">= 4.56), or pin transformers==4.49.0.")
+        emit({"ready": False,
+              "error": "model load failed: %s%s" % (exc, hint),
+              "transformers": tf_version,
+              "has_native": HAS_NATIVE})
+        log(traceback.format_exc())
+        return 1
+
+    emit({"ready": True, "device": device, "dtype": str(dtype), "model_id": model_id,
+          "impl": impl, "transformers": tf_version})
+
+    task = cfg.get("task", "<OCR_WITH_REGION>")
+    fallback_plain = bool(cfg.get("fallback_plain_ocr", True))
+    max_new_tokens = int(cfg.get("max_new_tokens", 64))
+    num_beams = int(cfg.get("num_beams", 3))
+    upscale = float(cfg.get("upscale", 1.0) or 1.0)
+    empty_cache_every = int(cfg.get("empty_cache_every", 50) or 0)
+
+    calls = [0]
+
+    def to_pil(gray):
+        img = Image.fromarray(gray).convert("RGB")
+        scale = upscale if upscale and upscale > 0 else 1.0
+        if abs(scale - 1.0) > 1e-6:
+            img = img.resize((max(1, int(round(img.width * scale))),
+                              max(1, int(round(img.height * scale)))),
+                             Image.BICUBIC)
+            return img, scale
+        return img, 1.0
+
+    def sequence_confidences(out, n):
+        # exp of the length-normalised log-prob, clipped to 0..1.
+        # Returns None per item when nothing can be derived, so the caller can
+        # tell "confident" apart from "unknown" instead of silently seeing 1.0.
+        default = [None] * n
+        try:
+            seq_scores = getattr(out, "sequences_scores", None)
+            if seq_scores is not None:
+                vals = [float(v) for v in seq_scores.detach().float().cpu().tolist()]
+                return [float(np.clip(np.exp(v), 0.0, 1.0)) for v in vals][:n] or default
+        except Exception:
+            pass
+        try:
+            scores = getattr(out, "scores", None)
+            sequences = getattr(out, "sequences", None)
+            if scores is None or sequences is None:
+                return default
+            trans = model.compute_transition_scores(
+                sequences, scores, normalize_logits=True).detach().float().cpu()
+            finite = torch.isfinite(trans)
+            totals = torch.where(finite, trans, torch.zeros_like(trans)).sum(dim=-1)
+            counts = finite.sum(dim=-1).clamp(min=1)
+            means = (totals / counts).tolist()
+            return [float(np.clip(np.exp(v), 0.0, 1.0)) for v in means][:n] or default
+        except Exception:
+            return default
+
+    def generate(prompt, images):
+        texts_in = [prompt] * len(images)
+        try:
+            inputs = processor(text=texts_in, images=images,
+                               return_tensors="pt", padding=True)
+        except Exception:
+            inputs = processor(text=texts_in, images=images, return_tensors="pt")
+
+        # Forward everything the processor produced (input_ids, pixel_values and
+        # attention_mask if present) rather than hand-picking keys.
+        try:
+            inputs = inputs.to(device)
+        except Exception:
+            inputs = {k: (v.to(device) if hasattr(v, "to") else v)
+                      for k, v in dict(inputs).items()}
+        if device != "cpu" and "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(dtype)
+
+        # output_scores=True is REQUIRED for any confidence at all: both
+        # `scores` and beam search's `sequences_scores` are only returned when
+        # it is set. Turning it off silently makes every confidence unknown,
+        # which makes FLORENCE_MIN_CONFIDENCE a no-op. With max_new_tokens=64
+        # the cost is roughly 40 MB per call, which is worth paying.
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                num_beams=num_beams,
+                do_sample=False,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+        sequences = getattr(out, "sequences", out)
+        texts = processor.batch_decode(sequences, skip_special_tokens=False)
+        return texts, sequence_confidences(out, len(texts))
+
+    def generate_oom_safe(prompt, images):
+        try:
+            return generate(prompt, images)
+        except Exception as exc:
+            if "out of memory" not in str(exc).lower() or len(images) == 1:
+                raise
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            mid = len(images) // 2
+            lt, lc = generate_oom_safe(prompt, images[:mid])
+            rt, rc = generate_oom_safe(prompt, images[mid:])
+            return lt + rt, lc + rc
+
+    def coerce_points(raw):
+        if raw is None:
+            return None
+        try:
+            arr = np.asarray(raw, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if arr.size == 4:
+            x1, y1, x2, y2 = [float(v) for v in arr]
+            return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        if arr.size >= 8 and arr.size % 2 == 0:
+            return arr.reshape(-1, 2).tolist()
+        return None
+
+    def parse(decoded, tsk, size):
+        try:
+            parsed = processor.post_process_generation(decoded, task=tsk, image_size=size)
+        except Exception:
+            return []
+        payload = parsed.get(tsk) if isinstance(parsed, dict) else None
+        if payload is None:
+            return []
+        if isinstance(payload, str):
+            return [(None, payload)]
+        out = []
+        if isinstance(payload, dict):
+            labels = payload.get("labels") or []
+            quads = payload.get("quad_boxes")
+            if quads is None:
+                quads = payload.get("bboxes")
+            for i, lab in enumerate(labels):
+                pts = coerce_points(quads[i]) if (quads is not None and i < len(quads)) else None
+                out.append((pts, str(lab)))
+        return out
+
+    warned_no_conf = [False]
+
+    def run_ocr(paths):
+        grays = [np.load(pth) for pth in paths]
+        prepared = [to_pil(g) for g in grays]
+        images = [p[0] for p in prepared]
+        scales = [p[1] for p in prepared]
+        sizes = [im.size for im in images]
+
+        decoded, confs = generate_oom_safe(task, images)
+        if len(confs) != len(images):
+            confs = [None] * len(images)
+
+        if not warned_no_conf[0] and all(c is None for c in confs):
+            warned_no_conf[0] = True
+            log("WARNING: no generation scores available from this model/"
+                "transformers version. Confidence will be reported as null and "
+                "FLORENCE_MIN_CONFIDENCE cannot filter anything.")
+
+        results = []
+        need_fallback = []
+        for i, txt in enumerate(decoded):
+            hits = parse(txt, task, sizes[i])
+            if not hits and fallback_plain and task != "<OCR>":
+                need_fallback.append(i)
+            c_i = None if confs[i] is None else float(confs[i])
+            results.append([(p, t, c_i) for p, t in hits])
+
+        if need_fallback:
+            try:
+                sub = [images[i] for i in need_fallback]
+                dec2, cf2 = generate_oom_safe("<OCR>", sub)
+                for j, i in enumerate(need_fallback):
+                    if j < len(dec2):
+                        c = float(cf2[j]) if (j < len(cf2) and cf2[j] is not None) else None
+                        results[i] = [(p, t, c) for p, t in parse(dec2[j], "<OCR>", sizes[i])]
+            except Exception as exc:
+                log("fallback <OCR> failed: %s" % exc)
+
+        final = []
+        for hits, scale in zip(results, scales):
+            rows = []
+            for pts, txt, conf in hits:
+                if pts is not None and abs(scale - 1.0) > 1e-6:
+                    pts = (np.asarray(pts, dtype=np.float32) / scale).tolist()
+                rows.append({"points": pts, "text": txt,
+                             "conf": (None if conf is None else float(conf))})
+            final.append(rows)
+
+        calls[0] += 1
+        if empty_cache_every and device == "cuda" and calls[0] % empty_cache_every == 0:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        return final
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception as exc:
+            emit({"ok": False, "error": "bad request: %s" % exc})
+            continue
+
+        cmd = req.get("cmd", "ocr")
+        if cmd == "quit":
+            emit({"ok": True, "bye": True})
+            break
+        if cmd == "ping":
+            emit({"ok": True, "pong": True})
+            continue
+
+        try:
+            emit({"ok": True, "results": run_ocr(req.get("paths") or [])})
+        except Exception as exc:
+            emit({"ok": False, "error": str(exc)})
+            log(traceback.format_exc())
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""
+
+
+class Florence2WorkerClient:
+    """Parent-side handle on the Florence-2 worker process.
+
+    Exposes the same readtext()/readtext_batch() surface as the in-process
+    Florence2Engine, so DicomProcessor does not care which one it is holding.
+    """
+
+    def __init__(self, logger=None):
+        self.logger = logger
+        self.proc = None
+        self.device = "?"
+        self.dtype = "?"
+        self._script_path = None
+        self._stderr_path = None
+        self._stderr_handle = None
+        self._tmpdir = None
+        self._out_q = None
+        self._reader = None
+        self._restarts = 0
+        self._launch()
+
+    # ------------------------------------------------------------------
+    # Process lifecycle
+    # ------------------------------------------------------------------
+    def _log(self, msg, error=False):
+        try:
+            if self.logger:
+                (self.logger.error if error else self.logger.info)(msg)
+        except Exception:
+            pass
+
+    def _worker_python(self):
+        exe = str(FLORENCE_WORKER_PYTHON or "").strip()
+        if exe and os.path.exists(exe):
+            return exe
+        return sys.executable
+
+    def _launch(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="headctdeid_florence_")
+
+        self._script_path = os.path.join(self._tmpdir, "florence_worker.py")
+        with open(self._script_path, "w", encoding="utf-8") as f:
+            f.write(FLORENCE_WORKER_SOURCE)
+
+        cfg = {
+            "model_id": FLORENCE_MODEL_ID,
+            "task": FLORENCE_TASK,
+            "fallback_plain_ocr": bool(FLORENCE_FALLBACK_PLAIN_OCR),
+            "max_new_tokens": int(FLORENCE_MAX_NEW_TOKENS),
+            "num_beams": int(FLORENCE_NUM_BEAMS),
+            "dtype": str(FLORENCE_DTYPE),
+            "device": str(FLORENCE_DEVICE),
+            "attn_impl": str(FLORENCE_ATTN_IMPL),
+            "local_files_only": bool(FLORENCE_LOCAL_FILES_ONLY),
+            "prefer_native": bool(FLORENCE_PREFER_NATIVE),
+            "native_equivalent": dict(FLORENCE_NATIVE_EQUIVALENT),
+            "upscale": float(FLORENCE_UPSCALE),
+            "empty_cache_every": int(FLORENCE_EMPTY_CACHE_EVERY_N_CALLS),
+            "hf_cache_dir": str(FLORENCE_HF_CACHE_DIR or ""),
+        }
+
+        self._stderr_path = os.path.join(self._tmpdir, "florence_worker_stderr.log")
+        self._stderr_handle = open(self._stderr_path, "w", encoding="utf-8")
+
+        popen_kwargs = dict(
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr_handle,
+            text=True,
+            bufsize=1,
+            cwd=self._tmpdir,
+        )
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        cmd = [self._worker_python(), self._script_path, json.dumps(cfg)]
+        self.proc = subprocess.Popen(cmd, **popen_kwargs)
+
+        self._out_q = queue.Queue()
+        self._reader = threading.Thread(target=self._pump_stdout, daemon=True)
+        self._reader.start()
+
+        _safe_show_status(
+            f"Loading {FLORENCE_MODEL_ID} in a worker process "
+            f"(first run downloads the weights, ~1.5 GB)...", 10000)
+
+        line = self._read_json(timeout_sec=float(FLORENCE_WORKER_LOAD_TIMEOUT_SEC))
+        if not line or not line.get("ready"):
+            err = (line or {}).get("error", "worker did not start")
+            self._log(f"Florence-2 worker failed to start: {err}\n{self._stderr_tail()}", error=True)
+            self.close()
+            raise RuntimeError(err)
+
+        self.device = line.get("device", "?")
+        self.dtype = line.get("dtype", "?")
+        self.impl = line.get("impl", "?")
+        self.model_id = line.get("model_id", FLORENCE_MODEL_ID)
+        self.transformers_version = line.get("transformers", "?")
+        self._log(f"Florence-2 worker ready: model={self.model_id} impl={self.impl} "
+                  f"device={self.device} dtype={self.dtype} "
+                  f"transformers={self.transformers_version}")
+
+    def _pump_stdout(self):
+        try:
+            for line in self.proc.stdout:
+                self._out_q.put(line)
+        except Exception:
+            pass
+        finally:
+            self._out_q.put(None)  # EOF sentinel
+
+    def _read_json(self, timeout_sec):
+        """Block for one JSON line, keeping the Slicer UI responsive."""
+        deadline = time.time() + float(timeout_sec)
+        while time.time() < deadline:
+            try:
+                line = self._out_q.get(timeout=0.2)
+            except queue.Empty:
+                try:
+                    slicer.app.processEvents()
+                except Exception:
+                    pass
+                if self.proc is not None and self.proc.poll() is not None:
+                    # Worker died (segfault / OOM kill) - drain and give up.
+                    try:
+                        line = self._out_q.get_nowait()
+                    except Exception:
+                        return None
+                    if line is None:
+                        return None
+                else:
+                    continue
+            if line is None:
+                return None
+            line = str(line).strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line)
+            except Exception:
+                # Stray print from a library; ignore and keep reading.
+                continue
+        return None
+
+    def _stderr_tail(self, n_lines=25):
+        try:
+            with open(self._stderr_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return "".join(lines[-n_lines:])
+        except Exception:
+            return ""
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _restart(self):
+        if self._restarts >= int(FLORENCE_WORKER_MAX_RESTARTS):
+            return False
+        self._restarts += 1
+        self._log(f"Restarting Florence-2 worker (attempt {self._restarts}) after:"
+                  f"\n{self._stderr_tail()}", error=True)
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            self._launch()
+            return True
+        except Exception as e:
+            self._log(f"Florence-2 worker restart failed: {e}", error=True)
+            return False
+
+    # ------------------------------------------------------------------
+    # Inference API (mirrors Florence2Engine)
+    # ------------------------------------------------------------------
+    def readtext_batch(self, grays):
+        if not grays:
+            return []
+
+        if not self._alive() and not self._restart():
+            raise RuntimeError("Florence-2 worker is not running")
+
+        paths = []
+        try:
+            for i, g in enumerate(grays):
+                pth = os.path.join(self._tmpdir, f"req_{os.getpid()}_{i}.npy")
+                np.save(pth, np.ascontiguousarray(g))
+                paths.append(pth)
+
+            req = json.dumps({"cmd": "ocr", "paths": paths}) + "\n"
+            try:
+                self.proc.stdin.write(req)
+                self.proc.stdin.flush()
+            except Exception as e:
+                if not self._restart():
+                    raise RuntimeError(f"Florence-2 worker write failed: {e}")
+                self.proc.stdin.write(req)
+                self.proc.stdin.flush()
+
+            resp = self._read_json(timeout_sec=float(FLORENCE_WORKER_CALL_TIMEOUT_SEC))
+
+            if resp is None:
+                # No answer: the worker crashed or hung on this slice.
+                self._log(f"Florence-2 worker did not respond.\n{self._stderr_tail()}", error=True)
+                self._restart()
+                return [[] for _ in grays]
+
+            if not resp.get("ok"):
+                self._log(f"Florence-2 worker error: {resp.get('error')}", error=True)
+                return [[] for _ in grays]
+
+            out = []
+            for rows in resp.get("results", []):
+                hits = []
+                for r in rows:
+                    pts = r.get("points")
+                    pts = None if pts is None else np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+                    conf = r.get("conf", None)
+                    hits.append((pts, _strip_special(r.get("text", "")),
+                                 None if conf is None else float(conf)))
+                out.append(hits)
+
+            while len(out) < len(grays):
+                out.append([])
+            return out
+
+        finally:
+            for pth in paths:
+                try:
+                    os.remove(pth)
+                except Exception:
+                    pass
+
+    def readtext(self, gray8):
+        out = self.readtext_batch([gray8])
+        return out[0] if out else []
+
+    def close(self):
+        try:
+            if self._alive():
+                try:
+                    self.proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                    self.proc.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    self.proc.wait(timeout=10)
+                except Exception:
+                    try:
+                        self.proc.terminate()
+                        self.proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            self.proc.kill()
+                        except Exception:
+                            pass
+        finally:
+            for closer in (self.proc.stdin if self.proc else None,
+                           self.proc.stdout if self.proc else None,
+                           self._stderr_handle):
+                try:
+                    if closer:
+                        closer.close()
+                except Exception:
+                    pass
+            self.proc = None
+
+
+# Loaded once per Slicer session and shared by every DicomProcessor, so the
+# ~1.5 GB model is not re-loaded for each patient folder.
+_FLORENCE_SHARED_ENGINE = None
+_FLORENCE_LOAD_FAILED = False
+
+
+def get_shared_florence_engine(logger=None):
+    """Return the shared engine (worker process by default), or None."""
+    global _FLORENCE_SHARED_ENGINE, _FLORENCE_LOAD_FAILED
+
+    if _FLORENCE_SHARED_ENGINE is not None:
+        return _FLORENCE_SHARED_ENGINE
+    if _FLORENCE_LOAD_FAILED:
+        return None
+
+    try:
+        if FLORENCE_RUN_IN_SUBPROCESS:
+            engine = Florence2WorkerClient(logger=logger)
+            where = "worker process"
+        else:
+            _safe_show_status(
+                f"Loading {FLORENCE_MODEL_ID} in-process "
+                f"(first run downloads the weights, ~1.5 GB)...", 10000)
+            engine = Florence2Engine()
+            where = "in-process"
+
+        msg = (f"Florence-2 ready ({where}): model={FLORENCE_MODEL_ID} "
+               f"device={engine.device} dtype={engine.dtype} task={FLORENCE_TASK}")
+        if logger:
+            try:
+                logger.info(msg)
+            except Exception:
+                pass
+        _safe_show_status(msg, 3000)
+
+        _FLORENCE_SHARED_ENGINE = engine
+        return engine
+
+    except Exception as e:
+        _FLORENCE_LOAD_FAILED = True
+        if logger:
+            try:
+                logger.error(f"Failed to initialize Florence-2: {e}")
+            except Exception:
+                pass
+        _safe_show_status(f"Florence-2 init failed; text detection skipped. ({e})", 6000)
+        return None
+
+
+def shutdown_shared_florence_engine():
+    """Release the model and its memory. Safe to call more than once."""
+    global _FLORENCE_SHARED_ENGINE, _FLORENCE_LOAD_FAILED
+
+    engine = _FLORENCE_SHARED_ENGINE
+    _FLORENCE_SHARED_ENGINE = None
+    _FLORENCE_LOAD_FAILED = False
+
+    if engine is None:
+        return
+    try:
+        engine.close()
+    except Exception:
+        pass
+
+
+def prefetch_florence_weights(model_id=None):
+    """Download the weights ahead of time.
+
+    Handy on a PHI machine: run this once from Slicer's Python console while
+    the machine has internet, then set FLORENCE_LOCAL_FILES_ONLY = True.
+
+        from HeadCTDeid import prefetch_florence_weights
+        prefetch_florence_weights()
+    """
+    mid = model_id or FLORENCE_MODEL_ID
+
+    if FLORENCE_PREFER_NATIVE and mid in FLORENCE_NATIVE_EQUIVALENT:
+        try:
+            from transformers import Florence2ForConditionalGeneration  # noqa: F401
+            mid = FLORENCE_NATIVE_EQUIVALENT[mid]
+        except Exception:
+            pass
+
+    if FLORENCE_HF_CACHE_DIR:
+        os.environ["HF_HOME"] = str(FLORENCE_HF_CACHE_DIR)
+        os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(str(FLORENCE_HF_CACHE_DIR), "hub")
+
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download(repo_id=mid)
+    _safe_show_status(f"Florence-2 weights cached at: {path}", 8000)
+    return path
+
+
+# =============================================================================
 # Module
 # =============================================================================
 class HeadCTDeid(ScriptedLoadableModule):
@@ -409,9 +1781,21 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.pip_install("pylibjpeg-libjpeg")
             slicer.util.pip_install("pylibjpeg-openjpeg")
             slicer.util.pip_install("scikit-image")
-            slicer.util.pip_install("opencv-python")
+            # Install ONLY the headless OpenCV build. opencv-python links its
+            # own Qt, which conflicts with Slicer's Qt and can abort the whole
+            # application; the two packages also overwrite each other's cv2.
+            slicer.util.pip_uninstall("opencv-python")
+            slicer.util.pip_uninstall("opencv-python-headless")
             slicer.util.pip_install("opencv-python-headless")
-            slicer.util.pip_install("easyocr")
+            # Florence-2 stack (replaces easyocr). transformers >= 4.56 ships a
+            # native Florence-2 implementation, which is what this module uses;
+            # timm + einops are only needed by the legacy remote-code fallback.
+            slicer.util.pip_install("pillow")
+            slicer.util.pip_install("transformers>=4.56")
+            slicer.util.pip_install("timm")
+            slicer.util.pip_install("einops")
+            slicer.util.pip_install("accelerate")
+            slicer.util.pip_install("huggingface_hub")
             import torch
             from packaging import version
             if version.parse(torch.__version__) < version.parse("2.3"):
@@ -615,6 +1999,13 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             except Exception as e:
                 self.logger.error(f"Final wait_for_all_subprocesses error: {e}")
 
+        if FLORENCE_SHUTDOWN_WORKER_AFTER_RUN:
+            try:
+                shutdown_shared_florence_engine()
+                self.logger.info("Florence-2 worker shut down; model memory released.")
+            except Exception as e:
+                self.logger.error(f"Florence-2 shutdown error: {e}")
+
         if progressBar:
             progressBar.setValue(100)
 
@@ -627,13 +2018,16 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 # =============================================================================
 class DicomProcessor:
     """
-    Pipeline: de-identification + face/air replacement + EasyOCR detect->drop.
+    Pipeline: de-identification + face/air replacement + Florence-2 detect->drop.
 
     Detection run decision per slice:
       if force_ocr_all == True:
-          run OCR detect on every slice
+          run Florence-2 detection on every slice
       else:
-          run OCR detect only when BurnedInAnnotation==YES
+          run Florence-2 detection only when BurnedInAnnotation==YES
+
+    A cheap OpenCV top-hat pre-screen can skip obviously empty slices first
+    (PRESCREEN_MODE), because Florence-2 is much slower than EasyOCR was.
     """
 
     def __init__(self, force_ocr_all=False):
@@ -647,8 +2041,12 @@ class DicomProcessor:
 
         self._running_subprocesses = []
 
-        self._ocr = None
-        self._ocr_langs = [EASYOCR_LANG] if EASYOCR_LANG else ["en"]
+        self._ocr = None            # Florence2Engine / worker client (lazy)
+        self._prescreen_skipped = 0
+        self._detect_calls = 0
+        self._warned_unknown_conf = False
+        self._unknown_conf_count = 0
+        self._conf_samples = []     # confidence of each detected slice, for tuning
 
     # -------------------------------------------------------------------------
     # Subprocess utilities (render only)
@@ -723,7 +2121,7 @@ class DicomProcessor:
         return len(self._running_subprocesses) == 0
 
     # -------------------------------------------------------------------------
-    # EasyOCR detection
+    # Florence-2 detection
     # -------------------------------------------------------------------------
     def _detect_gpu_available(self):
         try:
@@ -738,85 +2136,58 @@ class DicomProcessor:
             return False, "CPU"
 
     def _ensure_ocr(self):
+        """Lazily obtain the shared Florence-2 engine."""
         if self._ocr is not None:
             return True
 
-        try:
-            import easyocr
-
-            use_gpu, device_name = self._detect_gpu_available()
-
-            try:
-                self._ocr = easyocr.Reader(self._ocr_langs, gpu=use_gpu)
-            except TypeError:
-                self._ocr = easyocr.Reader(language_list=self._ocr_langs, gpu=use_gpu)
-
-            if use_gpu:
-                msg = f"EasyOCR initialized (GPU: {device_name})"
-            else:
-                msg = "EasyOCR initialized (CPU)"
-
-            try:
-                self.logger.info(msg)
-            except Exception:
-                pass
-            _safe_show_status(msg, 2500)
-            return True
-
-        except Exception as e:
-            try:
-                self.logger.error(f"Failed to init EasyOCR in-process: {e}")
-            except Exception:
-                pass
-            _safe_show_status(f"EasyOCR init failed; OCR will be skipped. ({e})", 5000)
+        engine = get_shared_florence_engine(logger=self.logger)
+        if engine is None:
             self._ocr = None
             return False
 
+        self._ocr = engine
+        return True
+
     def _alnum_count(self, s: str) -> int:
-        return len(re.findall(r"[A-Za-z0-9]", str(s) if s is not None else ""))
+        return _alnum_count(s)
 
     def _text_plausible(self, txt: str) -> bool:
-        s = str(txt).strip() if txt is not None else ""
-        if not s:
-            return False
-        return self._alnum_count(s) >= int(EASYOCR_MIN_ALNUM)
-
-    def _parse_easyocr_output(self, res):
-        out = []
-        if res is None:
-            return out
-        for it in res:
-            try:
-                bbox = it[0]
-                txt = str(it[1]).strip()
-                sc = None
-                try:
-                    sc = float(it[2])
-                except Exception:
-                    sc = None
-                quad = np.asarray(bbox, np.float32).reshape(4, 2)
-                out.append((quad, txt, sc))
-            except Exception:
-                continue
-        return out
+        return _text_plausible(txt)
 
     def _dicom_pixels_to_gray8_for_ocr(self, ds):
         """
-        Match standalone dicom_to_gray8(ds):
-        - pixels = ds.pixel_array
-        - if pixels.ndim == 3: pixels = pixels[0]
-        - apply slope/intercept
-        - min-max normalize to [0,255] uint8
+        DICOM -> 8-bit grayscale for the OCR model:
+        - pixels = ds.pixel_array (take first frame if multi-frame)
+        - apply RescaleSlope / RescaleIntercept
+        - min-max normalize to [0, 255] uint8
+        - invert MONOCHROME1 so text is bright on dark (RESPECT_MONOCHROME1)
         """
-        pixels = ds.pixel_array
+        import cv2
 
-        if pixels.ndim == 3:
+        pixels = ds.pixel_array
+        samples = int(getattr(ds, "SamplesPerPixel", 1) or 1)
+
+        if pixels.ndim == 4:
             pixels = pixels[0]
+
+        is_color = False
+        if pixels.ndim == 3:
+            if samples >= 3 and pixels.shape[-1] in (3, 4):
+                is_color = True
+            else:
+                pixels = pixels[0]
+
+        if is_color:
+            rgb = pixels[..., :3].astype(np.float32)
+            mx = float(np.max(rgb)) if rgb.size else 0.0
+            if mx > 255.0:
+                rgb = rgb / mx * 255.0
+            return cv2.cvtColor(rgb.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
 
         pixels = pixels.astype(np.float32)
 
-        slope = float(getattr(ds, "RescaleSlope", 1.0))
-        intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+        slope = float(getattr(ds, "RescaleSlope", 1.0) or 1.0)
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0) or 0.0)
         pixels_hu = pixels * slope + intercept
 
         mn = float(np.min(pixels_hu))
@@ -825,58 +2196,131 @@ class DicomProcessor:
             mx = mn + 1.0
 
         gray8 = ((pixels_hu - mn) / (mx - mn) * 255.0).clip(0, 255).astype(np.uint8)
+
+        if RESPECT_MONOCHROME1:
+            try:
+                pi = str(getattr(ds, "PhotometricInterpretation", "") or "").upper().strip()
+                if pi == "MONOCHROME1":
+                    gray8 = 255 - gray8
+            except Exception:
+                pass
+
         return gray8
 
-    def _run_easyocr_variant(self, bgr):
+    def _run_florence(self, gray8):
+        """Return raw hits [(points|None, text, confidence), ...]."""
         try:
-            return self._ocr.readtext(
-                bgr,
-                text_threshold=EASYOCR_TEXT_THRESHOLD,
-                low_text=EASYOCR_LOW_TEXT,
-                link_threshold=EASYOCR_LINK_THRESHOLD,
-                min_size=EASYOCR_MIN_SIZE,
-                allowlist=EASYOCR_ALLOWLIST,
-            )
-        except TypeError:
+            return self._ocr.readtext(gray8)
+        except Exception as e:
             try:
-                return self._ocr.readtext(bgr)
+                self.logger.error(f"Florence-2 inference failed: {e}")
             except Exception:
-                return None
-        except Exception:
-            return None
+                pass
+            return []
+
+    def _filter_florence_hits(self, hits, gray8):
+        """Apply confidence, plausibility, box-size and hallucination filters."""
+        kept = []
+        any_flagged = False
+        dropped_low_conf = 0
+
+        for points, txt, conf in hits:
+            try:
+                if conf is None:
+                    # No score available from the model. Warn once, because the
+                    # confidence threshold silently does nothing in this state.
+                    if not self._warned_unknown_conf:
+                        self._warned_unknown_conf = True
+                        try:
+                            self.logger.warning(
+                                "Florence-2 returned no confidence score; "
+                                "FLORENCE_MIN_CONFIDENCE=%s cannot filter these hits "
+                                "(FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN=%s)."
+                                % (FLORENCE_MIN_CONFIDENCE,
+                                   FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN))
+                        except Exception:
+                            pass
+                    self._unknown_conf_count += 1
+                    if not FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN:
+                        dropped_low_conf += 1
+                        continue
+                elif float(conf) < float(FLORENCE_MIN_CONFIDENCE):
+                    dropped_low_conf += 1
+                    continue
+
+                if not _text_plausible(txt):
+                    continue
+                if not _box_big_enough(points):
+                    continue
+                if FLORENCE_RESTRICT_TO_BORDER_BAND and not _in_border_band(points, gray8.shape[:2]):
+                    continue
+
+                flags = _hallucination_flags(txt, gray8)
+                if flags:
+                    any_flagged = True
+                    if FLORENCE_DROP_SUSPECTED_HALLUCINATIONS:
+                        continue
+
+                kept.append((points, txt, (None if conf is None else float(conf)), flags))
+            except Exception:
+                continue
+
+        return kept, any_flagged, dropped_low_conf
 
     def _draw_ocr_results(self, gray8, items):
+        """Draw Florence-2 boxes/labels onto a BGR debug image."""
         import cv2
 
         det_img = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+        h, w = gray8.shape[:2]
 
-        for quad, txt, sc in items:
+        for item in items:
             try:
-                pts = np.asarray(quad, dtype=np.int32).reshape(4, 2)
+                points, txt, sc = item[0], item[1], item[2]
+                flags = item[3] if len(item) > 3 else []
+
+                colour = OCR_DEBUG_COLOR_FLAGGED if flags else OCR_DEBUG_COLOR_OK
+                label = f"{txt} ({float(sc):.2f})" if sc is not None else f"{txt} (conf n/a)"
+                if flags:
+                    label += f" [{','.join(flags)}]"
+                label = label.replace("\n", " ")[:60]
+
+                if points is None:
+                    # Plain <OCR> hit: no coordinates, annotate the top-left corner
+                    if OCR_DEBUG_DRAW_LABELS:
+                        cv2.putText(
+                            det_img,
+                            "(no box) " + label,
+                            (5, 18),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            OCR_DEBUG_FONT_SCALE,
+                            colour,
+                            OCR_DEBUG_FONT_THICKNESS,
+                            cv2.LINE_AA,
+                        )
+                    continue
+
+                pts = np.asarray(points, dtype=np.int32).reshape(-1, 2)
+                pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+                pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+                if pts.shape[0] < 2:
+                    continue
 
                 if OCR_DEBUG_DRAW_BOXES:
-                    cv2.polylines(
-                        det_img,
-                        [pts],
-                        isClosed=True,
-                        color=(0, 255, 0),
-                        thickness=OCR_DEBUG_BOX_THICKNESS,
-                    )
+                    cv2.polylines(det_img, [pts], True, colour, OCR_DEBUG_BOX_THICKNESS)
 
                 if OCR_DEBUG_DRAW_LABELS:
                     x = int(np.min(pts[:, 0]))
                     y = int(np.min(pts[:, 1])) - 5
                     if y < 10:
                         y = int(np.max(pts[:, 1])) + 15
-
-                    label = f"{txt} ({float(sc):.2f})" if sc is not None else str(txt)
                     cv2.putText(
                         det_img,
                         label,
                         (x, y),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         OCR_DEBUG_FONT_SCALE,
-                        (0, 255, 0),
+                        colour,
                         OCR_DEBUG_FONT_THICKNESS,
                         cv2.LINE_AA,
                     )
@@ -885,15 +2329,17 @@ class DicomProcessor:
 
         return det_img
 
-    def detect_text_debug(self, ds):
+    def detect_text_debug(self, ds, burned_flag=False):
         """
+        Run Florence-2 burned-in text detection on one DICOM slice.
+
         Returns:
           has_text: bool
-          hit_text: str
-          hit_conf: float|None
-          hit_bbox: list|None
+          hit_text: str            (all kept strings joined with " | ")
+          hit_conf: float|None     (sequence-level generation probability)
+          hit_bbox: list|None      (points of the first kept hit, None for <OCR>)
           gray8: uint8 image
-          detection_img: image with boxes
+          detection_img: BGR image with boxes drawn
         """
         import cv2
 
@@ -905,34 +2351,61 @@ class DicomProcessor:
         except Exception:
             return False, "", None, None, None, None
 
-        try:
-            bgr = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
-        except Exception:
-            return False, "", None, None, gray8, None
+        # Cheap OpenCV pre-screen before paying for a VLM forward pass
+        if str(PRESCREEN_MODE).lower() == "on":
+            run_anyway = bool(burned_flag) and PRESCREEN_ALWAYS_RUN_ON_GROUND_TRUTH
+            if not run_anyway:
+                maybe_text, _n = _prescreen_says_maybe_text(gray8)
+                if not maybe_text:
+                    self._prescreen_skipped += 1
+                    return False, "", None, None, gray8, cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
 
-        res = self._run_easyocr_variant(bgr)
-        items = self._parse_easyocr_output(res)
-        if not items:
+        self._detect_calls += 1
+        raw_hits = self._run_florence(gray8)
+        if not raw_hits:
             return False, "", None, None, gray8, cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
 
-        kept = []
-        for quad, txt, sc in items:
-            if sc is None:
-                continue
-            if float(sc) < float(EASYOCR_CONF_THRESH):
-                continue
-            if not self._text_plausible(txt):
-                continue
-            kept.append((quad, txt, sc))
-
+        kept, _flagged, _low_conf = self._filter_florence_hits(raw_hits, gray8)
         detection_img = self._draw_ocr_results(gray8, kept if kept else [])
 
         if kept:
-            quad, txt, sc = kept[0]
-            bbox_list = np.asarray(quad, np.float32).reshape(4, 2).tolist()
-            return True, txt, float(sc), bbox_list, gray8, detection_img
+            texts = " | ".join(str(t).replace("\n", " ").strip() for _, t, _, _ in kept if str(t).strip())
+
+            known = [float(c) for _, _, c, _ in kept if c is not None]
+            best_conf = max(known) if known else None
+            if best_conf is not None:
+                self._conf_samples.append(best_conf)
+
+            bbox_list = None
+            for points, _t, _c, _f in kept:
+                if points is not None:
+                    bbox_list = np.asarray(points, np.float32).reshape(-1, 2).tolist()
+                    break
+
+            return (True, texts, (None if best_conf is None else float(best_conf)),
+                    bbox_list, gray8, detection_img)
 
         return False, "", None, None, gray8, detection_img
+
+    def _save_debug_png(self, out_dir, patient_new_id, series_folder, source_filename, img):
+        """Write a debug PNG into one of the global only_for_debug folders."""
+        if not out_dir or img is None:
+            return None
+        try:
+            import cv2
+
+            os.makedirs(out_dir, exist_ok=True)
+            stem = os.path.splitext(str(source_filename))[0]
+            name = _safe_filename(f"{patient_new_id}_{series_folder}_{stem}") + ".png"
+            out_path = os.path.join(out_dir, name)
+            cv2.imwrite(out_path, img)
+            return out_path
+        except Exception as e:
+            try:
+                self.logger.error(f"Failed to write debug PNG: {e}")
+            except Exception:
+                pass
+            return None
 
     # -------------------------------------------------------------------------
     # CT helpers
@@ -1082,7 +2555,7 @@ class DicomProcessor:
             # Exclude Secondary Capture objects because they can contain burned-in text annotations.
             status5 = not self._is_secondary_capture_sop_class(ds)
 
-            return 1#int(status1 and status2 and status3 and status4 and status5)
+            return int(status1 and status2 and status3 and status4 and status5)
         except Exception as e:
             self.error = str(e)
             return 0
@@ -1469,12 +2942,22 @@ class DicomProcessor:
 
                     pixels_hu = self.get_pixels_hu(ds)
 
-                    want_detect = self._force_ocr_all or burned_flag
+                    want_detect = ENABLE_TEXT_DETECTION and (self._force_ocr_all or burned_flag)
                     if want_detect:
-                        has_text, hit_txt, hit_conf, hit_bbox, gray8, detection_img = self.detect_text_debug(ds)
+                        (has_text, hit_txt, hit_conf, hit_bbox,
+                         gray8, detection_img) = self.detect_text_debug(ds, burned_flag=burned_flag)
 
                         if has_text:
                             drop_count += 1
+
+                            if SAVE_DETECTED_DEBUG_PNG:
+                                self._save_debug_png(
+                                    global_detected_png_dir,
+                                    id,
+                                    os.path.basename(original_dir),
+                                    fname,
+                                    detection_img,
+                                )
 
                             dropped_rows.append({
                                 "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1489,13 +2972,22 @@ class DicomProcessor:
                                 "sop_instance_uid": sop_uid,
                                 "burned_in_annotation": bool(burned_flag),
                                 "decision": "DROPPED",
-                                "reason": "easyocr_detected_text",
+                                "reason": "florence2_detected_text",
                                 "hit_text": hit_txt,
                                 "hit_conf": hit_conf,
                                 "hit_bbox": hit_bbox,
                             })
                             del ds, pixels_hu
                             continue
+
+                        if SAVE_NO_TEXT_DEBUG_PNG and detection_img is not None:
+                            self._save_debug_png(
+                                global_no_text_png_dir,
+                                id,
+                                os.path.basename(original_dir),
+                                fname,
+                                detection_img,
+                            )
 
                     bin_mask = self.binarize_volume(pixels_hu)
                     lcc = self.largest_connected_component(bin_mask)
@@ -1559,6 +3051,26 @@ class DicomProcessor:
                         f"[{id}] slices {i}/{len(files)} | kept={kept_count} dropped={drop_count} errors={err_count}",
                         1500,
                     )
+
+            if self._conf_samples or self._unknown_conf_count:
+                try:
+                    arr = np.asarray(self._conf_samples, dtype=float)
+                    if arr.size:
+                        self.logger.info(
+                            "[%s] detection confidence over %d detected slices: "
+                            "min=%.3f p10=%.3f median=%.3f max=%.3f | unknown=%d "
+                            "(threshold=%.2f)"
+                            % (id, arr.size, float(arr.min()),
+                               float(np.percentile(arr, 10)), float(np.median(arr)),
+                               float(arr.max()), self._unknown_conf_count,
+                               float(FLORENCE_MIN_CONFIDENCE)))
+                    else:
+                        self.logger.info(
+                            "[%s] no usable confidence scores (%d hits with unknown "
+                            "confidence); FLORENCE_MIN_CONFIDENCE is not filtering."
+                            % (id, self._unknown_conf_count))
+                except Exception:
+                    pass
 
             if files and not prepared:
                 errors.append((os.path.basename(original_dir), "all_slices_removed_due_to_detected_text"))
