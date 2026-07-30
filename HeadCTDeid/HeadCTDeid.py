@@ -78,6 +78,22 @@ FLORENCE_RUN_IN_SUBPROCESS = True
 #   FLORENCE_WORKER_PYTHON = "/mnt/mydrive/SlicerHeadCTDeid/deid/.venv/bin/python"
 FLORENCE_WORKER_PYTHON = ""
 
+# GPU selection for the worker. Restricting to a single device avoids PyTorch's
+# multi-GPU peer-to-peer probe, which is where the NVML assert
+#   NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() ... PeerToPeerAccess.cpp
+# is raised. "" leaves CUDA_VISIBLE_DEVICES untouched.
+FLORENCE_CUDA_VISIBLE_DEVICES = "0"
+
+# If CUDA cannot be initialised, run on CPU instead of failing the whole run.
+# Consider FLORENCE_MODEL_ID = "florence-community/Florence-2-base" on CPU.
+FLORENCE_FALLBACK_TO_CPU_ON_CUDA_ERROR = True
+
+# Launch the worker with the environment Slicer started from, rather than the
+# one Slicer modified. Slicer prepends its own library directories to
+# LD_LIBRARY_PATH, which can shadow the system NVIDIA/CUDA libraries and break
+# NVML inside child processes.
+FLORENCE_USE_SLICER_STARTUP_ENV = True
+
 # First launch downloads the weights, so the load timeout is generous.
 FLORENCE_WORKER_LOAD_TIMEOUT_SEC = 3600
 FLORENCE_WORKER_CALL_TIMEOUT_SEC = 300
@@ -147,7 +163,7 @@ FLORENCE_SHARE_MODEL_ACROSS_PATIENTS = True
 # IMPORTANT: this is confidence in the string it WROTE, not evidence that the
 # string is actually present in the image. Raising this reduces false alarms but
 # increases the risk of MISSING PHI, which is the dangerous direction.
-FLORENCE_MIN_CONFIDENCE = 0.8
+FLORENCE_MIN_CONFIDENCE = 0.4
 
 # What to do when the model gives no usable score (some transformers versions
 # return neither sequences_scores nor scores). True keeps the hit, which is the
@@ -395,6 +411,33 @@ def _safe_show_status(msg: str, ms: int = 2000):
         pass
 
 
+_SAVE_AS_SUPPORTS_ENFORCE = None
+
+
+def _dcm_save_as(ds, path, enforce_file_format=True):
+    """Write a DICOM dataset across the pydicom 2.x / 3.x keyword change.
+
+    pydicom 3.0 deprecated `write_like_original` in favour of
+    `enforce_file_format`, with the sense inverted:
+        write_like_original=False  ==  enforce_file_format=True
+    Both mean "write a proper Part 10 file, adding File Meta Information as
+    needed", which is what this pipeline wants for its de-identified output.
+    """
+    global _SAVE_AS_SUPPORTS_ENFORCE
+
+    if _SAVE_AS_SUPPORTS_ENFORCE is None:
+        try:
+            import inspect
+            _SAVE_AS_SUPPORTS_ENFORCE = (
+                "enforce_file_format" in inspect.signature(ds.save_as).parameters)
+        except Exception:
+            _SAVE_AS_SUPPORTS_ENFORCE = False
+
+    if _SAVE_AS_SUPPORTS_ENFORCE:
+        return ds.save_as(path, enforce_file_format=bool(enforce_file_format))
+    return ds.save_as(path, write_like_original=(not enforce_file_format))
+
+
 def _safe_filename(s: str) -> str:
     s = str(s) if s is not None else ""
     s = s.replace("\\", "__").replace("/", "__")
@@ -563,6 +606,8 @@ def _fixed_get_imports(filename):
 
 
 def _resolve_florence_device():
+    if str(FLORENCE_CUDA_VISIBLE_DEVICES) != "":
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(FLORENCE_CUDA_VISIBLE_DEVICES))
     if str(FLORENCE_DEVICE).lower() != "auto":
         return str(FLORENCE_DEVICE)
     try:
@@ -605,6 +650,20 @@ class Florence2Engine:
 
         self.torch = torch
         self.device = _resolve_florence_device()
+        self.cuda_error = None
+
+        # is_available() can be True while the CUDA context is unusable.
+        if self.device == "cuda":
+            try:
+                probe = torch.zeros(1, device="cuda")
+                del probe
+                torch.cuda.synchronize()
+            except Exception as exc:
+                self.cuda_error = "CUDA probe failed: %s" % exc
+                if not FLORENCE_FALLBACK_TO_CPU_ON_CUDA_ERROR:
+                    raise
+                self.device = "cpu"
+
         self.dtype = _resolve_florence_dtype(self.device)
         self._calls_done = 0
 
@@ -681,7 +740,15 @@ class Florence2Engine:
                 ) from exc
             raise
 
-        self.model = self.model.to(self.device)
+        try:
+            self.model = self.model.to(self.device)
+        except Exception as exc:
+            if self.device != "cuda" or not FLORENCE_FALLBACK_TO_CPU_ON_CUDA_ERROR:
+                raise
+            self.cuda_error = "moving the model to CUDA failed: %s" % exc
+            self.device = "cpu"
+            self.dtype = torch.float32
+            self.model = self.model.to(torch.float32).to("cpu")
         self.model.eval()
 
     # ------------------------------------------------------------------
@@ -960,11 +1027,33 @@ def main():
             imports = [im for im in imports if im != "flash_attn"]
         return imports
 
+    allow_cpu_fallback = bool(cfg.get("cpu_fallback", True))
+    cuda_error = None
+
     device = str(cfg.get("device", "auto"))
     if device == "auto":
         try:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
+        except Exception as exc:
+            cuda_error = "torch.cuda.is_available() failed: %s" % exc
+            device = "cpu"
+
+    # torch.cuda.is_available() can report True while the CUDA context is
+    # actually unusable (driver/NVML mismatch, driver updated without a reboot,
+    # container without the NVIDIA runtime). Probe with a real allocation so the
+    # failure happens here, cheaply, rather than mid-run.
+    if device == "cuda":
+        try:
+            probe = torch.zeros(1, device="cuda")
+            del probe
+            torch.cuda.synchronize()
+        except Exception as exc:
+            cuda_error = "CUDA probe failed: %s" % exc
+            log(cuda_error)
+            if not allow_cpu_fallback:
+                emit({"ready": False, "error": cuda_error})
+                return 1
+            log("falling back to CPU")
             device = "cpu"
 
     if device == "cpu":
@@ -1046,7 +1135,17 @@ def main():
                 log("remote code failed; falling back to the native implementation")
                 model, processor, impl = load_native()
 
-        model = model.to(device)
+        try:
+            model = model.to(device)
+        except Exception as exc:
+            if device != "cuda" or not allow_cpu_fallback:
+                raise
+            cuda_error = "moving the model to CUDA failed: %s" % exc
+            log(cuda_error)
+            log("falling back to CPU")
+            device = "cpu"
+            dtype = torch.float32
+            model = model.to(torch.float32).to("cpu")
         model.eval()
     except Exception as exc:
         hint = ""
@@ -1057,6 +1156,10 @@ def main():
                     "transformers >= 4.50. Use FLORENCE_MODEL_ID = "
                     "'florence-community/Florence-2-large' (needs transformers "
                     ">= 4.56), or pin transformers==4.49.0.")
+        elif "nvml" in text.lower() or "NVML_SUCCESS" in text:
+            hint = (" -- CUDA/NVML could not be initialised. Check `nvidia-smi`; "
+                    "a driver update without a reboot is the usual cause. Set "
+                    "FLORENCE_DEVICE = 'cpu' to run without the GPU.")
         emit({"ready": False,
               "error": "model load failed: %s%s" % (exc, hint),
               "transformers": tf_version,
@@ -1065,7 +1168,7 @@ def main():
         return 1
 
     emit({"ready": True, "device": device, "dtype": str(dtype), "model_id": model_id,
-          "impl": impl, "transformers": tf_version})
+          "impl": impl, "transformers": tf_version, "cuda_error": cuda_error})
 
     task = cfg.get("task", "<OCR_WITH_REGION>")
     fallback_plain = bool(cfg.get("fallback_plain_ocr", True))
@@ -1320,10 +1423,61 @@ class Florence2WorkerClient:
             pass
 
     def _worker_python(self):
+        """Locate a real Python interpreter for the worker.
+
+        sys.executable can point at the Slicer application binary rather than an
+        interpreter, so PythonSlicer is preferred when it can be found.
+        """
         exe = str(FLORENCE_WORKER_PYTHON or "").strip()
         if exe and os.path.exists(exe):
             return exe
+
+        candidates = []
+        try:
+            home = slicer.app.slicerHome
+            if home:
+                candidates += [os.path.join(home, "bin", "PythonSlicer"),
+                               os.path.join(home, "bin", "PythonSlicer.exe")]
+        except Exception:
+            pass
+        bindir = os.path.dirname(sys.executable or "")
+        if bindir:
+            candidates += [os.path.join(bindir, "PythonSlicer"),
+                           os.path.join(bindir, "PythonSlicer.exe")]
+        try:
+            found = shutil.which("PythonSlicer")
+            if found:
+                candidates.append(found)
+        except Exception:
+            pass
+
+        for c in candidates:
+            if c and os.path.exists(c):
+                return c
         return sys.executable
+
+    def _worker_env(self):
+        """Environment for the worker.
+
+        Slicer prepends its own library directories to LD_LIBRARY_PATH, which
+        can shadow the system NVIDIA libraries and make NVML fail inside child
+        processes. slicer.util.startupEnvironment() returns the environment as
+        it was before Slicer modified it, which is what external processes want.
+        """
+        env = None
+        if FLORENCE_USE_SLICER_STARTUP_ENV:
+            try:
+                env = {str(k): str(v) for k, v in dict(slicer.util.startupEnvironment()).items()}
+            except Exception:
+                env = None
+        if not env:
+            env = dict(os.environ)
+
+        if str(FLORENCE_CUDA_VISIBLE_DEVICES) != "":
+            env["CUDA_VISIBLE_DEVICES"] = str(FLORENCE_CUDA_VISIBLE_DEVICES)
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        env.setdefault("TOKENIZERS_PARALLELISM", "false")
+        return env
 
     def _launch(self):
         self._tmpdir = tempfile.mkdtemp(prefix="headctdeid_florence_")
@@ -1343,6 +1497,7 @@ class Florence2WorkerClient:
             "attn_impl": str(FLORENCE_ATTN_IMPL),
             "local_files_only": bool(FLORENCE_LOCAL_FILES_ONLY),
             "prefer_native": bool(FLORENCE_PREFER_NATIVE),
+            "cpu_fallback": bool(FLORENCE_FALLBACK_TO_CPU_ON_CUDA_ERROR),
             "native_equivalent": dict(FLORENCE_NATIVE_EQUIVALENT),
             "upscale": float(FLORENCE_UPSCALE),
             "empty_cache_every": int(FLORENCE_EMPTY_CACHE_EVERY_N_CALLS),
@@ -1359,6 +1514,7 @@ class Florence2WorkerClient:
             text=True,
             bufsize=1,
             cwd=self._tmpdir,
+            env=self._worker_env(),
         )
         if os.name == "nt":
             popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1386,9 +1542,13 @@ class Florence2WorkerClient:
         self.impl = line.get("impl", "?")
         self.model_id = line.get("model_id", FLORENCE_MODEL_ID)
         self.transformers_version = line.get("transformers", "?")
+        self.cuda_error = line.get("cuda_error")
         self._log(f"Florence-2 worker ready: model={self.model_id} impl={self.impl} "
                   f"device={self.device} dtype={self.dtype} "
                   f"transformers={self.transformers_version}")
+        if self.cuda_error:
+            self._log(f"Florence-2 fell back to {self.device}: {self.cuda_error}", error=True)
+            _safe_show_status(f"Florence-2 running on {self.device} (GPU unavailable).", 8000)
 
     def _pump_stdout(self):
         try:
@@ -3036,7 +3196,7 @@ class DicomProcessor:
                     tmp_path = os.path.join(tmp_root, out_name)
                     final_path = os.path.join(out_dir, out_name)
 
-                    ds.save_as(tmp_path, write_like_original=False)
+                    _dcm_save_as(ds, tmp_path, enforce_file_format=True)
                     prepared.append((tmp_path, final_path))
                     kept_count += 1
 
