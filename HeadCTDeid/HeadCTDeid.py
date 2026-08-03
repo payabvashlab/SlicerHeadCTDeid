@@ -1,5 +1,5 @@
 """
-HeadCTDeid (3D Slicer scripted module)\
+HeadCTDeid (3D Slicer scripted module)
 """
 
 import csv
@@ -69,14 +69,14 @@ FLORENCE_HF_CACHE_DIR = ""
 FLORENCE_TASK = "<OCR_WITH_REGION>"
 FLORENCE_FALLBACK_PLAIN_OCR = True
 
-FLORENCE_MAX_NEW_TOKENS = 64
+FLORENCE_MAX_NEW_TOKENS = 1024
 FLORENCE_NUM_BEAMS = 3
 FLORENCE_DTYPE = "float16"
 FLORENCE_DEVICE = "auto"
 FLORENCE_ATTN_IMPL = "sdpa"
 FLORENCE_LOCAL_FILES_ONLY = False
 
-FLORENCE_UPSCALE = 1.0
+FLORENCE_UPSCALE = 2.0
 
 FLORENCE_EMPTY_CACHE_EVERY_N_CALLS = 50
 
@@ -135,14 +135,32 @@ TEXT_ACTION = "redact"
 
 NEVER_DROP_SLICES = True
 
-REDACT_PAD_PX = 8
-REDACT_PAD_FRAC = 0.45
+REDACT_PAD_PX = 6
+REDACT_PAD_FRAC = 0.6
 
 REDACT_FILL = "air"
 REDACT_AIR_HU = -1000.0
 
 REDACT_BOXLESS_STRATEGY = "border_band"
 REDACT_BORDER_BAND_FRAC = 0.18
+
+REDACT_GEOMETRY = "exact"
+
+REDACT_EXACT_PAD_PX = 0
+
+OCR_DEBUG_DRAW_MASK_RECTS = True
+
+REDACT_SWEEP_TEXTLIKE_COMPONENTS = True
+
+REDACT_SWEEP_BORDER_FRAC = 0.30
+REDACT_SWEEP_NEAR_HIT_PX = 60
+
+REDACT_SWEEP_LINE_GAP_X = 26
+REDACT_SWEEP_LINE_GAP_Y = 8
+REDACT_SWEEP_MIN_CHARS_PER_LINE = 2
+
+REDACT_EXPAND_TO_LINE = True
+REDACT_LINE_EXTRA_PX = 12
 
 REDACT_VERIFY_WITH_SECOND_PASS = False
 
@@ -2684,8 +2702,123 @@ class DicomProcessor:
 
         return False, "", None, None, gray8, detection_img, [], 0
 
+    def _textlike_component_boxes(self, gray8):
+        """Every character-sized bright component in the slice, as (x,y,w,h)."""
+        try:
+            import cv2
+
+            k = int(PRESCREEN_TOPHAT_KERNEL)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+            tophat = cv2.morphologyEx(gray8, cv2.MORPH_TOPHAT, kernel)
+            if float(np.max(tophat)) < 1.0:
+                return []
+            _, bw = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            num, _lab, stats, _cent = cv2.connectedComponentsWithStats(bw, 8)
+
+            out = []
+            for i in range(1, num):
+                x, y, w, h, area = stats[i]
+                if (PRESCREEN_MIN_CHAR_H <= h <= PRESCREEN_MAX_CHAR_H
+                        and PRESCREEN_MIN_CHAR_W <= w <= PRESCREEN_MAX_CHAR_W
+                        and area >= PRESCREEN_MIN_CHAR_AREA):
+                    out.append((int(x), int(y), int(w), int(h)))
+            return out
+        except Exception:
+            return []
+
+    def _group_components_into_lines(self, comps):
+        """Cluster character boxes into text lines by vertical then horizontal run."""
+        if not comps:
+            return []
+
+        rows = []
+        for (x, y, w, h) in sorted(comps, key=lambda c: (c[1], c[0])):
+            cy = y + h / 2.0
+            placed = False
+            for row in rows:
+                if abs(cy - row["cy"]) <= float(REDACT_SWEEP_LINE_GAP_Y) + row["h"] / 2.0:
+                    row["items"].append((x, y, w, h))
+                    n = len(row["items"])
+                    row["cy"] = ((row["cy"] * (n - 1)) + cy) / n
+                    row["h"] = max(row["h"], h)
+                    placed = True
+                    break
+            if not placed:
+                rows.append({"cy": cy, "h": h, "items": [(x, y, w, h)]})
+
+        lines = []
+        for row in rows:
+            items = sorted(row["items"], key=lambda c: c[0])
+            run = [items[0]]
+            for cur in items[1:]:
+                prev = run[-1]
+                if cur[0] - (prev[0] + prev[2]) <= float(REDACT_SWEEP_LINE_GAP_X):
+                    run.append(cur)
+                else:
+                    lines.append(run)
+                    run = [cur]
+            lines.append(run)
+
+        out = []
+        for run in lines:
+            if len(run) < int(REDACT_SWEEP_MIN_CHARS_PER_LINE):
+                continue
+            x0 = min(c[0] for c in run)
+            y0 = min(c[1] for c in run)
+            x1 = max(c[0] + c[2] for c in run)
+            y1 = max(c[1] + c[3] for c in run)
+            out.append((x0, y0, x1, y1))
+        return out
+
+    def _line_is_relevant(self, line, seed_rects, shape_hw):
+        """Keep a swept line only near the edge or near a model-flagged region."""
+        h, w = int(shape_hw[0]), int(shape_hw[1])
+        x0, y0, x1, y1 = line
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+
+        fx = float(REDACT_SWEEP_BORDER_FRAC) * w
+        fy = float(REDACT_SWEEP_BORDER_FRAC) * h
+        if cx <= fx or cx >= w - fx or cy <= fy or cy >= h - fy:
+            return True
+
+        pad = float(REDACT_SWEEP_NEAR_HIT_PX)
+        for (sx0, sy0, sx1, sy1) in seed_rects:
+            if (x0 < sx1 + pad and x1 > sx0 - pad
+                    and y0 < sy1 + pad and y1 > sy0 - pad):
+                return True
+        return False
+
+    @staticmethod
+    def _merge_rects(rects):
+        """Union overlapping rectangles so masks read as solid blocks."""
+        items = list(rects)
+        changed = True
+        while changed:
+            changed = False
+            merged = []
+            while items:
+                a = items.pop()
+                hit = True
+                while hit:
+                    hit = False
+                    rest = []
+                    for b in items:
+                        if (a[0] <= b[2] and b[0] <= a[2]
+                                and a[1] <= b[3] and b[1] <= a[3]):
+                            a = (min(a[0], b[0]), min(a[1], b[1]),
+                                 max(a[2], b[2]), max(a[3], b[3]))
+                            hit = True
+                            changed = True
+                        else:
+                            rest.append(b)
+                    items = rest
+                merged.append(a)
+            items = merged
+        return items
+
     def _redaction_rects(self, boxes, boxless, shape_hw, gray_shape_hw=None,
-                         boxless_mode=None):
+                         boxless_mode=None, gray8=None):
         """Turn detected boxes into padded axis-aligned rectangles to blank out.
 
         Masks are grown deliberately: Florence-2's boxes hug the glyphs, and a
@@ -2700,6 +2833,8 @@ class DicomProcessor:
                 sy = float(h) / float(gh)
                 sx = float(w) / float(gw)
 
+        exact = str(REDACT_GEOMETRY).lower() == "exact"
+
         rects = []
         for pts in (boxes or []):
             try:
@@ -2711,9 +2846,11 @@ class DicomProcessor:
                 y0 = float(np.min(arr[:, 1])) * sy
                 y1 = float(np.max(arr[:, 1])) * sy
 
-                bw = max(1.0, x1 - x0)
-                bh = max(1.0, y1 - y0)
-                pad = max(float(REDACT_PAD_PX), float(REDACT_PAD_FRAC) * max(bw, bh))
+                if exact:
+                    pad = float(REDACT_EXACT_PAD_PX)
+                else:
+                    bh = max(1.0, y1 - y0)
+                    pad = max(float(REDACT_PAD_PX), float(REDACT_PAD_FRAC) * bh)
 
                 rx0 = int(max(0, np.floor(x0 - pad)))
                 ry0 = int(max(0, np.floor(y0 - pad)))
@@ -2723,6 +2860,73 @@ class DicomProcessor:
                     rects.append((rx0, ry0, rx1, ry1))
             except Exception:
                 continue
+
+        seed_rects = list(rects)
+
+        if not exact and REDACT_SWEEP_TEXTLIKE_COMPONENTS and gray8 is not None:
+            try:
+                gh, gw = gray8.shape[:2]
+                comps = self._textlike_component_boxes(gray8)
+                lines = self._group_components_into_lines(comps)
+
+                seed_in_gray = []
+                for (rx0, ry0, rx1, ry1) in seed_rects:
+                    seed_in_gray.append((rx0 / sx, ry0 / sy, rx1 / sx, ry1 / sy))
+
+                for line in lines:
+                    if not self._line_is_relevant(line, seed_in_gray, (gh, gw)):
+                        continue
+                    lx0, ly0, lx1, ly1 = line
+                    bh_ = max(1.0, ly1 - ly0)
+                    pad = max(float(REDACT_PAD_PX), float(REDACT_PAD_FRAC) * bh_)
+                    rects.append((
+                        int(max(0, np.floor((lx0 - pad) * sx))),
+                        int(max(0, np.floor((ly0 - pad) * sy))),
+                        int(min(w, np.ceil((lx1 + pad) * sx))),
+                        int(min(h, np.ceil((ly1 + pad) * sy))),
+                    ))
+            except Exception:
+                pass
+
+        if not exact and REDACT_EXPAND_TO_LINE and gray8 is not None and rects:
+            try:
+                gh, gw = gray8.shape[:2]
+                comps = self._textlike_component_boxes(gray8)
+                extra = float(REDACT_LINE_EXTRA_PX)
+                grown = []
+                gap = float(REDACT_SWEEP_LINE_GAP_X)
+                for (rx0, ry0, rx1, ry1) in rects:
+                    gx0, gy0 = rx0 / sx, ry0 / sy
+                    gx1, gy1 = rx1 / sx, ry1 / sy
+
+                    row = [(float(cx), float(cx + cw)) for (cx, cy, cw, ch) in comps
+                           if gy0 <= (cy + ch / 2.0) <= gy1]
+
+                    nx0, nx1 = gx0, gx1
+                    changed = True
+                    while changed:
+                        changed = False
+                        for (cx0, cx1) in row:
+                            if cx1 >= nx0 - gap and cx0 <= nx1 + gap:
+                                if cx0 < nx0:
+                                    nx0 = cx0
+                                    changed = True
+                                if cx1 > nx1:
+                                    nx1 = cx1
+                                    changed = True
+
+                    grown.append((
+                        int(max(0, np.floor((nx0 - extra) * sx))),
+                        ry0,
+                        int(min(w, np.ceil((nx1 + extra) * sx))),
+                        ry1,
+                    ))
+                rects = grown
+            except Exception:
+                pass
+
+        if not exact:
+            rects = self._merge_rects(rects)
 
         mode = str(boxless_mode if boxless_mode is not None
                    else REDACT_BOXLESS_STRATEGY).lower()
@@ -2767,6 +2971,39 @@ class DicomProcessor:
             except Exception:
                 continue
         return n
+
+    def _draw_mask_rects(self, det_img, rects, gray_shape_hw=None, hu_shape_hw=None):
+        """Outline the rectangles that will actually be blacked out.
+
+        Mask rectangles are computed in pixel-array coordinates, while the debug
+        image is the OCR grayscale, so they are mapped back if the two differ.
+        """
+        if det_img is None or not rects or not OCR_DEBUG_DRAW_MASK_RECTS:
+            return det_img
+        try:
+            import cv2
+
+            out = det_img.copy()
+            h, w = out.shape[:2]
+
+            sx = sy = 1.0
+            if gray_shape_hw is not None and hu_shape_hw is not None:
+                gh, gw = int(gray_shape_hw[0]), int(gray_shape_hw[1])
+                hh, hw_ = int(hu_shape_hw[0]), int(hu_shape_hw[1])
+                if hh > 0 and hw_ > 0 and (gh != hh or gw != hw_):
+                    sy = float(gh) / float(hh)
+                    sx = float(gw) / float(hw_)
+
+            for (x0, y0, x1, y1) in rects:
+                ax0 = int(max(0, min(w - 1, round(x0 * sx))))
+                ay0 = int(max(0, min(h - 1, round(y0 * sy))))
+                ax1 = int(max(0, min(w, round(x1 * sx))))
+                ay1 = int(max(0, min(h, round(y1 * sy))))
+                if ax1 > ax0 and ay1 > ay0:
+                    cv2.rectangle(out, (ax0, ay0), (ax1, ay1), (0, 165, 255), 1)
+            return out
+        except Exception:
+            return det_img
 
     def _gray_to_bgr(self, gray8):
         import cv2
@@ -3489,14 +3726,6 @@ class DicomProcessor:
 
                         if has_text:
                             png_detected += 1
-                            if SAVE_DETECTED_DEBUG_PNG:
-                                self._save_debug_png(
-                                    global_detected_png_dir,
-                                    id,
-                                    os.path.basename(original_dir),
-                                    fname,
-                                    detection_img,
-                                )
 
                             action = str(TEXT_ACTION).lower()
 
@@ -3520,6 +3749,20 @@ class DicomProcessor:
                                     pixels_hu.shape[:2],
                                     gray_shape_hw=(None if gray8 is None else gray8.shape[:2]),
                                     boxless_mode=boxless_mode,
+                                    gray8=gray8,
+                                )
+
+                            if SAVE_DETECTED_DEBUG_PNG:
+                                self._save_debug_png(
+                                    global_detected_png_dir,
+                                    id,
+                                    os.path.basename(original_dir),
+                                    fname,
+                                    self._draw_mask_rects(
+                                        detection_img, redact_rects,
+                                        gray_shape_hw=(None if gray8 is None
+                                                       else gray8.shape[:2]),
+                                        hu_shape_hw=pixels_hu.shape[:2]),
                                 )
 
                             if action == "redact" and redact_rects:
