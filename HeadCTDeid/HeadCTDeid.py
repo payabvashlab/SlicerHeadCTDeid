@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 """
-HeadCTDeid (3D Slicer scripted module)
+HeadCTDeid (3D Slicer scripted module)\
 """
 
 import csv
@@ -29,87 +28,33 @@ from slicer.util import VTKObservationMixin
 
 warnings.filterwarnings("ignore")
 
-# =============================================================================
-# Florence-2 (Burned-in text detection)  --  replaces EasyOCR
-# =============================================================================
 
-# Master switch for burned-in text detection.
-#   True  -> slices where Florence-2 finds text are DROPPED and logged
-#   False -> detection is skipped entirely (old `if 0:` behaviour)
 ENABLE_TEXT_DETECTION = True
 
-# ---------------------------------------------------------------------------
-# Process isolation
-# ---------------------------------------------------------------------------
-# Florence-2 runs in a separate Python process by default, exactly like the VTK
-# renderer in this module already does. Importing torch/transformers into
-# Slicer's own process risks native library conflicts (segfault) and OOM kills
-# that take the whole application down mid-study. In a worker, both degrade to
-# a logged error for that slice.
 FLORENCE_RUN_IN_SUBPROCESS = True
 
-# Interpreter used for the worker. "" = sys.executable (Slicer's PythonSlicer).
-# Point this at a separate venv python that has torch/transformers installed to
-# isolate the model from Slicer's libraries completely, e.g.
-#   FLORENCE_WORKER_PYTHON = "/mnt/mydrive/SlicerHeadCTDeid/deid/.venv/bin/python"
 FLORENCE_WORKER_PYTHON = ""
 
-# GPU selection for the worker. Restricting to a single device avoids PyTorch's
-# multi-GPU peer-to-peer probe, which is where the NVML assert
-#   NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() ... PeerToPeerAccess.cpp
-# is raised. "" leaves CUDA_VISIBLE_DEVICES untouched.
 FLORENCE_CUDA_VISIBLE_DEVICES = "0"
 
-# PYTORCH_CUDA_ALLOC_CONF for the worker. EMPTY BY DEFAULT ON PURPOSE:
-# "expandable_segments:True" makes the caching allocator go through PyTorch's
-# DriverAPI, which dlopens libnvidia-ml.so.1 and calls nvmlInit_v2(). On systems
-# where NVML is broken or mismatched, that turns a working GPU into
-#   NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() INTERNAL ASSERT FAILED
-# Plain CUDA allocation often works fine on the same machine. Set this only if
-# VRAM fragmentation is an actual problem AND NVML is healthy.
 FLORENCE_PYTORCH_CUDA_ALLOC_CONF = ""
 
-# If the worker reports an NVML failure, relaunch it once with a minimal
-# environment (no alloc-conf, no CUDA_VISIBLE_DEVICES override) before giving
-# up on the GPU. This isolates env-induced failures from real driver problems.
 FLORENCE_RETRY_CUDA_WITH_MINIMAL_ENV = True
 
-# Extra environment variables for the worker, for experimentation.
 FLORENCE_EXTRA_WORKER_ENV = {}
 
-# If CUDA cannot be initialised, run on CPU instead of failing the whole run.
-# Consider FLORENCE_MODEL_ID = "florence-community/Florence-2-base" on CPU.
 FLORENCE_FALLBACK_TO_CPU_ON_CUDA_ERROR = True
 
-# Launch the worker with the environment Slicer started from, rather than the
-# one Slicer modified. Slicer prepends its own library directories to
-# LD_LIBRARY_PATH, which can shadow the system NVIDIA/CUDA libraries and break
-# NVML inside child processes.
 FLORENCE_USE_SLICER_STARTUP_ENV = True
 
-# First launch downloads the weights, so the load timeout is generous.
 FLORENCE_WORKER_LOAD_TIMEOUT_SEC = 3600
 FLORENCE_WORKER_CALL_TIMEOUT_SEC = 300
 FLORENCE_WORKER_MAX_RESTARTS = 3
 
-# Free the model (and its RAM/VRAM) when a batch run finishes. The next Apply
-# reloads from the local cache, which is fast once the weights are downloaded.
 FLORENCE_SHUTDOWN_WORKER_AFTER_RUN = True
 
-# ---------------------------------------------------------------------------
-# Model / weights
-# ---------------------------------------------------------------------------
-# Florence-2 became a first-class transformers model on 2025-08-20, under the
-# "florence-community/*" repos. That path needs NO trust_remote_code, which is
-# what fixes the errors the old microsoft/* repos throw on transformers >= 4.50
-# ('Florence2LanguageConfig' object has no attribute 'forced_bos_token_id',
-# '_supports_sdpa', "Unrecognized configuration class", ...).
 FLORENCE_MODEL_ID = "florence-community/Florence-2-large"
-# Lighter option when RAM/VRAM is tight: "florence-community/Florence-2-base"
 
-# Legacy microsoft/* ids are remapped to their native equivalents automatically
-# unless this is turned off. With it off, the old remote-code path is used and
-# transformers must be < 4.50.
 FLORENCE_PREFER_NATIVE = True
 
 FLORENCE_NATIVE_EQUIVALENT = {
@@ -119,79 +64,42 @@ FLORENCE_NATIVE_EQUIVALENT = {
     "microsoft/Florence-2-base-ft": "florence-community/Florence-2-base-ft",
 }
 
-# Weights are downloaded from HuggingFace on first use (~1.5 GB for -large,
-# ~0.5 GB for -base) and cached on disk. Set this to keep the cache somewhere
-# specific, e.g. a shared drive; "" uses HF_HOME / ~/.cache/huggingface.
 FLORENCE_HF_CACHE_DIR = ""
 
-# "<OCR_WITH_REGION>" returns text + quad boxes. "<OCR>" returns text only.
 FLORENCE_TASK = "<OCR_WITH_REGION>"
-# If <OCR_WITH_REGION> returns nothing, retry the slice with plain <OCR>.
 FLORENCE_FALLBACK_PLAIN_OCR = True
 
-FLORENCE_MAX_NEW_TOKENS = 64       # burned-in text on CT is short
-FLORENCE_NUM_BEAMS = 3             # 1 = greedy, lowest memory
-FLORENCE_DTYPE = "float16"         # "float16" | "bfloat16" | "float32"
-FLORENCE_DEVICE = "auto"           # "auto" | "cuda" | "cpu"
-FLORENCE_ATTN_IMPL = "sdpa"        # avoids the flash_attn dependency
-FLORENCE_LOCAL_FILES_ONLY = False  # True if the machine is offline (pre-cached)
+FLORENCE_MAX_NEW_TOKENS = 64
+FLORENCE_NUM_BEAMS = 3
+FLORENCE_DTYPE = "float16"
+FLORENCE_DEVICE = "auto"
+FLORENCE_ATTN_IMPL = "sdpa"
+FLORENCE_LOCAL_FILES_ONLY = False
 
-# Upscale the grayscale slice before inference (Florence-2 works at ~768 px).
 FLORENCE_UPSCALE = 1.0
 
-# Release CUDA cache every N inference calls (useful when VRAM is tight).
 FLORENCE_EMPTY_CACHE_EVERY_N_CALLS = 50
 
-# Load the model once per Slicer session and share it across patients.
 FLORENCE_SHARE_MODEL_ACROSS_PATIENTS = True
 
-# ---------------------------------------------------------------------------
-# Confidence / text post-filters
-# ---------------------------------------------------------------------------
-# Florence-2 does not return a per-line confidence like EasyOCR. The value used
-# here is derived from the model's own token probabilities (length-normalised
-# log-prob, mapped back to 0..1):
-#     1.0 = the model is very sure about the string it just produced
-#     0.3 = the model is guessing
-# IMPORTANT: this is confidence in the string it WROTE, not evidence that the
-# string is actually present in the image. Raising this reduces false alarms but
-# increases the risk of MISSING PHI, which is the dangerous direction.
 FLORENCE_MIN_CONFIDENCE = 0.4
 
-# What to do when the model gives no usable score (some transformers versions
-# return neither sequences_scores nor scores). True keeps the hit, which is the
-# safe direction for PHI but means the threshold above cannot filter it. A
-# warning is logged the first time this happens.
 FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN = True
 
-FLORENCE_MIN_ALNUM = 2   # minimum alphanumeric characters for a plausible hit
-FLORENCE_MIN_BOX_SIDE = 6  # minimum box side in px (boxless <OCR> hits exempt)
+FLORENCE_MIN_ALNUM = 2
+FLORENCE_MIN_BOX_SIDE = 6
 
-# Burned-in annotation sits near the image edges, while hallucinated text tends
-# to land over the head. When enabled, hits whose box centre falls in the middle
-# of the image are rejected. Boxless <OCR> hits cannot be tested and are kept.
-# Off by default: it trades recall for precision, so enable deliberately.
 FLORENCE_RESTRICT_TO_BORDER_BAND = False
-FLORENCE_BORDER_FRAC = 0.30   # fraction of width/height treated as "border"
+FLORENCE_BORDER_FRAC = 0.30
 
 FLORENCE_APPLY_ALLOWLIST_FILTER = True
 FLORENCE_ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz:-_/(). "
 
-# Hallucination heuristics (VLMs can invent text on empty images)
 FLORENCE_MAX_PLAUSIBLE_BLOCK_CHARS = 300
 FLORENCE_REPEAT_FLAG_COUNT = 6
 FLORENCE_BLANK_IMAGE_STD = 3.0
-# Keep flagged hits by default: for PHI removal a suspicious hit should still
-# cause the slice to be dropped and reviewed, not be silently discarded.
 FLORENCE_DROP_SUSPECTED_HALLUCINATIONS = False
 
-# ---------------------------------------------------------------------------
-# OpenCV pre-screen (image processing, not OCR)
-# ---------------------------------------------------------------------------
-# Florence-2 is far slower than EasyOCR, so obviously-empty slices can be
-# skipped with a cheap top-hat morphology test.
-#   "on"  -> skip slices that fail the pre-screen (fastest)
-#   "off" -> every slice goes through Florence-2 (safest, slowest)
 PRESCREEN_MODE = "on"
 
 PRESCREEN_MIN_CHAR_H = 5
@@ -202,15 +110,10 @@ PRESCREEN_MIN_CHAR_AREA = 6
 PRESCREEN_MIN_COMPONENTS = 3
 PRESCREEN_TOPHAT_KERNEL = 15
 
-# Slices with BurnedInAnnotation == YES always go through the model.
 PRESCREEN_ALWAYS_RUN_ON_GROUND_TRUTH = True
 
-# Invert MONOCHROME1 slices so burned-in text is bright on a dark background.
 RESPECT_MONOCHROME1 = True
 
-# ---------------------------------------------------------------------------
-# Debug PNG drawing
-# ---------------------------------------------------------------------------
 OCR_DEBUG_DRAW_BOXES = True
 OCR_DEBUG_DRAW_LABELS = True
 OCR_DEBUG_BOX_THICKNESS = 2
@@ -219,108 +122,61 @@ OCR_DEBUG_FONT_THICKNESS = 1
 OCR_DEBUG_COLOR_OK = (0, 255, 0)
 OCR_DEBUG_COLOR_FLAGGED = (0, 0, 255)
 
-# Write a PNG for every slice with detected text; no-text PNGs are off by
-# default because a full study would otherwise produce thousands of images.
 SAVE_DETECTED_DEBUG_PNG = True
-# On: every slice that went through detection and came back clean is written to
-# only_for_debug/no_text_detected. Useful for auditing false negatives, but a
-# full study can produce thousands of PNGs - set to False if disk is tight.
 SAVE_NO_TEXT_DEBUG_PNG = True
 SAVE_REDACTED_DEBUG_PNG = True
 
+SAVE_PRESCREEN_SKIPPED_DEBUG_PNG = True
 
-# =============================================================================
-# What to do with burned-in text: redact (default) or drop the slice
-# =============================================================================
-#   "redact" -> blank the detected regions and KEEP the slice
-#   "drop"   -> discard the slice entirely (the previous behaviour)
+SAVE_NOT_EXAMINED_DEBUG_PNG = True
+
+
 TEXT_ACTION = "redact"
 
-# Padding around each detected box. Florence-2's boxes hug the glyphs, so the
-# mask is deliberately grown: the larger of a fixed margin and a fraction of the
-# box's own size. Increase these if any text survives at the edges of a mask.
+NEVER_DROP_SLICES = True
+
 REDACT_PAD_PX = 8
 REDACT_PAD_FRAC = 0.45
 
-# Value written into redacted regions, in HU.
-#   "air" -> REDACT_AIR_HU        "min" -> the minimum HU of that slice
-#   or a number, e.g. -1000
 REDACT_FILL = "air"
 REDACT_AIR_HU = -1000.0
 
-# Plain <OCR> hits carry no coordinates, so there is nothing to mask precisely.
-#   "border_band" -> blank the outer band, where burned-in text lives
-#   "drop"        -> discard that slice
-#   "ignore"      -> keep the slice unmodified (least safe)
 REDACT_BOXLESS_STRATEGY = "border_band"
 REDACT_BORDER_BAND_FRAC = 0.18
 
-# After masking, run detection once more on the redacted slice to confirm the
-# text is actually gone. This doubles inference cost on affected slices only,
-# so it is off by default; turn it on for a validation run.
 REDACT_VERIFY_WITH_SECOND_PASS = False
 
-# What to do if text is STILL detected after masking:
-#   "warn" -> keep the slice, log loudly, save a PNG for review
-#   "drop" -> discard the slice (safest)
 REDACT_VERIFY_ON_FAILURE = "warn"
 OCR_DEBUG_VERIFY_FAIL_DIRNAME = "text_after_redaction"
 
-# Global PNG debug folders
 OCR_DEBUG_ROOT_DIRNAME = "only_for_debug"
 OCR_DEBUG_DETECTED_DIRNAME = "detected_text"
 OCR_DEBUG_NO_TEXT_DIRNAME = "no_text_detected"
 OCR_DEBUG_REDACTED_DIRNAME = "redacted_text"
+OCR_DEBUG_PRESCREEN_DIRNAME = "not_examined_prescreen_skipped"
+OCR_DEBUG_NOT_EXAMINED_DIRNAME = "not_examined_detection_off"
 
-# =============================================================================
-# DICOM UID hygiene
-# =============================================================================
-# PS3.5 section 9.1: each UID component is a number of one or more digits, and
-# the first digit must not be zero unless the component is a single digit. Real
-# scanners do emit non-conformant UIDs such as "1.2.840.000000.0.1417821818376",
-# which pydicom 3 reports as "Invalid value for VR UI".
-#
-# When enabled, any syntactically invalid UID is replaced through the same
-# remapping table used for de-identification, so cross-references between
-# instances stay consistent within the output.
 DEID_FIX_INVALID_UIDS = True
 
-# File Meta (group 0002) is NOT part of the main dataset, so iterating a Dataset
-# never reaches it. Without this, output files keep the ORIGINAL SOP Instance
-# UID in MediaStorageSOPInstanceUID while the dataset carries the anonymised
-# one: inconsistent, and a link back to the source study.
 DEID_SYNC_FILE_META = True
 
-# SourceApplicationEntityTitle (0002,0016) often carries a scanner or site name.
 DEID_CLEAR_SOURCE_AE_TITLE = True
 
-# UIDs that identify a standard concept rather than an instance. These are never
-# regenerated, even if malformed, because inventing a value would break reading.
 UID_TAGS_NEVER_REMAPPED = {
-    (0x0002, 0x0002),   # MediaStorageSOPClassUID
-    (0x0002, 0x0010),   # TransferSyntaxUID
-    (0x0008, 0x0016),   # SOPClassUID
+    (0x0002, 0x0002),
+    (0x0002, 0x0010),
+    (0x0008, 0x0016),
 }
 
-# =============================================================================
-# Face/air drowning parameters (unchanged)
-# =============================================================================
 FACE_MAX_VALUE = 50
 FACE_MIN_VALUE = -125
 AIR_THRESHOLD = -800
 BONE_STOP_HU = 250
 FRONT_BOOST_KERNEL = (3, 3)
 
-# Increased face-removal dilation kernel. These values are the approximate
-# kernel diameters in millimeters; the effective one-sided expansion is
-# approximately half of the selected kernel diameter and remains constrained
-# by the BONE_STOP_HU threshold.
 FACE_KERNEL_MIN_MM = 50.0
 FACE_KERNEL_MAX_MM = 60.0
 
-# ---------------------------------------------------------------------------
-# DICOM tags to de-id (unchanged)
-# ---------------------------------------------------------------------------
 PDF_TAGS_TO_DEID = {
     (0x0008, 0x0014),
     (0x0008, 0x0018),
@@ -430,11 +286,8 @@ PDF_TAGS_TO_DEID = {
     (0x4008, 0x0212),
 }
 
-GLOBAL_DROPPED_CSV_NAME = "global_removed_slices_detected_text.csv"
+GLOBAL_DROPPED_CSV_NAME = "global_burned_in_text_actions.csv"
 
-# =============================================================================
-# Small helpers
-# =============================================================================
 def _to_str(x):
     try:
         if x is None:
@@ -527,9 +380,6 @@ def _safe_filename(s: str) -> str:
     return s or "unknown"
 
 
-# =============================================================================
-# Florence-2 text helpers (allowlist / plausibility / hallucination heuristics)
-# =============================================================================
 def _apply_allowlist(text):
     if not FLORENCE_APPLY_ALLOWLIST_FILTER:
         return str(text or "")
@@ -548,7 +398,7 @@ def _text_plausible(text) -> bool:
 
 def _box_big_enough(points) -> bool:
     if points is None:
-        return True  # plain <OCR> hits carry no box; do not reject on size
+        return True
     try:
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
         if pts.size == 0:
@@ -563,7 +413,7 @@ def _box_big_enough(points) -> bool:
 def _in_border_band(points, shape_hw) -> bool:
     """True when the box centre lies in the outer band of the image."""
     if points is None:
-        return True  # boxless <OCR> hit: cannot test, do not reject
+        return True
     try:
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
         if pts.size == 0:
@@ -630,9 +480,6 @@ def _coerce_points(raw):
     return None
 
 
-# =============================================================================
-# OpenCV pre-screen (cheap "is there anything text-like here?" test)
-# =============================================================================
 def _count_textlike_components(gray8) -> int:
     """Count connected components whose size looks like a burned-in character.
 
@@ -659,7 +506,6 @@ def _count_textlike_components(gray8) -> int:
                 count += 1
         return count
     except Exception:
-        # On failure, assume text may be present (safer for PHI removal).
         return int(PRESCREEN_MIN_COMPONENTS)
 
 
@@ -668,9 +514,6 @@ def _prescreen_says_maybe_text(gray8):
     return (n >= int(PRESCREEN_MIN_COMPONENTS)), n
 
 
-# =============================================================================
-# Florence-2 engine
-# =============================================================================
 def _fixed_get_imports(filename):
     """Drop the flash_attn requirement from Florence-2's remote code.
 
@@ -733,7 +576,6 @@ class Florence2Engine:
         self.device = _resolve_florence_device()
         self.cuda_error = None
 
-        # is_available() can be True while the CUDA context is unusable.
         if self.device == "cuda":
             try:
                 probe = torch.zeros(1, device="cuda")
@@ -782,7 +624,6 @@ class Florence2Engine:
                 "trust_remote_code": True,
                 "attn_implementation": FLORENCE_ATTN_IMPL,
                 "local_files_only": local_only,
-                # Avoids holding a second full copy of the weights during load.
                 "low_cpu_mem_usage": True,
             }
             if self.dtype is not None:
@@ -832,9 +673,6 @@ class Florence2Engine:
             self.model = self.model.to(torch.float32).to("cpu")
         self.model.eval()
 
-    # ------------------------------------------------------------------
-    # Image preparation
-    # ------------------------------------------------------------------
     @staticmethod
     def to_pil(gray8):
         import cv2
@@ -852,9 +690,6 @@ class Florence2Engine:
         rgb = cv2.cvtColor(work, cv2.COLOR_GRAY2RGB)
         return Image.fromarray(rgb), scale
 
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
     def _generate(self, prompt, images):
         torch = self.torch
 
@@ -872,8 +707,6 @@ class Florence2Engine:
         if self.dtype is not None and self.device != "cpu" and "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
 
-        # output_scores=True is REQUIRED for any confidence at all: `scores` and
-        # beam search's `sequences_scores` are only returned when it is set.
         with torch.inference_mode():
             out = self.model.generate(
                 **inputs,
@@ -953,7 +786,6 @@ class Florence2Engine:
         if payload is None:
             return out
 
-        # <OCR> -> a single string, no boxes
         if isinstance(payload, str):
             txt = _strip_special(payload)
             if txt:
@@ -984,7 +816,7 @@ class Florence2Engine:
         prepared = [self.to_pil(g) for g in grays]
         images = [pr[0] for pr in prepared]
         scales = [pr[1] for pr in prepared]
-        sizes = [im.size for im in images]  # (W, H) after upscaling
+        sizes = [im.size for im in images]
 
         decoded, confs = self._generate_with_oom_retry(FLORENCE_TASK, images)
 
@@ -1000,7 +832,6 @@ class Florence2Engine:
             hits = self._parse(txt, FLORENCE_TASK, sizes[i])
             if not hits and FLORENCE_FALLBACK_PLAIN_OCR and FLORENCE_TASK != "<OCR>":
                 need_fallback.append(i)
-            # Sequence-level score: every box from one image shares this value.
             c_i = None if confs[i] is None else float(confs[i])
             results.append([(pnt, t, c_i) for pnt, t in hits])
 
@@ -1015,7 +846,6 @@ class Florence2Engine:
             except Exception:
                 pass
 
-        # Map boxes back to original image coordinates
         final = []
         for hits, scale in zip(results, scales):
             if abs(scale - 1.0) > 1e-6:
@@ -1038,13 +868,6 @@ class Florence2Engine:
         return out[0] if out else []
 
 
-# =============================================================================
-# Florence-2 worker subprocess
-# =============================================================================
-# Standalone program: loads the model once, then answers one JSON request per
-# stdin line. Only numpy / torch / transformers / PIL are imported here - cv2 is
-# deliberately absent, because opencv-python links its own Qt and is a known
-# cause of hard crashes inside Qt applications such as Slicer.
 FLORENCE_WORKER_SOURCE = r"""
 import sys, os, json, traceback
 
@@ -1538,8 +1361,6 @@ def _florence_worker_env(minimal=False):
     if str(FLORENCE_CUDA_VISIBLE_DEVICES) != "":
         env["CUDA_VISIBLE_DEVICES"] = str(FLORENCE_CUDA_VISIBLE_DEVICES)
 
-    # Only set the allocator config if explicitly requested (see the note on
-    # FLORENCE_PYTORCH_CUDA_ALLOC_CONF: expandable_segments forces NVML).
     if str(FLORENCE_PYTORCH_CUDA_ALLOC_CONF or "").strip():
         env["PYTORCH_CUDA_ALLOC_CONF"] = str(FLORENCE_PYTORCH_CUDA_ALLOC_CONF).strip()
     else:
@@ -1654,7 +1475,6 @@ def florence_gpu_report():
                  % (env.get("PYTORCH_CUDA_ALLOC_CONF") or "<unset>"))
     lines.append("")
 
-    # 1) Does the driver work at all, independently of PyTorch?
     try:
         pr = subprocess.run(["nvidia-smi",
                              "--query-gpu=index,name,driver_version,memory.total,memory.used",
@@ -1673,7 +1493,6 @@ def florence_gpu_report():
         lines.append("nvidia-smi error: %s" % exc)
     lines.append("")
 
-    # 2) What does torch see, in the worker's environment?
     info = {}
     try:
         tmpdir = tempfile.mkdtemp(prefix="headctdeid_gpuprobe_")
@@ -1695,7 +1514,6 @@ def florence_gpu_report():
         lines.append("torch probe failed to run: %s" % exc)
     lines.append("")
 
-    # 3) Turn that into an actionable diagnosis.
     lines.append("diagnosis:")
     if info.get("torch_import_error"):
         lines.append("    torch cannot be imported by the worker interpreter: %s"
@@ -1770,9 +1588,6 @@ class Florence2WorkerClient:
         self.cuda_error = None
         self._launch()
 
-    # ------------------------------------------------------------------
-    # Process lifecycle
-    # ------------------------------------------------------------------
     def _log(self, msg, error=False):
         try:
             if self.logger:
@@ -1857,10 +1672,6 @@ class Florence2WorkerClient:
                   f"{' [minimal env]' if minimal_env else ''}")
 
         if self.cuda_error:
-            # An NVML failure is often induced by the environment rather than by
-            # the machine: expandable_segments sends the allocator through
-            # PyTorch's DriverAPI, which dlopens libnvidia-ml.so.1. Retry once
-            # with everything CUDA-related stripped before blaming the driver.
             nvml_related = "nvml" in str(self.cuda_error).lower()
             if (nvml_related and not minimal_env
                     and FLORENCE_RETRY_CUDA_WITH_MINIMAL_ENV):
@@ -1889,7 +1700,7 @@ class Florence2WorkerClient:
         except Exception:
             pass
         finally:
-            self._out_q.put(None)  # EOF sentinel
+            self._out_q.put(None)
 
     def _read_json(self, timeout_sec):
         """Block for one JSON line, keeping the Slicer UI responsive."""
@@ -1903,7 +1714,6 @@ class Florence2WorkerClient:
                 except Exception:
                     pass
                 if self.proc is not None and self.proc.poll() is not None:
-                    # Worker died (segfault / OOM kill) - drain and give up.
                     try:
                         line = self._out_q.get_nowait()
                     except Exception:
@@ -1920,7 +1730,6 @@ class Florence2WorkerClient:
             try:
                 return json.loads(line)
             except Exception:
-                # Stray print from a library; ignore and keep reading.
                 continue
         return None
 
@@ -1952,9 +1761,6 @@ class Florence2WorkerClient:
             self._log(f"Florence-2 worker restart failed: {e}", error=True)
             return False
 
-    # ------------------------------------------------------------------
-    # Inference API (mirrors Florence2Engine)
-    # ------------------------------------------------------------------
     def readtext_batch(self, grays):
         if not grays:
             return []
@@ -1982,7 +1788,6 @@ class Florence2WorkerClient:
             resp = self._read_json(timeout_sec=float(FLORENCE_WORKER_CALL_TIMEOUT_SEC))
 
             if resp is None:
-                # No answer: the worker crashed or hung on this slice.
                 self._log(f"Florence-2 worker did not respond.\n{self._stderr_tail()}", error=True)
                 self._restart()
                 return [[] for _ in grays]
@@ -2048,8 +1853,6 @@ class Florence2WorkerClient:
             self.proc = None
 
 
-# Loaded once per Slicer session and shared by every DicomProcessor, so the
-# ~1.5 GB model is not re-loaded for each patient folder.
 _FLORENCE_SHARED_ENGINE = None
 _FLORENCE_LOAD_FAILED = False
 
@@ -2126,7 +1929,7 @@ def prefetch_florence_weights(model_id=None):
 
     if FLORENCE_PREFER_NATIVE and mid in FLORENCE_NATIVE_EQUIVALENT:
         try:
-            from transformers import Florence2ForConditionalGeneration  # noqa: F401
+            from transformers import Florence2ForConditionalGeneration
             mid = FLORENCE_NATIVE_EQUIVALENT[mid]
         except Exception:
             pass
@@ -2142,9 +1945,6 @@ def prefetch_florence_weights(model_id=None):
     return path
 
 
-# =============================================================================
-# Module
-# =============================================================================
 class HeadCTDeid(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
@@ -2156,9 +1956,6 @@ class HeadCTDeid(ScriptedLoadableModule):
         self.parent.acknowledgementText = "This file was developed by Anh Tuan Tran, Sam Payabvash (Columbia University)."
 
 
-# =============================================================================
-# Widget
-# =============================================================================
 class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def __init__(self, parent=None):
         ScriptedLoadableModuleWidget.__init__(self, parent)
@@ -2241,7 +2038,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onApplyButton(self):
         try:
-            import gdcm  
+            import gdcm
             slicer.util.infoDisplay(
                 "This tool is a work-in-progress being validated in project. "
                 "Contact sp4479@columbia.edu for details. Use at your own risk.",
@@ -2253,7 +2050,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             if self.ui.progressBar:
                 self.ui.progressBar.setValue(0)
-            
+
             self.logic.process(
                 self.ui.inputFolderButton.directory,
                 self.ui.excelFileButton.text,
@@ -2273,15 +2070,9 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.pip_install("pylibjpeg-libjpeg")
             slicer.util.pip_install("pylibjpeg-openjpeg")
             slicer.util.pip_install("scikit-image")
-            # Install ONLY the headless OpenCV build. opencv-python links its
-            # own Qt, which conflicts with Slicer's Qt and can abort the whole
-            # application; the two packages also overwrite each other's cv2.
             slicer.util.pip_uninstall("opencv-python")
             slicer.util.pip_uninstall("opencv-python-headless")
             slicer.util.pip_install("opencv-python-headless")
-            # Florence-2 stack (replaces easyocr). transformers >= 4.56 ships a
-            # native Florence-2 implementation, which is what this module uses;
-            # timm + einops are only needed by the legacy remote-code fallback.
             slicer.util.pip_install("pillow")
             slicer.util.pip_install("transformers>=4.56")
             slicer.util.pip_install("timm")
@@ -2312,9 +2103,6 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.updateGUIFromParameterNode()
 
 
-# =============================================================================
-# Logic
-# =============================================================================
 class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
     def __init__(self):
         ScriptedLoadableModuleLogic.__init__(self)
@@ -2431,9 +2219,15 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         ocr_no_text_dir = os.path.join(ocr_debug_root, OCR_DEBUG_NO_TEXT_DIRNAME)
         ocr_redacted_dir = os.path.join(ocr_debug_root, OCR_DEBUG_REDACTED_DIRNAME)
         ocr_verify_fail_dir = os.path.join(ocr_debug_root, OCR_DEBUG_VERIFY_FAIL_DIRNAME)
+        ocr_prescreen_dir = os.path.join(ocr_debug_root, OCR_DEBUG_PRESCREEN_DIRNAME)
+        ocr_not_examined_dir = os.path.join(ocr_debug_root, OCR_DEBUG_NOT_EXAMINED_DIRNAME)
         os.makedirs(ocr_detected_dir, exist_ok=True)
         os.makedirs(ocr_no_text_dir, exist_ok=True)
         os.makedirs(ocr_redacted_dir, exist_ok=True)
+        if SAVE_PRESCREEN_SKIPPED_DEBUG_PNG:
+            os.makedirs(ocr_prescreen_dir, exist_ok=True)
+        if SAVE_NOT_EXAMINED_DEBUG_PNG:
+            os.makedirs(ocr_not_examined_dir, exist_ok=True)
         if REDACT_VERIFY_WITH_SECOND_PASS:
             os.makedirs(ocr_verify_fail_dir, exist_ok=True)
 
@@ -2473,6 +2267,8 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     global_no_text_png_dir=ocr_no_text_dir,
                     global_redacted_png_dir=ocr_redacted_dir,
                     global_verify_fail_png_dir=ocr_verify_fail_dir,
+                    global_prescreen_png_dir=ocr_prescreen_dir,
+                    global_not_examined_png_dir=ocr_not_examined_dir,
                     patient_input_root=src_folder,
                     original_face_render_dir=original_face_render_dir,
                     after_deidentification_render_dir=after_deidentification_render_dir,
@@ -2512,9 +2308,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         self.logger.info("All processing finished.")
 
 
-# =============================================================================
-# DICOM Processor
-# =============================================================================
 class DicomProcessor:
     """
     Pipeline: de-identification + face/air replacement + Florence-2 detect->drop.
@@ -2540,16 +2333,20 @@ class DicomProcessor:
 
         self._running_subprocesses = []
 
-        self._ocr = None            # Florence2Engine / worker client (lazy)
+        self._ocr = None
         self._prescreen_skipped = 0
         self._detect_calls = 0
         self._warned_unknown_conf = False
+        try:
+            if ENABLE_TEXT_DETECTION:
+                logging.getLogger(__name__).info(
+                    "Burned-in text mode: action=%s, never_drop=%s -> slices with text "
+                    "are blacked out and KEPT." % (TEXT_ACTION, NEVER_DROP_SLICES))
+        except Exception:
+            pass
         self._unknown_conf_count = 0
-        self._conf_samples = []     # confidence of each detected slice, for tuning
+        self._conf_samples = []
 
-    # -------------------------------------------------------------------------
-    # Subprocess utilities (render only)
-    # -------------------------------------------------------------------------
     def _popen_and_wait(self, cmd, timeout_sec):
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -2619,9 +2416,6 @@ class DicomProcessor:
         self._running_subprocesses = [p for p in self._running_subprocesses if p.poll() is None]
         return len(self._running_subprocesses) == 0
 
-    # -------------------------------------------------------------------------
-    # Florence-2 detection
-    # -------------------------------------------------------------------------
     def _detect_gpu_available(self):
         try:
             import torch
@@ -2726,8 +2520,6 @@ class DicomProcessor:
         for points, txt, conf in hits:
             try:
                 if conf is None:
-                    # No score available from the model. Warn once, because the
-                    # confidence threshold silently does nothing in this state.
                     if not self._warned_unknown_conf:
                         self._warned_unknown_conf = True
                         try:
@@ -2785,7 +2577,6 @@ class DicomProcessor:
                 label = label.replace("\n", " ")[:60]
 
                 if points is None:
-                    # Plain <OCR> hit: no coordinates, annotate the top-left corner
                     if OCR_DEBUG_DRAW_LABELS:
                         cv2.putText(
                             det_img,
@@ -2852,7 +2643,6 @@ class DicomProcessor:
         except Exception:
             return False, "", None, None, None, None, [], 0
 
-        # Cheap OpenCV pre-screen before paying for a VLM forward pass
         if str(PRESCREEN_MODE).lower() == "on":
             run_anyway = bool(burned_flag) and PRESCREEN_ALWAYS_RUN_ON_GROUND_TRUTH
             if not run_anyway:
@@ -2894,7 +2684,8 @@ class DicomProcessor:
 
         return False, "", None, None, gray8, detection_img, [], 0
 
-    def _redaction_rects(self, boxes, boxless, shape_hw, gray_shape_hw=None):
+    def _redaction_rects(self, boxes, boxless, shape_hw, gray_shape_hw=None,
+                         boxless_mode=None):
         """Turn detected boxes into padded axis-aligned rectangles to blank out.
 
         Masks are grown deliberately: Florence-2's boxes hug the glyphs, and a
@@ -2902,7 +2693,6 @@ class DicomProcessor:
         """
         h, w = int(shape_hw[0]), int(shape_hw[1])
 
-        # Detection ran on gray8; rescale if the pixel array has another shape.
         sx = sy = 1.0
         if gray_shape_hw is not None:
             gh, gw = int(gray_shape_hw[0]), int(gray_shape_hw[1])
@@ -2934,17 +2724,18 @@ class DicomProcessor:
             except Exception:
                 continue
 
-        # Hits with no coordinates cannot be masked precisely.
-        if boxless and str(REDACT_BOXLESS_STRATEGY).lower() == "border_band":
+        mode = str(boxless_mode if boxless_mode is not None
+                   else REDACT_BOXLESS_STRATEGY).lower()
+        if boxless and mode == "border_band":
             bx = int(round(float(REDACT_BORDER_BAND_FRAC) * w))
             by = int(round(float(REDACT_BORDER_BAND_FRAC) * h))
             bx = max(1, min(bx, w // 2))
             by = max(1, min(by, h // 2))
             rects.extend([
-                (0, 0, w, by),           # top
-                (0, h - by, w, h),       # bottom
-                (0, 0, bx, h),           # left
-                (w - bx, 0, w, h),       # right
+                (0, 0, w, by),
+                (0, h - by, w, h),
+                (0, 0, bx, h),
+                (w - bx, 0, w, h),
             ])
 
         return rects
@@ -2976,6 +2767,11 @@ class DicomProcessor:
             except Exception:
                 continue
         return n
+
+    def _gray_to_bgr(self, gray8):
+        import cv2
+
+        return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
 
     def _render_redacted_png(self, gray8, rects):
         """Render the slice as it will look after masking: solid black boxes.
@@ -3052,9 +2848,6 @@ class DicomProcessor:
                 pass
             return None
 
-    # -------------------------------------------------------------------------
-    # CT helpers
-    # -------------------------------------------------------------------------
     def is_dicom(self, file_path, remove_CTA=False):
         import pydicom
         try:
@@ -3137,9 +2930,6 @@ class DicomProcessor:
         vals = vals[(vals > FACE_MIN_VALUE) & (vals < FACE_MAX_VALUE)]
         return vals.tolist()
 
-    # -------------------------------------------------------------------------
-    # CT meta filter
-    # -------------------------------------------------------------------------
     def is_substring_in_list(self, substring, string_list):
         return any(substring in str(s) for s in string_list)
 
@@ -3151,11 +2941,11 @@ class DicomProcessor:
             sop_class = str(sop_class).strip()
 
             secondary_capture_uids = {
-                "1.2.840.10008.5.1.4.1.1.7",    # Secondary Capture Image Storage
-                "1.2.840.10008.5.1.4.1.1.7.1",  # Multi-frame Single Bit Secondary Capture Image Storage
-                "1.2.840.10008.5.1.4.1.1.7.2",  # Multi-frame Grayscale Byte Secondary Capture Image Storage
-                "1.2.840.10008.5.1.4.1.1.7.3",  # Multi-frame Grayscale Word Secondary Capture Image Storage
-                "1.2.840.10008.5.1.4.1.1.7.4",  # Multi-frame True Color Secondary Capture Image Storage
+                "1.2.840.10008.5.1.4.1.1.7",
+                "1.2.840.10008.5.1.4.1.1.7.1",
+                "1.2.840.10008.5.1.4.1.1.7.2",
+                "1.2.840.10008.5.1.4.1.1.7.3",
+                "1.2.840.10008.5.1.4.1.1.7.4",
             }
 
             return sop_class in secondary_capture_uids
@@ -3197,7 +2987,6 @@ class DicomProcessor:
                 if any(self.is_substring_in_list(e, studyDes) for e in exclude):
                     status4 = False
 
-            # Exclude Secondary Capture objects because they can contain burned-in text annotations.
             status5 = not self._is_secondary_capture_sop_class(ds)
 
             return int(status1 and status2 and status3 and status4 and status5)
@@ -3205,9 +2994,6 @@ class DicomProcessor:
             self.error = str(e)
             return 0
 
-    # -------------------------------------------------------------------------
-    # Dilation with barriers
-    # -------------------------------------------------------------------------
     def _keep_only_components_touching_seed(self, mask_uint8, seed_uint8):
         import cv2
         m = (mask_uint8 > 0).astype(np.uint8)
@@ -3329,9 +3115,6 @@ class DicomProcessor:
 
         return new_vol
 
-    # -------------------------------------------------------------------------
-    # DICOM anonymization helpers
-    # -------------------------------------------------------------------------
     def curves_callback(self, ds, elem):
         if elem.tag.group & 0xFF00 == 0x5000:
             del ds[elem.tag]
@@ -3378,7 +3161,6 @@ class DicomProcessor:
             ds[tag].value = self._current_date_da()
             return
         if vr == "TM":
-            # Preserve the original time while removing the original date elsewhere.
             return
         if vr == "DT":
             ds[tag].value = self._replace_dt_date_preserve_time(ds[tag].value)
@@ -3508,7 +3290,7 @@ class DicomProcessor:
 
         if DEID_CLEAR_SOURCE_AE_TITLE:
             try:
-                tag = (0x0002, 0x0016)   # SourceApplicationEntityTitle
+                tag = (0x0002, 0x0016)
                 if tag in fm:
                     del fm[tag]
             except Exception:
@@ -3542,9 +3324,6 @@ class DicomProcessor:
 
         recurse(ds)
 
-    # -------------------------------------------------------------------------
-    # Global CSV helpers
-    # -------------------------------------------------------------------------
     def _append_global_drop_rows(self, csv_path, rows):
         if not csv_path or not rows:
             return
@@ -3570,6 +3349,7 @@ class DicomProcessor:
                     "hit_bbox",
                     "n_redacted_regions",
                     "boxless_hits",
+                    "forced_keep",
                 ]
                 w = csv.DictWriter(f, fieldnames=fieldnames)
                 if not file_exists:
@@ -3582,11 +3362,6 @@ class DicomProcessor:
             except Exception:
                 pass
 
-    # -------------------------------------------------------------------------
-    # Save anonymized dicoms + OCR detect -> DROP slice
-    # Enforces: OCR-all-first, save-after via temp staging
-    # Writes only global CSV, and also global debug PNG folders
-    # -------------------------------------------------------------------------
     def save_new_dicom_files(
         self,
         original_dir,
@@ -3602,6 +3377,8 @@ class DicomProcessor:
         global_no_text_png_dir=None,
         global_redacted_png_dir=None,
         global_verify_fail_png_dir=None,
+        global_prescreen_png_dir=None,
+        global_not_examined_png_dir=None,
         patient_input_root=None,
         original_face_render_dir=None,
         after_deidentification_render_dir=None,
@@ -3631,6 +3408,11 @@ class DicomProcessor:
         redact_count = 0
         unmasked_count = 0
         verify_fail_count = 0
+        png_detected = 0
+        png_no_text = 0
+        png_prescreen = 0
+        png_not_examined = 0
+        png_none = 0
         err_count = 0
         uid_fix_count = 0
 
@@ -3694,14 +3476,19 @@ class DicomProcessor:
                     pixels_hu = self.get_pixels_hu(ds)
 
                     redact_rects = []
+                    forced_keep = False
+                    was_prescreen_skipped = False
 
                     want_detect = ENABLE_TEXT_DETECTION and (self._force_ocr_all or burned_flag)
                     if want_detect:
+                        _skipped_before = self._prescreen_skipped
                         (has_text, hit_txt, hit_conf, hit_bbox, gray8,
                          detection_img, boxes, boxless) = self.detect_text_debug(
                             ds, burned_flag=burned_flag)
+                        was_prescreen_skipped = (self._prescreen_skipped > _skipped_before)
 
                         if has_text:
+                            png_detected += 1
                             if SAVE_DETECTED_DEBUG_PNG:
                                 self._save_debug_png(
                                     global_detected_png_dir,
@@ -3713,17 +3500,26 @@ class DicomProcessor:
 
                             action = str(TEXT_ACTION).lower()
 
-                            # A hit with no coordinates cannot be masked precisely.
                             if (action == "redact" and boxless and not boxes
                                     and str(REDACT_BOXLESS_STRATEGY).lower() == "drop"):
                                 action = "drop"
 
+                            if NEVER_DROP_SLICES and action == "drop":
+                                action = "redact"
+                                forced_keep = True
+
                             if action == "redact":
+                                boxless_mode = str(REDACT_BOXLESS_STRATEGY).lower()
+                                if NEVER_DROP_SLICES and boxless and not boxes \
+                                        and boxless_mode != "border_band":
+                                    boxless_mode = "border_band"
+
                                 redact_rects = self._redaction_rects(
                                     boxes,
                                     boxless,
                                     pixels_hu.shape[:2],
                                     gray_shape_hw=(None if gray8 is None else gray8.shape[:2]),
+                                    boxless_mode=boxless_mode,
                                 )
 
                             if action == "redact" and redact_rects:
@@ -3748,10 +3544,10 @@ class DicomProcessor:
                                     "hit_bbox": hit_bbox,
                                     "n_redacted_regions": len(redact_rects),
                                     "boxless_hits": int(boxless),
+                                    "forced_keep": bool(forced_keep),
                                 })
-                                # Slice is kept; masking happens after drowning.
 
-                            elif action == "drop":
+                            elif action == "drop" and not NEVER_DROP_SLICES:
                                 drop_count += 1
                                 dropped_rows.append({
                                     "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -3772,26 +3568,56 @@ class DicomProcessor:
                                     "hit_bbox": hit_bbox,
                                     "n_redacted_regions": 0,
                                     "boxless_hits": int(boxless),
+                                    "forced_keep": False,
                                 })
                                 del ds, pixels_hu
                                 continue
 
                             else:
-                                # Text found but nothing actionable: log it loudly.
                                 unmasked_count += 1
                                 self.logger.warning(
                                     "[%s] %s: text detected but NOT masked "
                                     "(boxless=%d, strategy=%s): %r"
                                     % (id, fname, boxless, REDACT_BOXLESS_STRATEGY, hit_txt))
 
-                        elif SAVE_NO_TEXT_DEBUG_PNG and detection_img is not None:
-                            self._save_debug_png(
-                                global_no_text_png_dir,
-                                id,
-                                os.path.basename(original_dir),
-                                fname,
-                                detection_img,
-                            )
+                        elif detection_img is not None:
+                            if was_prescreen_skipped:
+                                png_prescreen += 1
+                                if SAVE_PRESCREEN_SKIPPED_DEBUG_PNG:
+                                    self._save_debug_png(
+                                        global_prescreen_png_dir,
+                                        id,
+                                        os.path.basename(original_dir),
+                                        fname,
+                                        detection_img,
+                                    )
+                            else:
+                                png_no_text += 1
+                                if SAVE_NO_TEXT_DEBUG_PNG:
+                                    self._save_debug_png(
+                                        global_no_text_png_dir,
+                                        id,
+                                        os.path.basename(original_dir),
+                                        fname,
+                                        detection_img,
+                                    )
+                        else:
+                            png_none += 1
+
+                    if not want_detect:
+                        png_not_examined += 1
+                        if SAVE_NOT_EXAMINED_DEBUG_PNG:
+                            try:
+                                self._save_debug_png(
+                                    global_not_examined_png_dir,
+                                    id,
+                                    os.path.basename(original_dir),
+                                    fname,
+                                    self._gray_to_bgr(
+                                        self._dicom_pixels_to_gray8_for_ocr(ds)),
+                                )
+                            except Exception:
+                                png_none += 1
 
                     bin_mask = self.binarize_volume(pixels_hu)
                     lcc = self.largest_connected_component(bin_mask)
@@ -3826,10 +3652,6 @@ class DicomProcessor:
                         fill_mode="air",
                     )
 
-                    # Redact AFTER drowning: masking first would feed artificial
-                    # air regions into the binarize/dilate face-removal step.
-                    # new_volume becomes ds.PixelData below, so this is exactly
-                    # what is written to the output folder.
                     if redact_rects:
                         self._apply_redaction(new_volume, redact_rects)
 
@@ -3858,7 +3680,8 @@ class DicomProcessor:
                                     self._render_redacted_png(
                                         self._hu_to_gray8(new_volume, ds), []),
                                 )
-                                if str(REDACT_VERIFY_ON_FAILURE).lower() == "drop":
+                                if (str(REDACT_VERIFY_ON_FAILURE).lower() == "drop"
+                                        and not NEVER_DROP_SLICES):
                                     drop_count += 1
                                     del ds, pixels_hu, new_volume
                                     continue
@@ -3894,12 +3717,62 @@ class DicomProcessor:
                         1500,
                     )
 
+            n_in = len(files)
+            n_out = len(prepared)
+            if n_in:
+                if n_out == n_in:
+                    self.logger.info(
+                        "[%s] %s: %d/%d slices written (none removed); %d had text "
+                        "blacked out." % (id, os.path.basename(original_dir),
+                                          n_out, n_in, redact_count))
+                else:
+                    self.logger.warning(
+                        "[%s] %s: %d/%d slices written - %d MISSING "
+                        "(dropped=%d, errors=%d). With NEVER_DROP_SLICES=%s, any "
+                        "shortfall is a read/processing error, not text removal."
+                        % (id, os.path.basename(original_dir), n_out, n_in,
+                           n_in - n_out, drop_count, err_count, NEVER_DROP_SLICES))
+
+            if n_in:
+                accounted = (png_detected + png_no_text + png_prescreen
+                             + png_not_examined + png_none)
+                self.logger.info(
+                    "[%s] %s: debug PNG accounting over %d slice(s): "
+                    "text_found=%d, examined_clean=%d, prescreen_skipped=%d, "
+                    "not_examined=%d, no_image=%d (total %d)"
+                    % (id, os.path.basename(original_dir), n_in,
+                       png_detected, png_no_text, png_prescreen,
+                       png_not_examined, png_none, accounted))
+                if png_detected != redact_count + drop_count + unmasked_count:
+                    self.logger.warning(
+                        "[%s] PNG/action mismatch: %d slice(s) with text but "
+                        "%d redacted + %d dropped + %d unmasked."
+                        % (id, png_detected, redact_count, drop_count, unmasked_count))
+                if png_not_examined:
+                    self.logger.warning(
+                        "[%s] %d slice(s) were NOT examined for burned-in text "
+                        "(detection runs only when the de-identify option is on or "
+                        "BurnedInAnnotation=YES). See only_for_debug/%s."
+                        % (id, png_not_examined, OCR_DEBUG_NOT_EXAMINED_DIRNAME))
+                if png_prescreen:
+                    self.logger.info(
+                        "[%s] %d slice(s) were skipped by the OpenCV pre-screen and "
+                        "never reached Florence-2. Set PRESCREEN_MODE = \"off\" to "
+                        "examine every slice. See only_for_debug/%s."
+                        % (id, png_prescreen, OCR_DEBUG_PRESCREEN_DIRNAME))
+                if png_none:
+                    self.logger.warning(
+                        "[%s] %d slice(s) produced NO debug image (pixel conversion or "
+                        "model init failed). These were not checked for text."
+                        % (id, png_none))
+
             if redact_count or unmasked_count:
                 self.logger.info(
-                    "[%s] burned-in text: %d slice(s) redacted and kept, %d dropped, "
-                    "%d detected but NOT masked (action=%s, boxless strategy=%s)."
+                    "[%s] burned-in text: %d slice(s) redacted and KEPT, %d dropped, "
+                    "%d detected but NOT masked (action=%s, boxless strategy=%s, "
+                    "never_drop=%s)."
                     % (id, redact_count, drop_count, unmasked_count,
-                       TEXT_ACTION, REDACT_BOXLESS_STRATEGY))
+                       TEXT_ACTION, REDACT_BOXLESS_STRATEGY, NEVER_DROP_SLICES))
                 if verify_fail_count:
                     self.logger.warning(
                         "[%s] %d slice(s) still showed text on the SECOND pass after "
@@ -3938,7 +3811,9 @@ class DicomProcessor:
                     pass
 
             if files and not prepared:
-                errors.append((os.path.basename(original_dir), "all_slices_removed_due_to_detected_text"))
+                reason = ("all_slices_failed_to_process" if NEVER_DROP_SLICES
+                          else "all_slices_removed_due_to_detected_text")
+                errors.append((os.path.basename(original_dir), reason))
 
             for tmp_path, final_path in prepared:
                 try:
@@ -3947,9 +3822,6 @@ class DicomProcessor:
                 except Exception as e:
                     errors.append((os.path.basename(tmp_path), f"finalize_copy_failed: {e}"))
 
-            # Save paired 3D face-rendering quality-control images outside the
-            # patient DICOM folders. These folders are created at the batch output
-            # root as: original_face_render/ and after_deidentification_render/.
             if prepared:
                 render_label = _safe_filename(f"{id}_{os.path.basename(original_dir)}")
 
@@ -4012,9 +3884,6 @@ class DicomProcessor:
 
         return errors
 
-    # -----------------------------------------------------------------------
-    # Snapshot rendering (subprocess) 
-    # -----------------------------------------------------------------------
     def _render_fallback_middle_slice(self, dicom_dir: str, out_png: str):
         import pydicom
         import cv2
@@ -4294,9 +4163,6 @@ print(out_png)
 
         return all_outputs
 
-    # -----------------------------------------------------------------------
-    # MAIN PIPELINE
-    # -----------------------------------------------------------------------
     def drown_volume(
         self,
         in_path,
@@ -4312,6 +4178,8 @@ print(out_png)
         global_no_text_png_dir=None,
         global_redacted_png_dir=None,
         global_verify_fail_png_dir=None,
+        global_prescreen_png_dir=None,
+        global_not_examined_png_dir=None,
         patient_input_root=None,
         original_face_render_dir=None,
         after_deidentification_render_dir=None,
@@ -4336,6 +4204,8 @@ print(out_png)
                         global_detected_png_dir=global_detected_png_dir,
                         global_redacted_png_dir=global_redacted_png_dir,
                         global_verify_fail_png_dir=global_verify_fail_png_dir,
+                        global_prescreen_png_dir=global_prescreen_png_dir,
+                        global_not_examined_png_dir=global_not_examined_png_dir,
                         global_no_text_png_dir=global_no_text_png_dir,
                         patient_input_root=patient_input_root or in_path,
                         original_face_render_dir=original_face_render_dir,
@@ -4387,9 +4257,6 @@ print(out_png)
         return 1
 
 
-# =============================================================================
-# Tests
-# =============================================================================
 class HeadCTDeidTest(ScriptedLoadableModuleTest):
     def setUp(self):
         slicer.mrmlScene.Clear()
