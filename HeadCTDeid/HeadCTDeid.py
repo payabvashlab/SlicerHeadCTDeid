@@ -1,5 +1,6 @@
 """
 HeadCTDeid (3D Slicer scripted module)
+
 """
 
 import csv
@@ -146,7 +147,7 @@ REDACT_BORDER_BAND_FRAC = 0.18
 
 REDACT_GEOMETRY = "exact"
 
-REDACT_EXACT_PAD_PX = 0
+REDACT_EXACT_PAD_PX = 6
 
 OCR_DEBUG_DRAW_MASK_RECTS = True
 
@@ -162,7 +163,7 @@ REDACT_SWEEP_MIN_CHARS_PER_LINE = 2
 REDACT_EXPAND_TO_LINE = True
 REDACT_LINE_EXTRA_PX = 12
 
-REDACT_VERIFY_WITH_SECOND_PASS = False
+REDACT_VERIFY_WITH_SECOND_PASS = True
 
 REDACT_VERIFY_ON_FAILURE = "warn"
 OCR_DEBUG_VERIFY_FAIL_DIRNAME = "text_after_redaction"
@@ -174,7 +175,64 @@ OCR_DEBUG_REDACTED_DIRNAME = "redacted_text"
 OCR_DEBUG_PRESCREEN_DIRNAME = "not_examined_prescreen_skipped"
 OCR_DEBUG_NOT_EXAMINED_DIRNAME = "not_examined_detection_off"
 
+DEID_REPLACE_ALL_DATES = True
+
+DEID_ANONYMIZATION_DATE = ""
+
+DEID_TIME_POLICY = "keep"
+
+DEID_PRESERVE_PATIENT_AGE = True
+
+DEID_MAX_AGE_YEARS = 89
+
+DATE_TIME_TAGS_OF_INTEREST = {
+    (0x0008, 0x0020): "StudyDate",
+    (0x0008, 0x0021): "SeriesDate",
+    (0x0008, 0x0022): "AcquisitionDate",
+    (0x0008, 0x0023): "ContentDate",
+    (0x0008, 0x0024): "OverlayDate",
+    (0x0008, 0x0025): "CurveDate",
+    (0x0008, 0x002A): "AcquisitionDateTime",
+    (0x0008, 0x0030): "StudyTime",
+    (0x0008, 0x0031): "SeriesTime",
+    (0x0008, 0x0032): "AcquisitionTime",
+    (0x0008, 0x0033): "ContentTime",
+    (0x0010, 0x0030): "PatientBirthDate",
+    (0x0010, 0x0032): "PatientBirthTime",
+    (0x0010, 0x21D0): "LastMenstrualDate",
+    (0x0018, 0x1012): "DateOfSecondaryCapture",
+    (0x0018, 0x1014): "TimeOfSecondaryCapture",
+    (0x0018, 0x1200): "DateOfLastCalibration",
+    (0x0018, 0x1201): "TimeOfLastCalibration",
+    (0x0032, 0x1000): "ScheduledStudyStartDate",
+    (0x0032, 0x1010): "ScheduledStudyStopDate",
+    (0x0032, 0x1040): "StudyArrivalDate",
+    (0x0032, 0x1050): "StudyCompletionDate",
+    (0x0038, 0x0020): "AdmittingDate",
+    (0x0038, 0x0021): "AdmittingTime",
+    (0x0038, 0x0030): "DischargeDate",
+    (0x0040, 0x0002): "ScheduledProcedureStepStartDate",
+    (0x0040, 0x0003): "ScheduledProcedureStepStartTime",
+    (0x0040, 0x0004): "ScheduledProcedureStepEndDate",
+    (0x0040, 0x0005): "ScheduledProcedureStepEndTime",
+    (0x0040, 0x0244): "PerformedProcedureStepStartDate",
+    (0x0040, 0x0245): "PerformedProcedureStepStartTime",
+    (0x0040, 0x0250): "PerformedProcedureStepEndDate",
+    (0x0040, 0x0251): "PerformedProcedureStepEndTime",
+    (0x0040, 0x2004): "IssueDateOfImagingServiceRequest",
+    (0x0040, 0xA030): "VerificationDateTime",
+    (0x0040, 0xA120): "DateTime",
+    (0x0040, 0xA121): "Date",
+    (0x0040, 0xA122): "Time",
+}
+
 DEID_FIX_INVALID_UIDS = True
+
+SUPPRESS_PYDICOM_READ_VALIDATION_WARNINGS = True
+
+SUPPRESS_PYDICOM_WRITE_VALIDATION_WARNINGS = False
+
+DEID_VERIFY_UIDS_AFTER_FIX = True
 
 DEID_SYNC_FILE_META = True
 
@@ -349,6 +407,39 @@ def _safe_show_status(msg: str, ms: int = 2000):
 
 
 _UID_COMPONENT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
+
+_PYDICOM_VALIDATION_CONFIGURED = False
+
+
+def _configure_pydicom_validation():
+    """Quieten pydicom's read-time UI validator (see the note on the flag)."""
+    global _PYDICOM_VALIDATION_CONFIGURED
+    if _PYDICOM_VALIDATION_CONFIGURED:
+        return
+    _PYDICOM_VALIDATION_CONFIGURED = True
+
+    try:
+        import pydicom
+        from pydicom import config as pdconfig
+
+        settings = getattr(pdconfig, "settings", None)
+        if settings is not None:
+            if SUPPRESS_PYDICOM_READ_VALIDATION_WARNINGS:
+                settings.reading_validation_mode = pdconfig.IGNORE
+            if SUPPRESS_PYDICOM_WRITE_VALIDATION_WARNINGS:
+                settings.writing_validation_mode = pdconfig.IGNORE
+        elif SUPPRESS_PYDICOM_READ_VALIDATION_WARNINGS:
+            pdconfig.enforce_valid_values = False
+    except Exception:
+        pass
+
+    if SUPPRESS_PYDICOM_READ_VALIDATION_WARNINGS:
+        try:
+            warnings.filterwarnings(
+                "ignore", message=r".*Invalid value for VR.*", category=UserWarning)
+        except Exception:
+            pass
 
 
 def _uid_is_valid(value) -> bool:
@@ -2355,6 +2446,7 @@ class DicomProcessor:
         self._prescreen_skipped = 0
         self._detect_calls = 0
         self._warned_unknown_conf = False
+        _configure_pydicom_validation()
         try:
             if ENABLE_TEXT_DETECTION:
                 logging.getLogger(__name__).info(
@@ -3099,6 +3191,8 @@ class DicomProcessor:
 
     def load_scan(self, path):
         import pydicom
+
+        _configure_pydicom_validation()
         p = Path(path)
         if p.is_file():
             return pydicom.dcmread(str(p), force=True)
@@ -3365,7 +3459,103 @@ class DicomProcessor:
         return uid_dict[s]
 
     def _current_date_da(self):
+        """The anonymization date, as DICOM DA (YYYYMMDD)."""
+        fixed = str(DEID_ANONYMIZATION_DATE or "").strip()
+        if len(fixed) == 8 and fixed.isdigit():
+            return fixed
         return datetime.now().strftime("%Y%m%d")
+
+    @staticmethod
+    def _parse_da(value):
+        """Parse a DICOM DA value into a date, or None."""
+        try:
+            s = "".join(ch for ch in str(value or "") if ch.isdigit())
+            if len(s) < 8:
+                return None
+            return datetime.strptime(s[:8], "%Y%m%d").date()
+        except Exception:
+            return None
+
+    def _compute_age_string(self, birth_date_value, study_date_value):
+        """Age at the exam as a DICOM AS value (e.g. '067Y'), capped per Safe Harbor."""
+        birth = self._parse_da(birth_date_value)
+        exam = self._parse_da(study_date_value)
+        if birth is None or exam is None or exam < birth:
+            return None
+
+        years = exam.year - birth.year
+        if (exam.month, exam.day) < (birth.month, birth.day):
+            years -= 1
+        if years < 0:
+            return None
+        if years > int(DEID_MAX_AGE_YEARS):
+            years = int(DEID_MAX_AGE_YEARS)
+        return "%03dY" % years
+
+    def _replace_all_dates(self, ds):
+        """Rewrite every DA/DT element to the anonymization date.
+
+        A VR-driven sweep rather than a fixed tag list, so private and vendor
+        date tags are covered too. Returns (n_changed, names_changed).
+        """
+        today = self._current_date_da()
+        changed = [0]
+        names = set()
+
+        def fix_da(value):
+            if isinstance(value, (list, tuple)):
+                return [today for _ in value]
+            return today
+
+        def fix_dt(value):
+            def one(v):
+                s = str(v or "").strip()
+                return today + s[8:] if len(s) > 8 else today
+            if isinstance(value, (list, tuple)):
+                return [one(v) for v in value]
+            return one(value)
+
+        def fix_tm(value):
+            if str(DEID_TIME_POLICY).lower() != "zero":
+                return None
+            if isinstance(value, (list, tuple)):
+                return ["000000.00" for _ in value]
+            return "000000.00"
+
+        def walk(dataset):
+            for elem in list(dataset):
+                try:
+                    if elem.VR == "SQ":
+                        for item in elem.value:
+                            walk(item)
+                        continue
+                    if elem.value is None:
+                        continue
+
+                    if elem.VR == "DA":
+                        new_val = fix_da(elem.value)
+                    elif elem.VR == "DT":
+                        new_val = fix_dt(elem.value)
+                    elif elem.VR == "TM":
+                        new_val = fix_tm(elem.value)
+                    else:
+                        continue
+
+                    if new_val is None:
+                        continue
+                    if str(elem.value) == str(new_val):
+                        continue
+
+                    elem.value = new_val
+                    changed[0] += 1
+                    tag = (elem.tag.group, elem.tag.element)
+                    names.add(DATE_TIME_TAGS_OF_INTEREST.get(
+                        tag, "(%04X,%04X)" % tag))
+                except Exception:
+                    continue
+
+        walk(ds)
+        return changed[0], names
 
     def _replace_dt_date_preserve_time(self, original_value):
         """Return DICOM DT with today's date and the original time component.
@@ -3498,7 +3688,47 @@ class DicomProcessor:
         if fm is not None:
             walk(fm)
 
+        if DEID_VERIFY_UIDS_AFTER_FIX:
+            leftover = self._find_invalid_uids(ds)
+            if leftover:
+                try:
+                    self.logger.warning(
+                        "UID repair incomplete: %d value(s) still invalid %s"
+                        % (len(leftover), leftover[:5]))
+                except Exception:
+                    pass
+
         return fixed[0]
+
+    def _find_invalid_uids(self, ds):
+        """List any UI values that are still non-conformant after repair."""
+        bad = []
+
+        def walk(dataset):
+            for elem in list(dataset):
+                try:
+                    if elem.VR == "SQ":
+                        for item in elem.value:
+                            walk(item)
+                        continue
+                    if elem.VR != "UI" or elem.value is None:
+                        continue
+                    if (elem.tag.group, elem.tag.element) in UID_TAGS_NEVER_REMAPPED:
+                        continue
+                    vals = (list(elem.value)
+                            if isinstance(elem.value, (list, tuple))
+                            else [elem.value])
+                    for v in vals:
+                        if not _uid_is_valid(v):
+                            bad.append(str(v))
+                except Exception:
+                    continue
+
+        walk(ds)
+        fm = getattr(ds, "file_meta", None)
+        if fm is not None:
+            walk(fm)
+        return bad
 
     def _sync_file_meta(self, ds):
         """Bring group 0002 into line with the de-identified dataset.
@@ -3645,6 +3875,9 @@ class DicomProcessor:
         redact_count = 0
         unmasked_count = 0
         verify_fail_count = 0
+        date_fix_count = 0
+        date_tag_names = set()
+        age_capped_count = 0
         png_detected = 0
         png_no_text = 0
         png_prescreen = 0
@@ -3700,7 +3933,44 @@ class DicomProcessor:
                     else:
                         ds[(0x0008, 0x0050)].value = id
 
+                    age_str = None
+                    orig_study_date = None
+                    if DEID_PRESERVE_PATIENT_AGE:
+                        try:
+                            orig_study_date = getattr(ds, "StudyDate", None)
+                            age_str = self._compute_age_string(
+                                getattr(ds, "PatientBirthDate", None), orig_study_date)
+                            if age_str is None:
+                                existing = str(getattr(ds, "PatientAge", "") or "").strip()
+                                if existing:
+                                    age_str = existing
+                        except Exception:
+                            age_str = None
+
                     self._anonymize_dataset_recursive(ds, patient_id_value=id)
+
+                    if DEID_REPLACE_ALL_DATES:
+                        n_dates, date_names = self._replace_all_dates(ds)
+                        if n_dates:
+                            date_fix_count += n_dates
+                            date_tag_names.update(date_names)
+
+                    if DEID_PRESERVE_PATIENT_AGE and age_str:
+                        try:
+                            capped = age_str
+                            try:
+                                yrs = int(str(age_str)[:3])
+                                if str(age_str).upper().endswith("Y") and yrs > int(DEID_MAX_AGE_YEARS):
+                                    capped = "%03dY" % int(DEID_MAX_AGE_YEARS)
+                                    age_capped_count += 1
+                            except Exception:
+                                pass
+                            if (0x0010, 0x1010) in ds:
+                                ds[(0x0010, 0x1010)].value = capped
+                            else:
+                                ds.add_new((0x0010, 0x1010), "AS", capped)
+                        except Exception:
+                            pass
 
                     if DEID_FIX_INVALID_UIDS:
                         n_fixed = self._fix_invalid_uids(ds)
@@ -4027,6 +4297,21 @@ class DicomProcessor:
                         "[%s] %d slice(s) still contain detected text. Review "
                         "only_for_debug/%s before release."
                         % (id, unmasked_count, OCR_DEBUG_DETECTED_DIRNAME))
+
+            if date_fix_count:
+                shown = ", ".join(sorted(date_tag_names)[:10])
+                more = len(date_tag_names) - 10
+                self.logger.info(
+                    "[%s] dates: %d value(s) across %d tag(s) replaced with the "
+                    "anonymization date %s [%s%s]; time policy=%s."
+                    % (id, date_fix_count, len(date_tag_names),
+                       self._current_date_da(), shown,
+                       (" +%d more" % more) if more > 0 else "",
+                       DEID_TIME_POLICY))
+            if age_capped_count:
+                self.logger.info(
+                    "[%s] %d slice(s) had PatientAge capped at %dY (Safe Harbor)."
+                    % (id, age_capped_count, int(DEID_MAX_AGE_YEARS)))
 
             if uid_fix_count:
                 self.logger.info(
