@@ -32,6 +32,8 @@ warnings.filterwarnings("ignore")
 
 ENABLE_TEXT_DETECTION = True
 
+ALWAYS_EXAMINE_ALL_SLICES = False
+
 FLORENCE_RUN_IN_SUBPROCESS = True
 
 FLORENCE_WORKER_PYTHON = ""
@@ -147,7 +149,7 @@ REDACT_BORDER_BAND_FRAC = 0.18
 
 REDACT_GEOMETRY = "exact"
 
-REDACT_EXACT_PAD_PX = 6
+REDACT_EXACT_PAD_PX = 0
 
 OCR_DEBUG_DRAW_MASK_RECTS = True
 
@@ -163,7 +165,7 @@ REDACT_SWEEP_MIN_CHARS_PER_LINE = 2
 REDACT_EXPAND_TO_LINE = True
 REDACT_LINE_EXTRA_PX = 12
 
-REDACT_VERIFY_WITH_SECOND_PASS = True
+REDACT_VERIFY_WITH_SECOND_PASS = False
 
 REDACT_VERIFY_ON_FAILURE = "warn"
 OCR_DEBUG_VERIFY_FAIL_DIRNAME = "text_after_redaction"
@@ -224,6 +226,173 @@ DATE_TIME_TAGS_OF_INTEREST = {
     (0x0040, 0xA120): "DateTime",
     (0x0040, 0xA121): "Date",
     (0x0040, 0xA122): "Time",
+}
+
+PS315_APPLY_PROFILE = True
+
+PS315_REMOVE_OVERLAYS = True
+
+PS315_REMOVE_ICON_IMAGE_SEQUENCE = True
+
+PS315_DESCRIPTOR_POLICY = "blank"
+
+PS315_ORDER_ENTRY_TAGS_TO_REMOVE = {
+    (0x0008, 0x0051): "IssuerOfAccessionNumberSequence",
+    (0x0032, 0x000A): "StudyStatusID",
+    (0x0032, 0x000C): "StudyPriorityID",
+    (0x0032, 0x0012): "StudyIDIssuer",
+    (0x0032, 0x1020): "ScheduledStudyLocation",
+    (0x0032, 0x1021): "ScheduledStudyLocationAETitle",
+    (0x0032, 0x1030): "ReasonForStudy",
+    (0x0032, 0x1031): "RequestingPhysicianIdentificationSequence",
+    (0x0032, 0x1032): "RequestingPhysician",
+    (0x0032, 0x1033): "RequestingService",
+    (0x0032, 0x1034): "RequestingServiceCodeSequence",
+    (0x0032, 0x1040): "StudyArrivalDate",
+    (0x0032, 0x1041): "StudyArrivalTime",
+    (0x0032, 0x1050): "StudyCompletionDate",
+    (0x0032, 0x1051): "StudyCompletionTime",
+    (0x0032, 0x1055): "StudyComponentStatusID",
+    (0x0032, 0x1060): "RequestedProcedureDescription",
+    (0x0032, 0x1064): "RequestedProcedureCodeSequence",
+    (0x0032, 0x1070): "RequestedContrastAgent",
+    (0x0032, 0x4000): "StudyComments",
+    (0x0038, 0x0004): "ReferencedPatientAliasSequence",
+    (0x0038, 0x001A): "ScheduledAdmissionDate",
+    (0x0038, 0x001B): "ScheduledAdmissionTime",
+    (0x0038, 0x001C): "ScheduledDischargeDate",
+    (0x0038, 0x001D): "ScheduledDischargeTime",
+    (0x0038, 0x001E): "ScheduledPatientInstitutionResidence",
+    (0x0038, 0x011A): "RouteOfAdmissions",
+    (0x0038, 0x0060): "ServiceEpisodeID",
+    (0x0038, 0x0062): "ServiceEpisodeDescription",
+    (0x0038, 0x0064): "IssuerOfServiceEpisodeID",
+    (0x0038, 0x0100): "PertinentDocumentsSequence",
+    (0x0038, 0x4000): "VisitComments",
+    (0x0040, 0x0001): "ScheduledStationAETitle",
+    (0x0040, 0x0010): "ScheduledStationName",
+    (0x0040, 0x0011): "ScheduledProcedureStepLocation",
+    (0x0040, 0x0012): "PreMedication",
+    (0x0040, 0x1001): "RequestedProcedureID",
+    (0x0040, 0x1002): "ReasonForRequestedProcedure",
+    (0x0040, 0x1004): "PatientTransportArrangements",
+    (0x0040, 0x1005): "RequestedProcedureLocation",
+    (0x0040, 0x1010): "NamesOfIntendedRecipientsOfResults",
+    (0x0040, 0x1011): "IntendedRecipientsOfResultsIdentificationSequence",
+    (0x0040, 0x1101): "PersonIdentificationCodeSequence",
+    (0x0040, 0x1102): "PersonAddress",
+    (0x0040, 0x1103): "PersonTelephoneNumbers",
+    (0x0040, 0x1400): "RequestedProcedureComments",
+    (0x0040, 0x2008): "OrderEnteredBy",
+    (0x0040, 0x2009): "OrderEntererLocation",
+    (0x0040, 0x2010): "OrderCallbackPhoneNumber",
+    (0x0040, 0x2016): "PlacerOrderNumberImagingServiceRequest",
+    (0x0040, 0x2017): "FillerOrderNumberImagingServiceRequest",
+    (0x0040, 0x3001): "ConfidentialityConstraint",
+}
+
+PS315_EXTRA_IDENTIFIERS_TO_REMOVE = {
+    (0x0010, 0x1060): "PatientMotherBirthName",
+    (0x0010, 0x2180): "Occupation",
+    (0x0010, 0x21A0): "SmokingStatus",
+    (0x0010, 0x21D0): "LastMenstrualDate",
+    (0x0010, 0x21F0): "PatientReligiousPreference",
+    (0x0040, 0x0241): "PerformedStationAETitle",
+    (0x0040, 0x0243): "PerformedLocation",
+    (0x0040, 0x0251): "PerformedProcedureStepEndTime",
+    (0x0040, 0x0253): "PerformedProcedureStepID",
+    (0x0040, 0x0555): "AcquisitionContextSequence",
+}
+
+PS315_REMOVE_ETHNIC_GROUP = False
+
+PS315_DELETE_EMPTIED_SEQUENCES = True
+
+PS315_DESCRIPTOR_TAGS = {
+    (0x0008, 0x1030): "StudyDescription",
+    (0x0008, 0x103E): "SeriesDescription",
+    (0x0008, 0x0080): "InstitutionName",
+    (0x0008, 0x0081): "InstitutionAddress",
+    (0x0008, 0x1040): "InstitutionalDepartmentName",
+    (0x0008, 0x1080): "AdmittingDiagnosesDescription",
+    (0x0008, 0x1084): "AdmittingDiagnosesCodeSequence",
+    (0x0008, 0x2111): "DerivationDescription",
+    (0x0008, 0x4000): "IdentifyingComments",
+    (0x0010, 0x2000): "MedicalAlerts",
+    (0x0010, 0x2110): "Allergies",
+    (0x0010, 0x21B0): "AdditionalPatientHistory",
+    (0x0010, 0x4000): "PatientComments",
+    (0x0018, 0x1030): "ProtocolName",
+    (0x0018, 0x1400): "AcquisitionDeviceProcessingDescription",
+    (0x0018, 0x4000): "AcquisitionComments",
+    (0x0018, 0x9424): "AcquisitionProtocolDescription",
+    (0x0020, 0x4000): "ImageComments",
+    (0x0028, 0x4000): "ImagePresentationComments",
+    (0x0032, 0x1030): "ReasonForStudy",
+    (0x0032, 0x1060): "RequestedProcedureDescription",
+    (0x0032, 0x4000): "StudyComments",
+    (0x0038, 0x0040): "DischargeDiagnosisDescription",
+    (0x0038, 0x0500): "PatientState",
+    (0x0038, 0x4000): "VisitComments",
+    (0x0040, 0x0007): "ScheduledProcedureStepDescription",
+    (0x0040, 0x0254): "PerformedProcedureStepDescription",
+    (0x0040, 0x0280): "CommentsOnPerformedProcedureStep",
+    (0x0040, 0x1400): "RequestedProcedureComments",
+    (0x0040, 0x2001): "ReasonForImagingServiceRequest",
+    (0x0040, 0x2400): "ImagingServiceRequestComments",
+    (0x0040, 0x3001): "ConfidentialityConstraint",
+    (0x4008, 0x0300): "Impressions",
+    (0x4008, 0x011A): "InterpretationText",
+}
+
+PS315_PROFILE_CODES = [
+    ("113100", "Basic Application Confidentiality Profile", True),
+    ("113101", "Clean Pixel Data Option", True),
+    ("113102", "Clean Recognizable Visual Features Option", True),
+    ("113105", "Clean Descriptors Option", None),
+    ("113108", "Retain Patient Characteristics Option", None),
+]
+
+PS315_METHOD_TEXT = "HeadCTDeid PS3.15 Basic+CleanPixel+CleanDesc+Deface"
+
+DEID_PN_DUMMY = "Anonymous^Anonymous"
+DEID_TEXT_DUMMY = "anonymous"
+
+PS315_RUN_QC = True
+PS315_QC_CSV_NAME = "global_ps315_qc_findings.csv"
+
+PS315_QC_MUST_BE_ABSENT = dict(PS315_ORDER_ENTRY_TAGS_TO_REMOVE)
+PS315_QC_MUST_BE_ABSENT.update(PS315_EXTRA_IDENTIFIERS_TO_REMOVE)
+
+PS315_QC_DUMMY_VALUES = {
+    "anonymous",
+    "anonymous^anonymous",
+    "processed for anonymization",
+    "anonymized",
+    "unknown",
+    "none",
+    "removed",
+    "000y",
+    "0",
+    "000000",
+    "000000.000000",
+    "--------",
+}
+
+PS315_QC_MUST_BE_EMPTY = {
+    (0x0010, 0x0010): "PatientName",
+    (0x0008, 0x0090): "ReferringPhysicianName",
+    (0x0008, 0x1050): "PerformingPhysicianName",
+    (0x0008, 0x1070): "OperatorsName",
+    (0x0008, 0x1048): "PhysiciansOfRecord",
+    (0x0008, 0x0050): "AccessionNumber",
+    (0x0010, 0x1000): "OtherPatientIDs",
+    (0x0010, 0x1001): "OtherPatientNames",
+    (0x0010, 0x1040): "PatientAddress",
+    (0x0010, 0x2154): "PatientTelephoneNumbers",
+    (0x0038, 0x0300): "CurrentPatientLocation",
+    (0x0008, 0x0080): "InstitutionName",
+    (0x0008, 0x0081): "InstitutionAddress",
 }
 
 DEID_FIX_INVALID_UIDS = True
@@ -442,6 +611,22 @@ def _configure_pydicom_validation():
             pass
 
 
+def _is_dummy_value(value, extra=None) -> bool:
+    """True when a value is a placeholder this module wrote on purpose."""
+    s = str(value if value is not None else "").strip().lower()
+    if not s:
+        return True
+    if s in PS315_QC_DUMMY_VALUES:
+        return True
+    if s.startswith("anon"):
+        return True
+    if set(s) <= set("^ -_."):
+        return True
+    if extra and s in extra:
+        return True
+    return False
+
+
 def _uid_is_valid(value) -> bool:
     """DICOM PS3.5 section 9.1 UID syntax check.
 
@@ -449,7 +634,9 @@ def _uid_is_valid(value) -> bool:
     component with a leading zero unless that component is a single "0".
     """
     s = str(value if value is not None else "").strip()
-    if not s or len(s) > 64:
+    if not s:
+        return True
+    if len(s) > 64:
         return False
     return all(_UID_COMPONENT_RE.match(part) for part in s.split("."))
 
@@ -2321,6 +2508,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         os.makedirs(after_deidentification_render_dir, exist_ok=True)
 
         global_drop_csv_path = os.path.join(out_path, GLOBAL_DROPPED_CSV_NAME)
+        global_qc_csv_path = os.path.join(out_path, PS315_QC_CSV_NAME)
         self._init_global_drop_csv(global_drop_csv_path)
 
         ocr_debug_root = os.path.join(out_path, OCR_DEBUG_ROOT_DIRNAME)
@@ -2372,6 +2560,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     name=f"Processed for Anonymization {id_mapping[foldername]}",
                     remove_CTA=remove_CTA,
                     global_drop_csv_path=global_drop_csv_path,
+                    global_qc_csv_path=global_qc_csv_path,
                     global_detected_png_dir=ocr_detected_dir,
                     global_no_text_png_dir=ocr_no_text_dir,
                     global_redacted_png_dir=ocr_redacted_dir,
@@ -2446,6 +2635,8 @@ class DicomProcessor:
         self._prescreen_skipped = 0
         self._detect_calls = 0
         self._warned_unknown_conf = False
+        self._uid_repair_failures = 0
+        self._uid_repair_examples = set()
         _configure_pydicom_validation()
         try:
             if ENABLE_TEXT_DETECTION:
@@ -3610,11 +3801,11 @@ class DicomProcessor:
             return
 
         if vr == "PN":
-            ds[tag].value = "anonymous"
+            ds[tag].value = DEID_PN_DUMMY
             return
 
         if vr in {"LO", "SH", "ST", "LT", "UT", "CS", "AE"}:
-            ds[tag].value = "anonymous"
+            ds[tag].value = DEID_TEXT_DUMMY
             return
 
         if vr in {"IS", "DS", "US", "UL", "SS", "SL", "FL", "FD"}:
@@ -3691,14 +3882,260 @@ class DicomProcessor:
         if DEID_VERIFY_UIDS_AFTER_FIX:
             leftover = self._find_invalid_uids(ds)
             if leftover:
-                try:
-                    self.logger.warning(
-                        "UID repair incomplete: %d value(s) still invalid %s"
-                        % (len(leftover), leftover[:5]))
-                except Exception:
-                    pass
+                self._uid_repair_failures += len(leftover)
+                for v in leftover[:3]:
+                    self._uid_repair_examples.add(str(v)[:60])
 
         return fixed[0]
+
+    def _apply_ps315_profile(self, ds):
+        """Apply the PS3.15 pieces the tag list alone does not cover.
+
+        Returns a dict of counts so the caller can report what was done.
+        """
+        stats = {"overlays": 0, "icons": 0, "descriptors": 0, "curves": 0,
+                 "order_entry": 0, "extra_identifiers": 0}
+        if not PS315_APPLY_PROFILE:
+            return stats
+
+        try:
+            for elem in list(ds):
+                try:
+                    g = elem.tag.group
+                    if PS315_REMOVE_OVERLAYS and 0x6000 <= g <= 0x601E and g % 2 == 0:
+                        del ds[elem.tag]
+                        stats["overlays"] += 1
+                    elif g & 0xFF00 == 0x5000:
+                        del ds[elem.tag]
+                        stats["curves"] += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        try:
+            extra = dict(PS315_EXTRA_IDENTIFIERS_TO_REMOVE)
+            if PS315_REMOVE_ETHNIC_GROUP:
+                extra[(0x0010, 0x2160)] = "EthnicGroup"
+
+            def strip_extra(dataset, depth=0):
+                for elem in list(dataset):
+                    try:
+                        tag = (elem.tag.group, elem.tag.element)
+                        if tag in extra:
+                            del dataset[elem.tag]
+                            stats["extra_identifiers"] += 1
+                            continue
+                        if elem.VR == "SQ" and elem.value is not None and depth < 8:
+                            for item in elem.value:
+                                strip_extra(item, depth + 1)
+                    except Exception:
+                        continue
+            strip_extra(ds)
+        except Exception:
+            pass
+
+        try:
+            def strip_order(dataset, depth=0):
+                for elem in list(dataset):
+                    try:
+                        tag = (elem.tag.group, elem.tag.element)
+                        if tag in PS315_ORDER_ENTRY_TAGS_TO_REMOVE:
+                            del dataset[elem.tag]
+                            stats["order_entry"] += 1
+                            continue
+                        if elem.VR == "SQ" and elem.value is not None and depth < 8:
+                            for item in elem.value:
+                                strip_order(item, depth + 1)
+                    except Exception:
+                        continue
+            strip_order(ds)
+        except Exception:
+            pass
+
+        if PS315_REMOVE_ICON_IMAGE_SEQUENCE:
+            def strip_icons(dataset):
+                for elem in list(dataset):
+                    try:
+                        if (elem.tag.group, elem.tag.element) == (0x0088, 0x0200):
+                            del dataset[elem.tag]
+                            stats["icons"] += 1
+                            continue
+                        if elem.VR == "SQ" and elem.value is not None:
+                            for item in elem.value:
+                                strip_icons(item)
+                    except Exception:
+                        continue
+            try:
+                strip_icons(ds)
+            except Exception:
+                pass
+
+        if str(PS315_DESCRIPTOR_POLICY).lower() == "blank":
+            def clean_desc(dataset):
+                for elem in list(dataset):
+                    try:
+                        tag = (elem.tag.group, elem.tag.element)
+                        if elem.VR == "SQ" and elem.value is not None:
+                            if tag in PS315_DESCRIPTOR_TAGS:
+                                if PS315_DELETE_EMPTIED_SEQUENCES:
+                                    del dataset[elem.tag]
+                                else:
+                                    elem.value = []
+                                stats["descriptors"] += 1
+                            else:
+                                for item in elem.value:
+                                    clean_desc(item)
+                            continue
+                        if tag in PS315_DESCRIPTOR_TAGS:
+                            if elem.value not in (None, ""):
+                                elem.value = ""
+                                stats["descriptors"] += 1
+                    except Exception:
+                        continue
+            try:
+                clean_desc(ds)
+            except Exception:
+                pass
+
+        self._set_deidentification_attributes(ds)
+        return stats
+
+    def _set_deidentification_attributes(self, ds):
+        """Declare the profile in (0012,0062/0063/0064), as PS3.15 requires."""
+        try:
+            from pydicom.dataset import Dataset
+            from pydicom.sequence import Sequence
+        except Exception:
+            return
+
+        try:
+            if (0x0012, 0x0062) in ds:
+                ds[(0x0012, 0x0062)].value = "YES"
+            else:
+                ds.add_new((0x0012, 0x0062), "CS", "YES")
+        except Exception:
+            pass
+
+        try:
+            if (0x0012, 0x0063) in ds:
+                ds[(0x0012, 0x0063)].value = PS315_METHOD_TEXT
+            else:
+                ds.add_new((0x0012, 0x0063), "LO", PS315_METHOD_TEXT)
+        except Exception:
+            pass
+
+        active = []
+        for code, meaning, always in PS315_PROFILE_CODES:
+            if always is True:
+                active.append((code, meaning))
+            elif code == "113105":
+                if str(PS315_DESCRIPTOR_POLICY).lower() == "blank":
+                    active.append((code, meaning))
+            elif code == "113108":
+                if DEID_PRESERVE_PATIENT_AGE:
+                    active.append((code, meaning))
+
+        try:
+            items = []
+            for code, meaning in active:
+                item = Dataset()
+                item.CodeValue = code
+                item.CodingSchemeDesignator = "DCM"
+                item.CodeMeaning = meaning
+                items.append(item)
+            if (0x0012, 0x0064) in ds:
+                ds[(0x0012, 0x0064)].value = Sequence(items)
+            else:
+                ds.add_new((0x0012, 0x0064), "SQ", Sequence(items))
+        except Exception:
+            pass
+
+    def _ps315_qc_report(self, ds):
+        """DICOMQC-style self check on the de-identified dataset."""
+        findings = []
+        if not PS315_RUN_QC:
+            return findings
+
+        def add(kind, tag, name, detail):
+            findings.append({
+                "finding": kind,
+                "tag": ("(%04X,%04X)" % tag) if tag else "",
+                "name": name,
+                "detail": str(detail)[:120],
+            })
+
+        for tag, name in PS315_QC_MUST_BE_ABSENT.items():
+            try:
+                if tag in ds:
+                    add("tag_not_removed", tag, name, ds[tag].value)
+            except Exception:
+                continue
+
+        known_ids = set()
+        try:
+            for t in ((0x0010, 0x0020), (0x0020, 0x0010)):
+                if t in ds and ds[t].value:
+                    known_ids.add(str(ds[t].value).strip().lower())
+        except Exception:
+            pass
+
+        for tag, name in PS315_QC_MUST_BE_EMPTY.items():
+            try:
+                if tag in ds and not _is_dummy_value(ds[tag].value, known_ids):
+                    add("value_not_removed", tag, name, ds[tag].value)
+            except Exception:
+                continue
+
+        def walk(dataset, depth=0):
+            for elem in list(dataset):
+                try:
+                    tag = (elem.tag.group, elem.tag.element)
+                    if elem.tag.group % 2 == 1:
+                        add("private_tag_present", tag, "private", elem.VR)
+                    elif 0x6000 <= elem.tag.group <= 0x601E:
+                        add("overlay_present", tag, "overlay", elem.VR)
+                    elif elem.tag.group & 0xFF00 == 0x5000:
+                        add("curve_present", tag, "curve", elem.VR)
+                    elif tag == (0x0088, 0x0200):
+                        add("icon_image_present", tag, "IconImageSequence", "SQ")
+
+                    if elem.VR == "UI" and elem.value is not None \
+                            and tag not in UID_TAGS_NEVER_REMAPPED:
+                        vals = (list(elem.value)
+                                if isinstance(elem.value, (list, tuple)) else [elem.value])
+                        for v in vals:
+                            if not _uid_is_valid(v):
+                                add("invalid_uid", tag, "UID", v)
+
+                    if elem.VR == "SQ" and elem.value is not None and depth < 8:
+                        for item in elem.value:
+                            walk(item, depth + 1)
+                except Exception:
+                    continue
+
+        walk(ds)
+        fm = getattr(ds, "file_meta", None)
+        if fm is not None:
+            try:
+                for elem in list(fm):
+                    tag = (elem.tag.group, elem.tag.element)
+                    if elem.VR == "UI" and tag not in UID_TAGS_NEVER_REMAPPED:
+                        if not _uid_is_valid(elem.value):
+                            add("invalid_uid_file_meta", tag, "file_meta UID", elem.value)
+            except Exception:
+                pass
+
+        try:
+            if (0x0012, 0x0062) not in ds or str(ds[(0x0012, 0x0062)].value).upper() != "YES":
+                add("missing_declaration", (0x0012, 0x0062), "PatientIdentityRemoved", "")
+            if (0x0012, 0x0064) not in ds:
+                add("missing_declaration", (0x0012, 0x0064),
+                    "DeidentificationMethodCodeSequence", "")
+        except Exception:
+            pass
+
+        return findings
 
     def _find_invalid_uids(self, ds):
         """List any UI values that are still non-conformant after repair."""
@@ -3791,6 +4228,26 @@ class DicomProcessor:
 
         recurse(ds)
 
+    def _append_qc_rows(self, csv_path, rows):
+        """Write PS3.15 QC findings. An empty file means the run passed."""
+        if not csv_path or not rows:
+            return
+        try:
+            file_exists = os.path.exists(csv_path)
+            with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                fieldnames = ["timestamp", "patient_new_id", "series_folder",
+                              "source_filename", "finding", "tag", "name", "detail"]
+                w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if not file_exists:
+                    w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+        except Exception as e:
+            try:
+                self.logger.error(f"Failed to write QC CSV: {e}")
+            except Exception:
+                pass
+
     def _append_global_drop_rows(self, csv_path, rows):
         if not csv_path or not rows:
             return
@@ -3840,6 +4297,7 @@ class DicomProcessor:
         new_patient_id="Processed for anonymization",
         remove_CTA=False,
         global_drop_csv_path=None,
+        global_qc_csv_path=None,
         global_detected_png_dir=None,
         global_no_text_png_dir=None,
         global_redacted_png_dir=None,
@@ -3857,6 +4315,7 @@ class DicomProcessor:
         errors = []
 
         dropped_rows = []
+        qc_rows = []
 
         def _instnum(path):
             try:
@@ -3877,6 +4336,12 @@ class DicomProcessor:
         verify_fail_count = 0
         date_fix_count = 0
         date_tag_names = set()
+        ps315_overlays = 0
+        ps315_curves = 0
+        ps315_order = 0
+        ps315_extra = 0
+        ps315_icons = 0
+        ps315_descriptors = 0
         age_capped_count = 0
         png_detected = 0
         png_no_text = 0
@@ -3980,13 +4445,33 @@ class DicomProcessor:
                     if DEID_SYNC_FILE_META:
                         self._sync_file_meta(ds)
 
+                    if PS315_APPLY_PROFILE:
+                        st = self._apply_ps315_profile(ds)
+                        ps315_overlays += st["overlays"]
+                        ps315_curves += st["curves"]
+                        ps315_order += st["order_entry"]
+                        ps315_extra += st["extra_identifiers"]
+                        ps315_icons += st["icons"]
+                        ps315_descriptors += st["descriptors"]
+
+                    if PS315_RUN_QC:
+                        for f in self._ps315_qc_report(ds):
+                            f.update({
+                                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                "patient_new_id": id,
+                                "series_folder": os.path.basename(original_dir),
+                                "source_filename": fname,
+                            })
+                            qc_rows.append(f)
+
                     pixels_hu = self.get_pixels_hu(ds)
 
                     redact_rects = []
                     forced_keep = False
                     was_prescreen_skipped = False
 
-                    want_detect = ENABLE_TEXT_DETECTION and (self._force_ocr_all or burned_flag)
+                    want_detect = ENABLE_TEXT_DETECTION and (
+                        ALWAYS_EXAMINE_ALL_SLICES or self._force_ocr_all or burned_flag)
                     if want_detect:
                         _skipped_before = self._prescreen_skipped
                         (has_text, hit_txt, hit_conf, hit_bbox, gray8,
@@ -4261,7 +4746,7 @@ class DicomProcessor:
                         "[%s] PNG/action mismatch: %d slice(s) with text but "
                         "%d redacted + %d dropped + %d unmasked."
                         % (id, png_detected, redact_count, drop_count, unmasked_count))
-                if png_not_examined:
+                if png_not_examined and not ALWAYS_EXAMINE_ALL_SLICES:
                     self.logger.warning(
                         "[%s] %d slice(s) were NOT examined for burned-in text "
                         "(detection runs only when the de-identify option is on or "
@@ -4297,6 +4782,23 @@ class DicomProcessor:
                         "[%s] %d slice(s) still contain detected text. Review "
                         "only_for_debug/%s before release."
                         % (id, unmasked_count, OCR_DEBUG_DETECTED_DIRNAME))
+
+            if (ps315_overlays or ps315_curves or ps315_icons
+                    or ps315_descriptors or ps315_order or ps315_extra):
+                self.logger.info(
+                    "[%s] PS3.15: removed %d overlay element(s), %d curve element(s), "
+                    "%d icon image sequence(s), %d order-entry attribute(s), "
+                    "%d extra identifier(s), blanked %d free-text descriptor(s)."
+                    % (id, ps315_overlays, ps315_curves, ps315_icons,
+                       ps315_order, ps315_extra, ps315_descriptors))
+
+            if self._uid_repair_failures:
+                self.logger.warning(
+                    "[%s] %s: %d UID value(s) could not be repaired, e.g. %s"
+                    % (id, os.path.basename(original_dir), self._uid_repair_failures,
+                       sorted(self._uid_repair_examples)[:3]))
+                self._uid_repair_failures = 0
+                self._uid_repair_examples = set()
 
             if date_fix_count:
                 shown = ", ".join(sorted(date_tag_names)[:10])
@@ -4403,6 +4905,18 @@ class DicomProcessor:
                     pass
 
             self._append_global_drop_rows(global_drop_csv_path, dropped_rows)
+            self._append_qc_rows(global_qc_csv_path, qc_rows)
+
+            if PS315_RUN_QC:
+                if qc_rows:
+                    kinds = {}
+                    for r in qc_rows:
+                        kinds[r["finding"]] = kinds.get(r["finding"], 0) + 1
+                    self.logger.warning(
+                        "[%s] PS3.15 QC: %d finding(s) %s -- see %s"
+                        % (id, len(qc_rows), kinds, PS315_QC_CSV_NAME))
+                else:
+                    self.logger.info("[%s] PS3.15 QC: no findings." % id)
 
             if tmp_root and os.path.isdir(tmp_root):
                 try:
@@ -4702,6 +5216,7 @@ print(out_png)
         name="",
         remove_CTA=False,
         global_drop_csv_path=None,
+        global_qc_csv_path=None,
         global_detected_png_dir=None,
         global_no_text_png_dir=None,
         global_redacted_png_dir=None,
@@ -4729,6 +5244,7 @@ print(out_png)
                         new_patient_id="Processed for anonymization",
                         remove_CTA=remove_CTA,
                         global_drop_csv_path=global_drop_csv_path,
+                        global_qc_csv_path=global_qc_csv_path,
                         global_detected_png_dir=global_detected_png_dir,
                         global_redacted_png_dir=global_redacted_png_dir,
                         global_verify_fail_png_dir=global_verify_fail_png_dir,
