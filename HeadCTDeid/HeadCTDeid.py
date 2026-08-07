@@ -356,6 +356,8 @@ PS315_PROFILE_CODES = [
 PS315_METHOD_TEXT = "HeadCTDeid PS3.15 Basic+CleanPixel+CleanDesc+Deface"
 
 DEID_PN_DUMMY = "Anonymous^Anonymous"
+
+DEID_PATIENT_NAME_DUMMY = DEID_PN_DUMMY
 DEID_TEXT_DUMMY = "anonymous"
 
 PS315_RUN_QC = True
@@ -411,6 +413,16 @@ UID_TAGS_NEVER_REMAPPED = {
     (0x0002, 0x0002),
     (0x0002, 0x0010),
     (0x0008, 0x0016),
+    (0x0008, 0x1150),
+}
+
+DEID_SHARE_ONE_UID_MAP = True
+
+DEID_DROP_EMPTY_SOP_REFERENCES = True
+
+SOP_REFERENCE_TYPE1_TAGS = {
+    (0x0008, 0x1150): "ReferencedSOPClassUID",
+    (0x0008, 0x1155): "ReferencedSOPInstanceUID",
 }
 
 FACE_MAX_VALUE = 50
@@ -2621,10 +2633,17 @@ class DicomProcessor:
     """
 
     def __init__(self, force_ocr_all=False):
-        self.study_uid_map = defaultdict(str)
-        self.series_uid_map = defaultdict(str)
-        self.sop_uid_map = defaultdict(str)
-        self.uid_map_general = defaultdict(str)
+        if DEID_SHARE_ONE_UID_MAP:
+            shared = defaultdict(str)
+            self.study_uid_map = shared
+            self.series_uid_map = shared
+            self.sop_uid_map = shared
+            self.uid_map_general = shared
+        else:
+            self.study_uid_map = defaultdict(str)
+            self.series_uid_map = defaultdict(str)
+            self.sop_uid_map = defaultdict(str)
+            self.uid_map_general = defaultdict(str)
 
         self.logger = logging.getLogger("PatientProcessor")
         self._force_ocr_all = bool(force_ocr_all)
@@ -3769,7 +3788,7 @@ class DicomProcessor:
             ds[tag].value = patient_id_value
             return
         if tag == (0x0010, 0x0010):
-            ds[tag].value = "Processed for anonymization"
+            ds[tag].value = DEID_PATIENT_NAME_DUMMY
             return
         if tag == (0x0008, 0x0050):
             ds[tag].value = patient_id_value
@@ -3785,6 +3804,8 @@ class DicomProcessor:
             return
 
         if vr == "UI":
+            if tag in UID_TAGS_NEVER_REMAPPED:
+                return
             if tag == (0x0020, 0x000D):
                 ds[tag].value = self._remap_uid(ds[tag].value, self.study_uid_map, generate_uid_fn)
                 return
@@ -3894,7 +3915,7 @@ class DicomProcessor:
         Returns a dict of counts so the caller can report what was done.
         """
         stats = {"overlays": 0, "icons": 0, "descriptors": 0, "curves": 0,
-                 "order_entry": 0, "extra_identifiers": 0}
+                 "order_entry": 0, "extra_identifiers": 0, "dangling_refs": 0}
         if not PS315_APPLY_PROFILE:
             return stats
 
@@ -3998,8 +4019,58 @@ class DicomProcessor:
             except Exception:
                 pass
 
+        stats["dangling_refs"] = self._drop_empty_sop_references(ds)
+
         self._set_deidentification_attributes(ds)
         return stats
+
+    def _drop_empty_sop_references(self, ds):
+        """Remove sequence items whose Type 1 reference UID is empty.
+
+        ReferencedSOPClassUID and ReferencedSOPInstanceUID are Type 1: they must
+        be present AND have a value. An item with an empty one points at nothing,
+        and dciodvfy reports it as an Error. Dropping the item is the only fix
+        that does not fabricate a reference.
+        """
+        removed = [0]
+        if not DEID_DROP_EMPTY_SOP_REFERENCES:
+            return 0
+
+        def item_is_dangling(item):
+            for tag in SOP_REFERENCE_TYPE1_TAGS:
+                try:
+                    if tag in item:
+                        v = item[tag].value
+                        if v is None or str(v).strip() == "":
+                            return True
+                except Exception:
+                    continue
+            return False
+
+        def walk(dataset, depth=0):
+            if depth > 8:
+                return
+            for elem in list(dataset):
+                try:
+                    if elem.VR != "SQ" or elem.value is None:
+                        continue
+                    keep = []
+                    for item in elem.value:
+                        if item_is_dangling(item):
+                            removed[0] += 1
+                            continue
+                        walk(item, depth + 1)
+                        keep.append(item)
+                    if len(keep) != len(elem.value):
+                        if keep:
+                            elem.value = keep
+                        else:
+                            del dataset[elem.tag]
+                except Exception:
+                    continue
+
+        walk(ds)
+        return removed[0]
 
     def _set_deidentification_attributes(self, ds):
         """Declare the profile in (0012,0062/0063/0064), as PS3.15 requires."""
@@ -4125,6 +4196,37 @@ class DicomProcessor:
                             add("invalid_uid_file_meta", tag, "file_meta UID", elem.value)
             except Exception:
                 pass
+
+        produced = set()
+        try:
+            produced = set(self.uid_map_general.values())
+        except Exception:
+            pass
+
+        def check_refs(dataset, depth=0):
+            if depth > 8:
+                return
+            for elem in list(dataset):
+                try:
+                    if elem.VR != "SQ" or elem.value is None:
+                        continue
+                    for item in elem.value:
+                        for rtag, rname in SOP_REFERENCE_TYPE1_TAGS.items():
+                            if rtag in item:
+                                v = item[rtag].value
+                                if v is None or str(v).strip() == "":
+                                    add("empty_type1_reference", rtag, rname, "")
+                        ref = (0x0008, 0x1155)
+                        if produced and ref in item:
+                            v = str(item[ref].value or "").strip()
+                            if v and v not in produced:
+                                add("unresolved_reference", ref,
+                                    "ReferencedSOPInstanceUID", v)
+                        check_refs(item, depth + 1)
+                except Exception:
+                    continue
+
+        check_refs(ds)
 
         try:
             if (0x0012, 0x0062) not in ds or str(ds[(0x0012, 0x0062)].value).upper() != "YES":
@@ -4340,6 +4442,7 @@ class DicomProcessor:
         ps315_curves = 0
         ps315_order = 0
         ps315_extra = 0
+        ps315_dangling = 0
         ps315_icons = 0
         ps315_descriptors = 0
         age_capped_count = 0
@@ -4389,9 +4492,9 @@ class DicomProcessor:
                         ds[(0x0010, 0x0020)].value = id
 
                     if (0x0010, 0x0010) not in ds:
-                        ds.add_new((0x0010, 0x0010), "PN", "Processed for anonymization")
+                        ds.add_new((0x0010, 0x0010), "PN", DEID_PATIENT_NAME_DUMMY)
                     else:
-                        ds[(0x0010, 0x0010)].value = "Processed for anonymization"
+                        ds[(0x0010, 0x0010)].value = DEID_PATIENT_NAME_DUMMY
 
                     if (0x0008, 0x0050) not in ds:
                         ds.add_new((0x0008, 0x0050), "SH", id)
@@ -4451,6 +4554,7 @@ class DicomProcessor:
                         ps315_curves += st["curves"]
                         ps315_order += st["order_entry"]
                         ps315_extra += st["extra_identifiers"]
+                        ps315_dangling += st["dangling_refs"]
                         ps315_icons += st["icons"]
                         ps315_descriptors += st["descriptors"]
 
@@ -4784,13 +4888,15 @@ class DicomProcessor:
                         % (id, unmasked_count, OCR_DEBUG_DETECTED_DIRNAME))
 
             if (ps315_overlays or ps315_curves or ps315_icons
-                    or ps315_descriptors or ps315_order or ps315_extra):
+                    or ps315_descriptors or ps315_order or ps315_extra
+                    or ps315_dangling):
                 self.logger.info(
                     "[%s] PS3.15: removed %d overlay element(s), %d curve element(s), "
                     "%d icon image sequence(s), %d order-entry attribute(s), "
-                    "%d extra identifier(s), blanked %d free-text descriptor(s)."
+                    "%d extra identifier(s), %d dangling SOP reference(s), "
+                    "blanked %d free-text descriptor(s)."
                     % (id, ps315_overlays, ps315_curves, ps315_icons,
-                       ps315_order, ps315_extra, ps315_descriptors))
+                       ps315_order, ps315_extra, ps315_dangling, ps315_descriptors))
 
             if self._uid_repair_failures:
                 self.logger.warning(
