@@ -3510,22 +3510,41 @@ class DicomProcessor:
             imageType = [str(x).lower().replace(" ", "") for x in imageType]
             status2 = all(self.is_substring_in_list(c, imageType) for c in ["original", "primary", "axial"])
 
-            studyDes = None
-            for tag in [(0x08, 0x1030), (0x08, 0x103e), (0x18, 0x0015), (0x18, 0x1160)]:
+            description_tags = [
+                (0x0008, 0x1030),  # StudyDescription
+                (0x0008, 0x103E),  # SeriesDescription
+                (0x0018, 0x0015),  # BodyPartExamined
+                (0x0018, 0x1160),  # FilterType
+            ]
+
+            all_descriptions = []
+
+            for tag in description_tags:
                 if tag in ds:
-                    studyDes = ds[tag].value
-                    break
-            studyDes = [studyDes] if isinstance(studyDes, str) else [studyDes]
-            studyDes = [str(x).lower().replace(" ", "") for x in studyDes if x is not None]
+                    value = ds[tag].value
+
+                    if value is None:
+                        continue
+
+                    if isinstance(value, (list, tuple)):
+                        all_descriptions.extend(str(x) for x in value if x is not None)
+                    else:
+                        all_descriptions.append(str(value))
+
+            # Combine everything into one string
+            combined_description = " ".join(all_descriptions).lower().replace(" ", "")
 
             include = ["head", "brain", "skull"]
             exclude = ["angio", "cta", "perfusion"]
 
-            status3 = any(self.is_substring_in_list(c, studyDes) for c in include)
-
+            status3 = any(
+                term in combined_description
+                for term in include
+            )
+            
             status4 = True
             if not remove_CTA:
-                if any(self.is_substring_in_list(e, studyDes) for e in exclude):
+                if any(self.is_substring_in_list(e, all_descriptions) for e in exclude):
                     status4 = False
 
             status5 = not self._is_secondary_capture_sop_class(ds)
@@ -3618,17 +3637,38 @@ class DicomProcessor:
         allowed = (pixels_hu < int(bone_stop_hu)).astype(np.uint8)
 
         k_max = int(max(1, k_max))
-        kmax = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_max, k_max))
-        max_once = cv2.dilate(seed, kmax)
 
-        max_once = (max_once & allowed).astype(np.uint8)
+        # --- Barrier-respecting (geodesic) dilation ---
+        # A single cv2.dilate() with a large kernel expands the seed as a
+        # full disk in one shot; masking by `allowed` only *afterward* does
+        # not stop growth from tunneling across bone that is thinner than
+        # the kernel radius (thin orbital wall, temporal bone, sutures,
+        # pediatric skull, etc.) -- the far side survives because it's still
+        # below bone_stop_hu, even though the true path to it crosses bone.
+        #
+        # Instead, grow by a small step and re-clip to `allowed` after every
+        # single step. Growth is then blocked the instant it touches bone,
+        # regardless of total reach, because a pixel can only ever enter the
+        # mask by being adjacent to an already-allowed pixel already in the
+        # mask -- there is no way to skip over a barrier of any thickness.
+        step_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        n_steps = int(max(1, ceil(k_max / 2.0)))  # ~k_max total reach, in 1px/step increments
+
+        max_once = seed.copy()
+        for _ in range(n_steps):
+            grown = cv2.dilate(max_once, step_kernel)
+            grown = (grown & allowed).astype(np.uint8)
+            if np.array_equal(grown, max_once):
+                break  # converged early, nothing left to grow into
+            max_once = grown
+
         max_once = self._keep_only_components_touching_seed(max_once, seed)
 
         k33 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, FRONT_BOOST_KERNEL)
         anterior_region = self._anterior_region_mask((H, W), ds, front_fraction=front_fraction)
 
         boosted = cv2.dilate(max_once, k33)
-        boosted = (boosted & anterior_region & max_once).astype(np.uint8)
+        boosted = (boosted & allowed & anterior_region & max_once).astype(np.uint8)
 
         combined = (max_once | boosted).astype(np.uint8)
         combined = (combined & max_once).astype(np.uint8)
