@@ -21,6 +21,15 @@ References:
 
 <img width="1720" alt="face" src="https://github.com/payabvashlab/SlicerHeadCTDeid/blob/main/images/face.png" />
 
+<h2>Date and time handling:</h2>
+Date and time attributes are processed according to the actions specified in Annex E, with an additional VR-based sweep used as a safeguard. Every element with a VR of DA or DT, including private vendor attributes and elements within nested sequences, is replaced with a fixed anonymization date. This approach takes advantage of the extensibility described in Annex E, which allows de-identifiers to account for attributes based on their DA, DT, or TM VR even when they are not explicitly enumerated in the confidentiality profile. Standalone TM values are zeroed by default.
+The current implementation uses date replacement rather than per-patient date shifting. Consequently, temporal intervals between serial examinations are not preserved. Longitudinal Temporal Information Modified (0028,0303) is therefore set to REMOVED. This date policy also ensures that acquisition dates and times are not retained in their original form and supports removal of dates more specific than the year for HIPAA Safe Harbor de-identification.
+
+<h2>UID remapping and non-metadata content:</h2>
+Instance UIDs are remapped using a single shared lookup table, such that each original UID is consistently mapped to the same replacement throughout a set of instances. This preserves internal referential consistency as required for PS3.15 action U. UIDs representing standard concepts rather than individual instances—including SOP Class UID, Referenced SOP Class UID, Transfer Syntax UID, and Media Storage SOP Class UID—are excluded from remapping.
+All private attributes are removed. Overlay planes (60xx), curve data (50xx), and Icon Image Sequences are also removed because they may contain pixel or annotation information that is not addressed by image-level text redaction.
+Additional safeguards are applied to the DICOM Part 10 file structure. The 128-byte preamble is zeroed, File Meta Information is synchronized with the de-identified dataset, and potentially identifying file-meta attributes are removed, including Source, Sending, and Receiving AE Titles, Implementation Version Name, Private Information Creator UID, and Private Information.
+Following Annex E Notes 8 and 12 and Section E.1.1, item 9, structures capable of retaining pre-coercion values or identifying the modifying system are also removed. These include Original Attributes Sequence (0400,0561), Encrypted Attributes Sequence, Modified Attributes Sequence, Modifying System, Digital Signatures Sequence (FFFA,FFFA) and associated certificate attributes, and group 0004 directory-structuring attributes. These structures are removed in their entirety rather than selectively sanitized because selective cleaning would require relying on metadata recorded by the system being de-identified and could leave copies of identifying values intact.
 
 <h2>Axial head CT detection and de-identification algorithm:</h2>
 
