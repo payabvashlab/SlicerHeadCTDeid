@@ -2483,7 +2483,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 )
         except (ValueError, FileNotFoundError) as exc:
             slicer.util.errorDisplay(str(exc), windowTitle="Input error")
-        except ImportError:
+        except Exception:
             slicer.util.pip_install("python-gdcm==3.0.25")
             slicer.util.pip_uninstall("torch")
             slicer.util.pip_install([ "torch", "--extra-index-url", "https://download.pytorch.org/whl/cu121"])
@@ -2491,8 +2491,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.pip_install("openpyxl")
             slicer.util.pip_install("pydicom")
             slicer.util.pip_install("pylibjpeg")
-            slicer.util.pip_install("pylibjpeg-libjpeg")
-            slicer.util.pip_install("pylibjpeg-openjpeg")
+            slicer.util.pip_install("--only-binary=:all: pylibjpeg-libjpeg pylibjpeg-openjpeg")
             slicer.util.pip_install("scikit-image")
             slicer.util.pip_uninstall("opencv-python")
             slicer.util.pip_uninstall("opencv-python-headless")
@@ -2512,9 +2511,6 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
                 windowTitle="Warning",
             )
-        except Exception as exc:
-            logging.exception("HeadCTDeid processing failed")
-            slicer.util.errorDisplay(str(exc), windowTitle="Processing error")
 
     def onBrowseExcelFile(self):
         from ctk import ctkFileDialog
