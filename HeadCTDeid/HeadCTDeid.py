@@ -32,7 +32,7 @@ from slicer.util import VTKObservationMixin
 warnings.filterwarnings("ignore")
 
 
-MODULE_REVISION = "2026-10-28"
+MODULE_REVISION = "2026-11-16-iod-repair-cta-filter-fix"
 
 
 class OCRProcessingError(RuntimeError):
@@ -281,7 +281,8 @@ PS315_ORDER_ENTRY_TAGS_TO_REMOVE = {
     (0x0038, 0x001C): "ScheduledDischargeDate",
     (0x0038, 0x001D): "ScheduledDischargeTime",
     (0x0038, 0x001E): "ScheduledPatientInstitutionResidence",
-    (0x0038, 0x011A): "RouteOfAdmissions",
+    (0x0038, 0x0016): "RouteOfAdmissions",
+    (0x0038, 0x011A): "LegacyMislabelledRouteOfAdmissions",
     (0x0038, 0x0060): "ServiceEpisodeID",
     (0x0038, 0x0062): "ServiceEpisodeDescription",
     (0x0038, 0x0064): "IssuerOfServiceEpisodeID",
@@ -582,7 +583,205 @@ PDF_TAGS_TO_DEID = {
     (0x4008, 0x0212),
 }
 
+# Focused IOD cleanup for classic, single-frame CT Image Storage only. These
+# are Type 3 root attributes in the modules/macros used by this IOD. No global
+# 'delete every incomplete sequence' operation is performed.
+DEID_REPAIR_CT_IOD = True
+DEID_NORMALIZE_CONFIRMED_HEAD = True
+DEID_REMOVE_RETIRED_DOSE_SAVING = True
+DEID_REMOVE_MODALITIES_IN_STUDY = True
+DEID_IOD_ACTIONS_FILENAME = "metadata_iod_actions.csv"
+CT_CLASSIC_SOP_UID = "1.2.840.10008.5.1.4.1.1.2"
+CT_OPTIONAL_ROOT_CODE_SEQUENCES = {
+    0x00081032: "ProcedureCodeSequence",
+    0x0008103F: "SeriesDescriptionCodeSequence",
+    0x00081041: "InstitutionalDepartmentTypeCodeSequence",
+    0x00082218: "AnatomicRegionSequence",
+    0x00082228: "PrimaryAnatomicStructureSequence",
+    0x00400260: "PerformedProtocolCodeSequence",
+    0x00401012: "ReasonForPerformedProcedureCodeSequence",
+}
+
+
+def _iod_scalar(dataset, tag):
+    if tag not in dataset or dataset[tag].value is None:
+        return ""
+    return str(dataset[tag].value).strip()
+
+
+def _iod_code_item_issues(item):
+    """Basic coded-entry validity; never invent a code, scheme or meaning."""
+    identifiers = [(tag, _iod_scalar(item, tag))
+                   for tag in (0x00080100, 0x00080119, 0x00080120)]
+    present = [(tag, value) for tag, value in identifiers if value]
+    issues = []
+    if len(present) != 1:
+        issues.append("expected_exactly_one_code_identifier")
+    if not _iod_scalar(item, 0x00080104):
+        issues.append("missing_CodeMeaning")
+    elif len(_iod_scalar(item, 0x00080104)) > 64:
+        issues.append("CodeMeaning_exceeds_LO_length")
+    for code_tag in (0x00080102, 0x00080104):
+        if code_tag in item and getattr(item[code_tag], "VM", 1) != 1:
+            issues.append("coded_attribute_must_be_single_valued")
+    if len(_iod_scalar(item, 0x00080102)) > 16:
+        issues.append("CodingSchemeDesignator_exceeds_SH_length")
+    if len(present) == 1:
+        tag, value = present[0]
+        if getattr(item[tag], "VM", 1) != 1:
+            issues.append("code_identifier_must_be_single_valued")
+        if tag in (0x00080100, 0x00080119):
+            if not _iod_scalar(item, 0x00080102):
+                issues.append("missing_CodingSchemeDesignator")
+            if tag == 0x00080100 and len(value) > 16:
+                issues.append("CodeValue_requires_LongCodeValue")
+            if tag == 0x00080119 and len(value) <= 16:
+                issues.append("short_identifier_requires_CodeValue")
+            if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value):
+                issues.append("URI_identifier_requires_URNCodeValue")
+        elif not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value):
+            issues.append("URNCodeValue_is_not_a_URI")
+    return issues
+
+
+def _iod_head_evidence(dataset):
+    """Capture source anatomy BEFORE free-text descriptors are cleared.
+
+    This uses source metadata, not image content, and never overwrites explicit
+    evidence for a different or paired anatomical target.
+    """
+    if _iod_scalar(dataset, 0x00080016) != CT_CLASSIC_SOP_UID:
+        return False
+    if _iod_scalar(dataset, 0x00080060).upper() != "CT":
+        return False
+    try:
+        if int(_iod_scalar(dataset, 0x00280008) or "1") != 1:
+            return False
+    except ValueError:
+        return False
+    descriptions = " ".join(_iod_scalar(dataset, tag) for tag in (0x00081030, 0x0008103E))
+    if re.search(r"\b(neck|orbit\w*|temporal\s+bone|mastoid\w*|ear|iac)\b", descriptions, re.I):
+        return False
+    body = re.sub(r"[^A-Z0-9]", "", _iod_scalar(dataset, 0x00180015).upper())
+    if body in {"HEAD", "BRAIN", "SKULL", "CRANIUM", "CEREBRUM"}:
+        return True
+    if body and body not in {"UNKNOWN", "UNSPECIFIED"}:
+        return False
+    # Explicit R/L/B side-specific data are not turned into whole-head data.
+    if any(_iod_scalar(dataset, tag).upper() in {"R", "L", "B"}
+           for tag in (0x00200060, 0x00200062)):
+        return False
+    descriptions = " ".join(_iod_scalar(dataset, tag) for tag in (0x00081030, 0x0008103E))
+    if re.search(r"\b(neck|orbit\w*|temporal\s+bone|mastoid\w*|ear|iac)\b", descriptions, re.I):
+        return False
+    return bool(re.search(r"\b(head|brain|skull|cranium|cerebrum)\b", descriptions, re.I))
+
+
+def _repair_classic_ct_iod(dataset, confirmed_head=False):
+    """Return explicit action records; input image pixels are never accessed.
+
+    Only incomplete items from approved optional ROOT coded sequences are
+    removed. Unknown/nested or mandatory sequence requirements are not guessed.
+    Valid local codes and vendor ImageType values keep their original meaning.
+    """
+    if not DEID_REPAIR_CT_IOD or _iod_scalar(dataset, 0x00080016) != CT_CLASSIC_SOP_UID:
+        return []
+    from pydicom.sequence import Sequence
+    actions = []
+    for tag, name in CT_OPTIONAL_ROOT_CODE_SEQUENCES.items():
+        if tag not in dataset:
+            continue
+        element = dataset[tag]
+        if element.VR != "SQ":
+            actions.append(("unresolved", f"({tag >> 16:04X},{tag & 65535:04X})", "Expected SQ for " + name))
+            continue
+        retained = []
+        for index, item in enumerate(element.value or []):
+            issues = _iod_code_item_issues(item)
+            if issues:
+                actions.append(("removed_invalid_optional_code_item",
+                                f"({tag >> 16:04X},{tag & 65535:04X})[{index}]", ";".join(issues)))
+            else:
+                retained.append(item)
+        if not retained:
+            del dataset[tag]
+            actions.append(("removed_empty_optional_code_sequence", f"({tag >> 16:04X},{tag & 65535:04X})", name))
+        elif len(retained) != len(element.value):
+            element.value = Sequence(retained)
+    if DEID_REMOVE_RETIRED_DOSE_SAVING and 0x00189324 in dataset:
+        del dataset[0x00189324]
+        actions.append(("removed_retired_optional_attribute", "(0018,9324)", "EstimatedDoseSaving"))
+    if DEID_REMOVE_MODALITIES_IN_STUDY and 0x00080061 in dataset:
+        del dataset[0x00080061]
+        actions.append(("removed_redundant_study_summary", "(0008,0061)", "ModalitiesInStudy; root Modality is retained"))
+    if DEID_NORMALIZE_CONFIRMED_HEAD and confirmed_head:
+        laterality = _iod_scalar(dataset, 0x00200060).upper()
+        image_laterality = _iod_scalar(dataset, 0x00200062).upper()
+        if laterality in {"R", "L", "B"} or image_laterality in {"R", "L", "B"}:
+            actions.append(("unresolved", "(0020,0060)", "Explicit side-specific metadata retained; no whole-head normalization"))
+        else:
+            if _iod_scalar(dataset, 0x00180015) != "HEAD":
+                dataset.add_new(0x00180015, "CS", "HEAD")
+                actions.append(("normalized_source_supported_head_anatomy", "(0018,0015)", "HEAD"))
+            if laterality not in {"", "U"}:
+                actions.append(("unresolved", "(0020,0060)", "Unrecognized existing laterality retained for review"))
+            if 0x00200060 in dataset and laterality in {"", "U"}:
+                del dataset[0x00200060]
+                actions.append(("removed_inapplicable_series_laterality", "(0020,0060)", "Confirmed whole-head context; no R/L value invented"))
+    return actions
+
+
+def _append_iod_actions(path, source_filename, actions):
+    if not actions:
+        return
+    exists = os.path.isfile(path)
+    with open(path, "a", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        if not exists:
+            writer.writerow(["source_filename", "action", "element_path", "detail"])
+        for action, location, detail in actions:
+            writer.writerow([source_filename, action, location, detail])
+
+
 GLOBAL_DROPPED_CSV_NAME = "global_burned_in_text_actions.csv"
+
+def _cta_ctp_label_reason(value):
+    """Recognize explicit angiography/perfusion labels without fusing words.
+
+    Applied to each ORIGINAL metadata value independently. This is textual
+    series screening, not an inference from contrast, pixels or diagnosis.
+    CT AXIAL/CTAXIAL, PUNCTATE and ANGIOMA do not denote CTA here.
+    """
+    raw = str(value or "")
+    literal_text = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
+    # Preserve acronym/camel-case word boundaries: CTAHead -> CTA Head,
+    # CTAxial -> CT Axial, HeadCTA -> Head CTA, CTAngio -> CT Angio.
+    raw = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", raw)
+    raw = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
+    text = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
+    if not text:
+        return ""
+    anatomy = r"(?:head|brain|neck|skull|cow|circle|carotid|cerebr|intracran|extracran)"
+    for text in dict.fromkeys((text, literal_text)):
+        if re.search(r"\bcta\b", text) or re.search(r"\bcta(?=\d|" + anatomy + r")", text):
+            return "CTA_label"
+        if re.search(r"\b(?:head|brain|neck|skull|cow|axial)cta(?=$|\d)", text):
+            return "CTA_label"
+        # CT-A/CT_A are explicit acronym spellings; CT AXIAL has no such token.
+        if re.search(r"\bct[-_]a\b", raw, re.I):
+            return "CTA_label"
+        if re.search(r"\b(?:ct)?angio(?:graphy|graphic|gram|grams|graphie|grafia)?(?=$|\s|\d|" + anatomy + r")", text):
+            return "angiography_label"
+        if re.search(r"\bctp\b", text) or re.search(r"\bctp(?=\d|" + anatomy + r")", text):
+            return "CTP_label"
+        if re.search(r"\b(?:head|brain|neck|skull|cow|axial)ctp(?=$|\d)", text):
+            return "CTP_label"
+        if re.search(r"\b(?:ct)?perfusion(?=$|\s|\d|" + anatomy + r")", text):
+            return "perfusion_label"
+        if re.search(r"\bct\s+perf\b", text):
+            return "perfusion_label"
+    return ""
+
 
 def _to_str(x):
     try:
@@ -2831,6 +3030,8 @@ class DicomProcessor:
         self._render_counter = 0
         self._processing_errors = []
         self._eligible_slice_count = 0
+        self._ct_filter_rejections = defaultdict(int)
+        self._last_ct_filter_reasons = ()
         self._saved_slice_count = 0
         self._ocr_failure_count = 0
 
@@ -3582,8 +3783,17 @@ class DicomProcessor:
                 _decompress_preserving_instance_uid(ds)
             except Exception:
                 pass
-            return self.checkCTmeta(ds, remove_CTA) == 1
+            accepted = self.checkCTmeta(ds, remove_CTA) == 1
+            if not accepted:
+                if not hasattr(self, "_ct_filter_rejections"):
+                    self._ct_filter_rejections = defaultdict(int)
+                for reason in self._last_ct_filter_reasons or ("metadata_filter_rejected",):
+                    self._ct_filter_rejections[reason] += 1
+            return accepted
         except Exception:
+            if not hasattr(self, "_ct_filter_rejections"):
+                self._ct_filter_rejections = defaultdict(int)
+            self._ct_filter_rejections["DICOM_read_or_classification_error"] += 1
             return False
 
     def load_scan(self, path):
@@ -3687,70 +3897,69 @@ class DicomProcessor:
             return False
 
     def checkCTmeta(self, ds, remove_CTA=False):
+        """Select original/primary/axial, single-frame grayscale head CT.
+
+        Historical argument name retained for compatibility: remove_CTA=True
+        corresponds to the UI's ALLOW CTA/CTP option, so it BYPASSES only the
+        angiography/perfusion exclusion. Other eligibility checks still apply.
         """
-        Accept only CT head (original/primary/axial), and exclude Secondary Capture.
-        By default, exclude CTA/perfusion.
-        If remove_CTA=True -> do not exclude CTA (i.e., include such series as well).
-        """
+        self._last_ct_filter_reasons = ()
         try:
-            # The image-processing path below operates on one grayscale slice.
             if int(getattr(ds, "NumberOfFrames", 1) or 1) != 1:
+                self._last_ct_filter_reasons = ("multiframe",)
                 return 0
             if int(getattr(ds, "SamplesPerPixel", 1) or 1) != 1:
+                self._last_ct_filter_reasons = ("not_single_sample_grayscale",)
                 return 0
-            modality = ds.get((0x08, 0x60), "")
+            modality = ds.get((0x0008, 0x0060), "")
             modality = [modality.value] if hasattr(modality, "value") else [modality]
             modality = [str(x).lower().replace(" ", "") for x in modality]
-            status1 = any(self.is_substring_in_list(c, modality) for c in ["ct", "computedtomography", "ctprotocal"])
-
-            imageType = ds.get((0x08, 0x08), "")
+            status1 = any(self.is_substring_in_list(c, modality)
+                          for c in ["ct", "computedtomography", "ctprotocal"])
+            imageType = ds.get((0x0008, 0x0008), "")
             imageType = [imageType.value] if hasattr(imageType, "value") else [imageType]
             imageType = [str(x).lower().replace(" ", "") for x in imageType]
-            status2 = all(self.is_substring_in_list(c, imageType) for c in ["original", "primary", "axial"])
-
-            description_tags = [
-                (0x0008, 0x1030),  # StudyDescription
-                (0x0008, 0x103E),  # SeriesDescription
-                (0x0018, 0x0015),  # BodyPartExamined
-                (0x0018, 0x1160),  # FilterType
-            ]
-
-            all_descriptions = []
-
-            for tag in description_tags:
-                if tag in ds:
-                    value = ds[tag].value
-
-                    if value is None:
-                        continue
-
-                    if _is_multivalue(value):
-                        all_descriptions.extend(str(x) for x in value if x is not None)
-                    else:
-                        all_descriptions.append(str(value))
-
-            # Combine everything into one string
-            combined_description = " ".join(all_descriptions).lower().replace(" ", "")
-
-            include = ["head", "brain", "skull"]
-            exclude = ["angio", "cta", "perfusion"]
-
-            status3 = any(
-                term in combined_description
-                for term in include
-            )
-            
-            status4 = True
+            status2 = all(self.is_substring_in_list(c, imageType)
+                          for c in ["original", "primary", "axial"])
+            descriptions = []
+            for tag in ((0x0008, 0x1030), (0x0008, 0x103E),
+                        (0x0018, 0x0015), (0x0018, 0x1160)):
+                if tag not in ds or ds[tag].value is None:
+                    continue
+                value = ds[tag].value
+                if _is_multivalue(value):
+                    descriptions.extend(str(v) for v in value if v is not None)
+                else:
+                    descriptions.append(str(value))
+            # Keep field/value boundaries. Never turn CT + AXIAL into CTA.
+            status3 = any(term in value.lower()
+                          for value in descriptions for term in ("head", "brain", "skull"))
+            excluded_reason = ""
             if not remove_CTA:
-                if any(e in combined_description for e in exclude):
-                    status4 = False
-
+                for value in descriptions:
+                    excluded_reason = _cta_ctp_label_reason(value)
+                    if excluded_reason:
+                        break
+            status4 = not bool(excluded_reason)
             status5 = not self._is_secondary_capture_sop_class(ds)
-
+            reasons = []
+            if not status1:
+                reasons.append("modality_not_CT")
+            if not status2:
+                reasons.append("ImageType_missing_ORIGINAL_PRIMARY_AXIAL")
+            if not status3:
+                reasons.append("head_brain_skull_not_identified")
+            if not status4:
+                reasons.append("excluded_" + excluded_reason)
+            if not status5:
+                reasons.append("secondary_capture")
+            self._last_ct_filter_reasons = tuple(reasons)
             return int(status1 and status2 and status3 and status4 and status5)
-        except Exception as e:
-            self.error = str(e)
+        except Exception as exc:
+            self.error = str(exc)
+            self._last_ct_filter_reasons = ("metadata_parse_error_" + type(exc).__name__,)
             return 0
+
 
     def _keep_only_components_touching_seed(self, mask_uint8, seed_uint8):
         import cv2
@@ -4752,6 +4961,7 @@ class DicomProcessor:
                         except Exception:
                             age_str = None
 
+                    source_head_confirmed = _iod_head_evidence(ds)
                     self._anonymize_dataset_recursive(ds, patient_id_value=id)
 
                     if DEID_REPLACE_ALL_DATES:
@@ -4794,6 +5004,12 @@ class DicomProcessor:
                         ps315_dangling += st["dangling_refs"]
                         ps315_icons += st["icons"]
                         ps315_descriptors += st["descriptors"]
+
+                    iod_actions = _repair_classic_ct_iod(ds, confirmed_head=source_head_confirmed)
+                    _append_iod_actions(os.path.join(out_dir, DEID_IOD_ACTIONS_FILENAME), fname, iod_actions)
+                    for action, location, detail in iod_actions:
+                        if action == "unresolved":
+                            self.logger.warning("[%s] IOD metadata review %s: %s", id, location, detail)
 
                     if PS315_RUN_QC:
                         for f in self._ps315_qc_report(ds):
@@ -5638,7 +5854,10 @@ print(out_png)
                     self._processing_errors.extend(series_errors)
 
             if not self._eligible_slice_count:
-                raise ValueError("No eligible single-frame grayscale CT instances were found")
+                counts = getattr(self, "_ct_filter_rejections", {})
+                detail = ", ".join("%s=%d" % (reason, count) for reason, count in sorted(counts.items()))
+                raise ValueError("No eligible single-frame grayscale CT instances were found. "
+                                 "Rejected filter evaluations: " + (detail or "no candidate files encountered"))
 
             for curr, subdirs, files in os.walk(out_path, topdown=True):
                 if not subdirs:
