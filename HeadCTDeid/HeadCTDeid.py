@@ -1,8 +1,3 @@
-"""
-HeadCTDeid (3D Slicer scripted module)
-
-"""
-
 import csv
 import hashlib
 import importlib.metadata
@@ -26,7 +21,12 @@ from pathlib import Path
 
 import numpy as np
 import slicer
-from slicer.ScriptedLoadableModule import *
+from slicer.ScriptedLoadableModule import (
+    ScriptedLoadableModule,
+    ScriptedLoadableModuleLogic,
+    ScriptedLoadableModuleTest,
+    ScriptedLoadableModuleWidget,
+)
 from slicer.util import VTKObservationMixin
 
 warnings.filterwarnings("ignore")
@@ -36,7 +36,7 @@ MODULE_REVISION = "2026-11-16-iod-repair-cta-filter-fix"
 
 
 class OCRProcessingError(RuntimeError):
-    """The requested OCR check failed; this is not a text-negative result."""
+    pass
 
 
 ENABLE_TEXT_DETECTION = True
@@ -66,7 +66,6 @@ FLORENCE_WORKER_MAX_RESTARTS = 3
 FLORENCE_SHUTDOWN_WORKER_AFTER_RUN = True
 
 FLORENCE_MODEL_ID = "florence-community/Florence-2-large"
-# Set an immutable revision for a locked validation run. Empty retains legacy behavior.
 FLORENCE_MODEL_REVISION = ""
 
 FLORENCE_PREFER_NATIVE = True
@@ -93,8 +92,6 @@ FLORENCE_LOCAL_FILES_ONLY = False
 FLORENCE_UPSCALE = 2.0
 
 FLORENCE_EMPTY_CACHE_EVERY_N_CALLS = 50
-
-FLORENCE_SHARE_MODEL_ACROSS_PATIENTS = True
 
 FLORENCE_MIN_CONFIDENCE = 0.2
 
@@ -191,11 +188,6 @@ OCR_DEBUG_NOT_EXAMINED_DIRNAME = "not_examined_detection_off"
 DEID_REPLACE_ALL_DATES = True
 
 DEID_ANONYMIZATION_DATE = ""
-
-DEID_STANDARD_NOTE = (
-    "PS3.15 Annex E governs DICOM attribute handling; HIPAA Safe Harbor and "
-    "Expert Determination are separate regulatory pathways."
-)
 
 DEID_SET_LONGITUDINAL_TEMPORAL_FLAG = True
 
@@ -460,15 +452,9 @@ SOP_REFERENCE_TYPE1_TAGS = {
     (0x0008, 0x1155): "ReferencedSOPInstanceUID",
 }
 
-FACE_MAX_VALUE = 50
-FACE_MIN_VALUE = -125
 AIR_THRESHOLD = -800
 BONE_STOP_HU = 250
-FRONT_BOOST_KERNEL = (3, 3)
 
-# Optional integer seed. None preserves stochastic legacy behavior.
-# With a seed, each source SOP Instance UID determines a local per-slice RNG.
-# This controls the facial mask parameter, not generated UIDs or GPU arithmetic.
 DEID_RANDOM_SEED = None
 DEID_IMPLEMENTATION_VERSION = "HEADCTDEID2"
 FACE_KERNEL_MIN_MM = 50.0
@@ -583,9 +569,6 @@ PDF_TAGS_TO_DEID = {
     (0x4008, 0x0212),
 }
 
-# Focused IOD cleanup for classic, single-frame CT Image Storage only. These
-# are Type 3 root attributes in the modules/macros used by this IOD. No global
-# 'delete every incomplete sequence' operation is performed.
 DEID_REPAIR_CT_IOD = True
 DEID_NORMALIZE_CONFIRMED_HEAD = True
 DEID_REMOVE_RETIRED_DOSE_SAVING = True
@@ -610,9 +593,7 @@ def _iod_scalar(dataset, tag):
 
 
 def _iod_code_item_issues(item):
-    """Basic coded-entry validity; never invent a code, scheme or meaning."""
-    identifiers = [(tag, _iod_scalar(item, tag))
-                   for tag in (0x00080100, 0x00080119, 0x00080120)]
+    identifiers = [(tag, _iod_scalar(item, tag)) for tag in (0x00080100, 0x00080119, 0x00080120)]
     present = [(tag, value) for tag, value in identifiers if value]
     issues = []
     if len(present) != 1:
@@ -645,11 +626,6 @@ def _iod_code_item_issues(item):
 
 
 def _iod_head_evidence(dataset):
-    """Capture source anatomy BEFORE free-text descriptors are cleared.
-
-    This uses source metadata, not image content, and never overwrites explicit
-    evidence for a different or paired anatomical target.
-    """
     if _iod_scalar(dataset, 0x00080016) != CT_CLASSIC_SOP_UID:
         return False
     if _iod_scalar(dataset, 0x00080060).upper() != "CT":
@@ -667,45 +643,50 @@ def _iod_head_evidence(dataset):
         return True
     if body and body not in {"UNKNOWN", "UNSPECIFIED"}:
         return False
-    # Explicit R/L/B side-specific data are not turned into whole-head data.
-    if any(_iod_scalar(dataset, tag).upper() in {"R", "L", "B"}
-           for tag in (0x00200060, 0x00200062)):
-        return False
-    descriptions = " ".join(_iod_scalar(dataset, tag) for tag in (0x00081030, 0x0008103E))
-    if re.search(r"\b(neck|orbit\w*|temporal\s+bone|mastoid\w*|ear|iac)\b", descriptions, re.I):
+    if any(
+        _iod_scalar(dataset, tag).upper() in {"R", "L", "B"} for tag in (0x00200060, 0x00200062)
+    ):
         return False
     return bool(re.search(r"\b(head|brain|skull|cranium|cerebrum)\b", descriptions, re.I))
 
 
 def _repair_classic_ct_iod(dataset, confirmed_head=False):
-    """Return explicit action records; input image pixels are never accessed.
-
-    Only incomplete items from approved optional ROOT coded sequences are
-    removed. Unknown/nested or mandatory sequence requirements are not guessed.
-    Valid local codes and vendor ImageType values keep their original meaning.
-    """
     if not DEID_REPAIR_CT_IOD or _iod_scalar(dataset, 0x00080016) != CT_CLASSIC_SOP_UID:
         return []
     from pydicom.sequence import Sequence
+
     actions = []
     for tag, name in CT_OPTIONAL_ROOT_CODE_SEQUENCES.items():
         if tag not in dataset:
             continue
         element = dataset[tag]
         if element.VR != "SQ":
-            actions.append(("unresolved", f"({tag >> 16:04X},{tag & 65535:04X})", "Expected SQ for " + name))
+            actions.append(
+                ("unresolved", f"({tag >> 16:04X},{tag & 65535:04X})", "Expected SQ for " + name)
+            )
             continue
         retained = []
         for index, item in enumerate(element.value or []):
             issues = _iod_code_item_issues(item)
             if issues:
-                actions.append(("removed_invalid_optional_code_item",
-                                f"({tag >> 16:04X},{tag & 65535:04X})[{index}]", ";".join(issues)))
+                actions.append(
+                    (
+                        "removed_invalid_optional_code_item",
+                        f"({tag >> 16:04X},{tag & 65535:04X})[{index}]",
+                        ";".join(issues),
+                    )
+                )
             else:
                 retained.append(item)
         if not retained:
             del dataset[tag]
-            actions.append(("removed_empty_optional_code_sequence", f"({tag >> 16:04X},{tag & 65535:04X})", name))
+            actions.append(
+                (
+                    "removed_empty_optional_code_sequence",
+                    f"({tag >> 16:04X},{tag & 65535:04X})",
+                    name,
+                )
+            )
         elif len(retained) != len(element.value):
             element.value = Sequence(retained)
     if DEID_REMOVE_RETIRED_DOSE_SAVING and 0x00189324 in dataset:
@@ -713,21 +694,45 @@ def _repair_classic_ct_iod(dataset, confirmed_head=False):
         actions.append(("removed_retired_optional_attribute", "(0018,9324)", "EstimatedDoseSaving"))
     if DEID_REMOVE_MODALITIES_IN_STUDY and 0x00080061 in dataset:
         del dataset[0x00080061]
-        actions.append(("removed_redundant_study_summary", "(0008,0061)", "ModalitiesInStudy; root Modality is retained"))
+        actions.append(
+            (
+                "removed_redundant_study_summary",
+                "(0008,0061)",
+                "ModalitiesInStudy; root Modality is retained",
+            )
+        )
     if DEID_NORMALIZE_CONFIRMED_HEAD and confirmed_head:
         laterality = _iod_scalar(dataset, 0x00200060).upper()
         image_laterality = _iod_scalar(dataset, 0x00200062).upper()
         if laterality in {"R", "L", "B"} or image_laterality in {"R", "L", "B"}:
-            actions.append(("unresolved", "(0020,0060)", "Explicit side-specific metadata retained; no whole-head normalization"))
+            actions.append(
+                (
+                    "unresolved",
+                    "(0020,0060)",
+                    "Explicit side-specific metadata retained; no whole-head normalization",
+                )
+            )
         else:
             if _iod_scalar(dataset, 0x00180015) != "HEAD":
                 dataset.add_new(0x00180015, "CS", "HEAD")
                 actions.append(("normalized_source_supported_head_anatomy", "(0018,0015)", "HEAD"))
             if laterality not in {"", "U"}:
-                actions.append(("unresolved", "(0020,0060)", "Unrecognized existing laterality retained for review"))
+                actions.append(
+                    (
+                        "unresolved",
+                        "(0020,0060)",
+                        "Unrecognized existing laterality retained for review",
+                    )
+                )
             if 0x00200060 in dataset and laterality in {"", "U"}:
                 del dataset[0x00200060]
-                actions.append(("removed_inapplicable_series_laterality", "(0020,0060)", "Confirmed whole-head context; no R/L value invented"))
+                actions.append(
+                    (
+                        "removed_inapplicable_series_laterality",
+                        "(0020,0060)",
+                        "Confirmed whole-head context; no R/L value invented",
+                    )
+                )
     return actions
 
 
@@ -745,17 +750,10 @@ def _append_iod_actions(path, source_filename, actions):
 
 GLOBAL_DROPPED_CSV_NAME = "global_burned_in_text_actions.csv"
 
-def _cta_ctp_label_reason(value):
-    """Recognize explicit angiography/perfusion labels without fusing words.
 
-    Applied to each ORIGINAL metadata value independently. This is textual
-    series screening, not an inference from contrast, pixels or diagnosis.
-    CT AXIAL/CTAXIAL, PUNCTATE and ANGIOMA do not denote CTA here.
-    """
+def _cta_ctp_label_reason(value):
     raw = str(value or "")
     literal_text = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
-    # Preserve acronym/camel-case word boundaries: CTAHead -> CTA Head,
-    # CTAxial -> CT Axial, HeadCTA -> Head CTA, CTAngio -> CT Angio.
     raw = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", raw)
     raw = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
     text = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
@@ -767,10 +765,14 @@ def _cta_ctp_label_reason(value):
             return "CTA_label"
         if re.search(r"\b(?:head|brain|neck|skull|cow|axial)cta(?=$|\d)", text):
             return "CTA_label"
-        # CT-A/CT_A are explicit acronym spellings; CT AXIAL has no such token.
         if re.search(r"\bct[-_]a\b", raw, re.I):
             return "CTA_label"
-        if re.search(r"\b(?:ct)?angio(?:graphy|graphic|gram|grams|graphie|grafia)?(?=$|\s|\d|" + anatomy + r")", text):
+        if re.search(
+            r"\b(?:ct)?angio(?:graphy|graphic|gram|grams|graphie|grafia)?(?=$|\s|\d|"
+            + anatomy
+            + r")",
+            text,
+        ):
             return "angiography_label"
         if re.search(r"\bctp\b", text) or re.search(r"\bctp(?=\d|" + anatomy + r")", text):
             return "CTP_label"
@@ -809,15 +811,6 @@ def dicom_has_burned_in(ds) -> bool:
         return False
 
 
-def _subprocess_import_ok(module_name: str, timeout_sec: int = 25) -> bool:
-    try:
-        cmd = [sys.executable, "-c", f"import {module_name}; print('OK')"]
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-        return (p.returncode == 0) and ("OK" in (p.stdout or ""))
-    except Exception:
-        return False
-
-
 def _safe_show_status(msg: str, ms: int = 2000):
     try:
         slicer.util.showStatusMessage(str(msg), int(ms))
@@ -832,14 +825,12 @@ _PYDICOM_VALIDATION_CONFIGURED = False
 
 
 def _configure_pydicom_validation():
-    """Quieten pydicom's read-time UI validator (see the note on the flag)."""
     global _PYDICOM_VALIDATION_CONFIGURED
     if _PYDICOM_VALIDATION_CONFIGURED:
         return
     _PYDICOM_VALIDATION_CONFIGURED = True
 
     try:
-        import pydicom
         from pydicom import config as pdconfig
 
         settings = getattr(pdconfig, "settings", None)
@@ -856,13 +847,13 @@ def _configure_pydicom_validation():
     if SUPPRESS_PYDICOM_READ_VALIDATION_WARNINGS:
         try:
             warnings.filterwarnings(
-                "ignore", message=r".*Invalid value for VR.*", category=UserWarning)
+                "ignore", message=r".*Invalid value for VR.*", category=UserWarning
+            )
         except Exception:
             pass
 
 
 def _is_dummy_value(value, extra=None) -> bool:
-    """True when a value is a placeholder this module wrote on purpose."""
     s = str(value if value is not None else "").strip().lower()
     if not s:
         return True
@@ -878,11 +869,6 @@ def _is_dummy_value(value, extra=None) -> bool:
 
 
 def _uid_is_valid(value) -> bool:
-    """DICOM PS3.5 section 9.1 UID syntax check.
-
-    Valid: digits in dot-separated components, at most 64 characters, and no
-    component with a leading zero unless that component is a single "0".
-    """
     s = str(value if value is not None else "").strip()
     if not s:
         return True
@@ -891,17 +877,16 @@ def _uid_is_valid(value) -> bool:
     return all(_UID_COMPONENT_RE.match(part) for part in s.split("."))
 
 
-
 _RUN_PROVENANCE_PATH = None
 
 
 def _is_multivalue(value):
     return isinstance(value, (list, tuple)) or (
-        hasattr(value, "__iter__") and not isinstance(value, (str, bytes, bytearray)))
+        hasattr(value, "__iter__") and not isinstance(value, (str, bytes, bytearray))
+    )
 
 
 def _update_run_provenance(update):
-    """Record configured settings separately from observed model initialization."""
     if not _RUN_PROVENANCE_PATH:
         return
     try:
@@ -919,7 +904,6 @@ def _update_run_provenance(update):
 
 
 def _decompress_preserving_instance_uid(ds):
-    """Decompress pixels without changing the identifiers used by UID mapping."""
     if not getattr(getattr(ds, "file_meta", None), "TransferSyntaxUID", None):
         return
     if not getattr(ds.file_meta.TransferSyntaxUID, "is_compressed", False):
@@ -942,21 +926,15 @@ _SAVE_AS_SUPPORTS_ENFORCE = None
 
 
 def _dcm_save_as(ds, path, enforce_file_format=True):
-    """Write a DICOM dataset across the pydicom 2.x / 3.x keyword change.
-
-    pydicom 3.0 deprecated `write_like_original` in favour of
-    `enforce_file_format`, with the sense inverted:
-        write_like_original=False  ==  enforce_file_format=True
-    Both mean "write a proper Part 10 file, adding File Meta Information as
-    needed", which is what this pipeline wants for its de-identified output.
-    """
     global _SAVE_AS_SUPPORTS_ENFORCE
 
     if _SAVE_AS_SUPPORTS_ENFORCE is None:
         try:
             import inspect
+
             _SAVE_AS_SUPPORTS_ENFORCE = (
-                "enforce_file_format" in inspect.signature(ds.save_as).parameters)
+                "enforce_file_format" in inspect.signature(ds.save_as).parameters
+            )
         except Exception:
             _SAVE_AS_SUPPORTS_ENFORCE = False
 
@@ -1004,7 +982,6 @@ def _box_big_enough(points) -> bool:
 
 
 def _in_border_band(points, shape_hw) -> bool:
-    """True when the box centre lies in the outer band of the image."""
     if points is None:
         return True
     try:
@@ -1022,7 +999,6 @@ def _in_border_band(points, shape_hw) -> bool:
 
 
 def _hallucination_flags(text, image):
-    """Heuristics for text the model invented rather than read."""
     flags = []
     s = str(text or "")
 
@@ -1050,7 +1026,6 @@ def _hallucination_flags(text, image):
 
 
 def _strip_special(text) -> str:
-    """<OCR_WITH_REGION> labels usually carry </s>, <s> and <loc_*> markers."""
     s = str(text or "")
     s = re.sub(r"</?s>", "", s)
     s = re.sub(r"<pad>", "", s)
@@ -1074,12 +1049,6 @@ def _coerce_points(raw):
 
 
 def _count_textlike_components(gray8) -> int:
-    """Count connected components whose size looks like a burned-in character.
-
-    Top-hat morphology highlights small BRIGHT regions on a darker background,
-    which is what burned-in annotation looks like on CT. This is plain image
-    processing, not OCR.
-    """
     try:
         import cv2
 
@@ -1093,9 +1062,11 @@ def _count_textlike_components(gray8) -> int:
         count = 0
         for i in range(1, num):
             x, y, w, h, area = stats[i]
-            if (PRESCREEN_MIN_CHAR_H <= h <= PRESCREEN_MAX_CHAR_H
-                    and PRESCREEN_MIN_CHAR_W <= w <= PRESCREEN_MAX_CHAR_W
-                    and area >= PRESCREEN_MIN_CHAR_AREA):
+            if (
+                PRESCREEN_MIN_CHAR_H <= h <= PRESCREEN_MAX_CHAR_H
+                and PRESCREEN_MIN_CHAR_W <= w <= PRESCREEN_MAX_CHAR_W
+                and area >= PRESCREEN_MIN_CHAR_AREA
+            ):
                 count += 1
         return count
     except Exception:
@@ -1108,12 +1079,6 @@ def _prescreen_says_maybe_text(gray8):
 
 
 def _fixed_get_imports(filename):
-    """Drop the flash_attn requirement from Florence-2's remote code.
-
-    modeling_florence2.py imports flash_attn at module scope, so transformers
-    treats it as mandatory even though the model runs fine with sdpa
-    (huggingface/transformers#31793).
-    """
     from transformers.dynamic_module_utils import get_imports
 
     imports = get_imports(filename)
@@ -1129,6 +1094,7 @@ def _resolve_florence_device():
         return str(FLORENCE_DEVICE)
     try:
         import torch
+
         if torch.cuda.is_available():
             return "cuda"
     except Exception:
@@ -1151,15 +1117,16 @@ def _resolve_florence_dtype(device):
 
 
 class Florence2Engine:
-    """Thin wrapper around microsoft/Florence-2-* for burned-in text OCR."""
 
     def __init__(self):
-        import torch
         from unittest.mock import patch
+
+        import torch
         from transformers import AutoModelForCausalLM, AutoProcessor
 
         try:
             from transformers import Florence2ForConditionalGeneration
+
             has_native = True
         except Exception:
             Florence2ForConditionalGeneration = None
@@ -1175,7 +1142,7 @@ class Florence2Engine:
                 del probe
                 torch.cuda.synchronize()
             except Exception as exc:
-                self.cuda_error = "CUDA probe failed: %s" % exc
+                self.cuda_error = f"CUDA probe failed: {exc}"
                 if not FLORENCE_FALLBACK_TO_CPU_ON_CUDA_ERROR:
                     raise
                 self.device = "cpu"
@@ -1194,23 +1161,32 @@ class Florence2Engine:
         revision = str(FLORENCE_MODEL_REVISION or "").strip() or None
 
         local_only = bool(FLORENCE_LOCAL_FILES_ONLY)
-        use_native = bool(FLORENCE_PREFER_NATIVE and has_native
-                          and not str(model_id).startswith("microsoft/"))
+        use_native = bool(
+            FLORENCE_PREFER_NATIVE and has_native and not str(model_id).startswith("microsoft/")
+        )
 
         def _load_native():
-            base = {"attn_implementation": FLORENCE_ATTN_IMPL, "local_files_only": local_only, "revision": revision}
+            base = {
+                "attn_implementation": FLORENCE_ATTN_IMPL,
+                "local_files_only": local_only,
+                "revision": revision,
+            }
             for dtype_key in ("dtype", "torch_dtype"):
                 kw = dict(base)
                 if self.dtype is not None:
                     kw[dtype_key] = self.dtype
                 try:
                     mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **kw)
-                    prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only, revision=revision)
+                    prc = AutoProcessor.from_pretrained(
+                        model_id, local_files_only=local_only, revision=revision
+                    )
                     return mdl, prc, f"native({dtype_key})"
                 except TypeError:
                     continue
             mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **base)
-            prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only, revision=revision)
+            prc = AutoProcessor.from_pretrained(
+                model_id, local_files_only=local_only, revision=revision
+            )
             return mdl, prc, "native(no-dtype)"
 
         def _load_remote_code():
@@ -1230,7 +1206,8 @@ class Florence2Engine:
                     kw.pop("attn_implementation", None)
                     mdl = AutoModelForCausalLM.from_pretrained(model_id, **kw)
                 prc = AutoProcessor.from_pretrained(
-                    model_id, trust_remote_code=True, local_files_only=local_only, revision=revision)
+                    model_id, trust_remote_code=True, local_files_only=local_only, revision=revision
+                )
             return mdl, prc, "remote_code"
 
         try:
@@ -1248,8 +1225,11 @@ class Florence2Engine:
                     self.model, self.processor, self.impl = _load_native()
         except Exception as exc:
             text = str(exc)
-            if ("forced_bos_token_id" in text or "_supports_sdpa" in text
-                    or "Unrecognized configuration class" in text):
+            if (
+                "forced_bos_token_id" in text
+                or "_supports_sdpa" in text
+                or "Unrecognized configuration class" in text
+            ):
                 raise RuntimeError(
                     f"{exc} -- known Florence-2 remote-code break on transformers "
                     f">= 4.50. Set FLORENCE_MODEL_ID = 'florence-community/Florence-2-large' "
@@ -1262,7 +1242,7 @@ class Florence2Engine:
         except Exception as exc:
             if self.device != "cuda" or not FLORENCE_FALLBACK_TO_CPU_ON_CUDA_ERROR:
                 raise
-            self.cuda_error = "moving the model to CUDA failed: %s" % exc
+            self.cuda_error = f"moving the model to CUDA failed: {exc}"
             self.device = "cpu"
             self.dtype = torch.float32
             self.model = self.model.to(torch.float32).to("cpu")
@@ -1279,8 +1259,10 @@ class Florence2Engine:
         if abs(scale - 1.0) > 1e-6:
             work = cv2.resize(
                 gray8,
-                (max(1, int(round(gray8.shape[1] * scale))),
-                 max(1, int(round(gray8.shape[0] * scale)))),
+                (
+                    max(1, int(round(gray8.shape[1] * scale))),
+                    max(1, int(round(gray8.shape[0] * scale))),
+                ),
                 interpolation=cv2.INTER_CUBIC,
             )
         rgb = cv2.cvtColor(work, cv2.COLOR_GRAY2RGB)
@@ -1290,16 +1272,17 @@ class Florence2Engine:
         torch = self.torch
 
         try:
-            inputs = self.processor(text=[prompt] * len(images), images=images,
-                                    return_tensors="pt", padding=True)
+            inputs = self.processor(
+                text=[prompt] * len(images), images=images, return_tensors="pt", padding=True
+            )
         except Exception:
-            inputs = self.processor(text=[prompt] * len(images), images=images,
-                                    return_tensors="pt")
+            inputs = self.processor(text=[prompt] * len(images), images=images, return_tensors="pt")
         try:
             inputs = inputs.to(self.device)
         except Exception:
-            inputs = {k: (v.to(self.device) if hasattr(v, "to") else v)
-                      for k, v in dict(inputs).items()}
+            inputs = {
+                k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in dict(inputs).items()
+            }
         if self.dtype is not None and self.device != "cpu" and "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
 
@@ -1319,13 +1302,6 @@ class Florence2Engine:
         return texts, confs
 
     def _sequence_confidences(self, out, n):
-        """Sequence-level probability in 0..1 (exp of mean token log-prob).
-
-        Beam search provides `sequences_scores` (length-normalised log-prob)
-        whenever output_scores=True; otherwise it is recomputed from `scores`.
-        Returns None per item when nothing can be derived, so "unknown" is
-        distinguishable from "certain".
-        """
         torch = self.torch
         default = [None] * n
 
@@ -1342,9 +1318,12 @@ class Florence2Engine:
             sequences = getattr(out, "sequences", None)
             if scores is None or sequences is None:
                 return default
-            trans = self.model.compute_transition_scores(
-                sequences, scores, normalize_logits=True
-            ).detach().float().cpu()
+            trans = (
+                self.model.compute_transition_scores(sequences, scores, normalize_logits=True)
+                .detach()
+                .float()
+                .cpu()
+            )
             finite = torch.isfinite(trans)
             totals = torch.where(finite, trans, torch.zeros_like(trans)).sum(dim=-1)
             counts = finite.sum(dim=-1).clamp(min=1)
@@ -1354,7 +1333,6 @@ class Florence2Engine:
             return default
 
     def _generate_with_oom_retry(self, prompt, images):
-        """Halve the batch and retry on CUDA OOM instead of failing the run."""
         try:
             return self._generate(prompt, images)
         except Exception as exc:
@@ -1371,7 +1349,6 @@ class Florence2Engine:
             return left_t + right_t, left_c + right_c
 
     def _parse(self, decoded, task, size):
-        """Turn a Florence-2 completion into [(points|None, text), ...]."""
         try:
             parsed = self.processor.post_process_generation(decoded, task=task, image_size=size)
         except Exception as exc:
@@ -1405,7 +1382,6 @@ class Florence2Engine:
         return out
 
     def readtext_batch(self, grays):
-        """Return, per image, a list of (points|None, text, confidence)."""
         if not grays:
             return []
 
@@ -1417,7 +1393,9 @@ class Florence2Engine:
         decoded, confs = self._generate_with_oom_retry(FLORENCE_TASK, images)
 
         if len(decoded) != len(images):
-            raise RuntimeError(f"Florence-2 returned {len(decoded)} results for {len(images)} images")
+            raise RuntimeError(
+                f"Florence-2 returned {len(decoded)} results for {len(images)} images"
+            )
         if len(confs) != len(images):
             confs = [None] * len(images)
 
@@ -1439,8 +1417,14 @@ class Florence2Engine:
                     raise RuntimeError("Florence-2 fallback returned an incomplete batch")
                 for j, i in enumerate(need_fallback):
                     if j < len(decoded2):
-                        c = float(confs2[j]) if (j < len(confs2) and confs2[j] is not None) else None
-                        results[i] = [(pnt, t, c) for pnt, t in self._parse(decoded2[j], "<OCR>", sizes[i])]
+                        c = (
+                            float(confs2[j])
+                            if (j < len(confs2) and confs2[j] is not None)
+                            else None
+                        )
+                        results[i] = [
+                            (pnt, t, c) for pnt, t in self._parse(decoded2[j], "<OCR>", sizes[i])
+                        ]
             except Exception as exc:
                 raise RuntimeError(f"Florence-2 fallback OCR failed: {exc}") from exc
 
@@ -1451,9 +1435,11 @@ class Florence2Engine:
             final.append(hits)
 
         self._calls_done += 1
-        if (FLORENCE_EMPTY_CACHE_EVERY_N_CALLS
-                and self.device == "cuda"
-                and self._calls_done % int(FLORENCE_EMPTY_CACHE_EVERY_N_CALLS) == 0):
+        if (
+            FLORENCE_EMPTY_CACHE_EVERY_N_CALLS
+            and self.device == "cuda"
+            and self._calls_done % int(FLORENCE_EMPTY_CACHE_EVERY_N_CALLS) == 0
+        ):
             try:
                 self.torch.cuda.empty_cache()
             except Exception:
@@ -1467,11 +1453,12 @@ class Florence2Engine:
 
 
 FLORENCE_WORKER_SOURCE = r"""
-import sys, os, json, traceback
+import json
+import os
+import sys
+import traceback
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-# PYTORCH_CUDA_ALLOC_CONF is deliberately NOT set here; the parent decides,
-# because expandable_segments forces PyTorch down the NVML code path.
 
 
 def emit(obj):
@@ -1499,32 +1486,31 @@ def main():
         os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(cache_dir, "hub")
 
     try:
+        from unittest.mock import patch
+
         import numpy as np
         import torch
         import transformers
         from PIL import Image
-        from unittest.mock import patch
         from transformers import AutoModelForCausalLM, AutoProcessor
     except Exception as exc:
-        emit({"ready": False, "error": "import failed: %s" % exc})
+        emit({"ready": False, "error": f"import failed: {exc}"})
         log(traceback.format_exc())
         return 1
 
     tf_version = getattr(transformers, "__version__", "?")
 
-    # Native Florence-2 support landed in transformers on 2025-08-20. When the
-    # class exists we use it and skip trust_remote_code entirely.
     try:
         from transformers import Florence2ForConditionalGeneration
+
         HAS_NATIVE = True
     except Exception:
         Florence2ForConditionalGeneration = None
         HAS_NATIVE = False
 
     def fixed_get_imports(filename):
-        # Florence-2's remote code imports flash_attn at module scope even
-        # though it runs fine with sdpa (huggingface/transformers#31793).
         from transformers.dynamic_module_utils import get_imports
+
         imports = get_imports(filename)
         if str(filename).endswith("modeling_florence2.py") and "flash_attn" in imports:
             imports = [im for im in imports if im != "flash_attn"]
@@ -1538,20 +1524,16 @@ def main():
         try:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         except Exception as exc:
-            cuda_error = "torch.cuda.is_available() failed: %s" % exc
+            cuda_error = f"torch.cuda.is_available() failed: {exc}"
             device = "cpu"
 
-    # torch.cuda.is_available() can report True while the CUDA context is
-    # actually unusable (driver/NVML mismatch, driver updated without a reboot,
-    # container without the NVIDIA runtime). Probe with a real allocation so the
-    # failure happens here, cheaply, rather than mid-run.
     if device == "cuda":
         try:
             probe = torch.zeros(1, device="cuda")
             del probe
             torch.cuda.synchronize()
         except Exception as exc:
-            cuda_error = "CUDA probe failed: %s" % exc
+            cuda_error = f"CUDA probe failed: {exc}"
             log(cuda_error)
             if not allow_cpu_fallback:
                 emit({"ready": False, "error": cuda_error})
@@ -1562,10 +1544,11 @@ def main():
     if device == "cpu":
         dtype = torch.float32
     else:
-        dtype = {"float16": torch.float16,
-                 "bfloat16": torch.bfloat16,
-                 "float32": torch.float32}.get(str(cfg.get("dtype", "float16")).lower(),
-                                               torch.float16)
+        dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }.get(str(cfg.get("dtype", "float16")).lower(), torch.float16)
 
     model_id = cfg.get("model_id", "florence-community/Florence-2-large")
     revision = str(cfg.get("revision") or "").strip() or None
@@ -1573,41 +1556,45 @@ def main():
     native_map = cfg.get("native_equivalent") or {}
     prefer_native = bool(cfg.get("prefer_native", True))
 
-    # Remap legacy microsoft/* ids onto their native equivalents.
     if prefer_native and HAS_NATIVE and model_id in native_map:
-        log("remapping %s -> %s (native transformers implementation)"
-            % (model_id, native_map[model_id]))
+        log(f"remapping {model_id} -> {native_map[model_id]} (native transformers implementation)")
         model_id = native_map[model_id]
 
-    use_native = bool(prefer_native and HAS_NATIVE
-                      and not str(model_id).startswith("microsoft/"))
+    use_native = bool(prefer_native and HAS_NATIVE and not str(model_id).startswith("microsoft/"))
 
     def load_native():
-        # transformers v5 renamed torch_dtype to dtype; try both.
-        base = {"attn_implementation": cfg.get("attn_impl", "sdpa"),
-                "local_files_only": local_only, "revision": revision}
+        base = {
+            "attn_implementation": cfg.get("attn_impl", "sdpa"),
+            "local_files_only": local_only,
+            "revision": revision,
+        }
         for dtype_key in ("dtype", "torch_dtype"):
             kw = dict(base)
             kw[dtype_key] = dtype
             try:
                 mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **kw)
-                prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only, revision=revision)
-                return mdl, prc, "native(%s)" % dtype_key
+                prc = AutoProcessor.from_pretrained(
+                    model_id, local_files_only=local_only, revision=revision
+                )
+                return mdl, prc, f"native({dtype_key})"
             except TypeError as exc:
-                log("native load with %s failed: %s" % (dtype_key, exc))
+                log(f"native load with {dtype_key} failed: {exc}")
                 continue
-        # Last resort: no dtype argument at all.
         mdl = Florence2ForConditionalGeneration.from_pretrained(model_id, **base)
-        prc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only, revision=revision)
+        prc = AutoProcessor.from_pretrained(
+            model_id, local_files_only=local_only, revision=revision
+        )
         return mdl, prc, "native(no-dtype)"
 
     def load_remote_code():
-        kw = {"trust_remote_code": True,
-              "attn_implementation": cfg.get("attn_impl", "sdpa"),
-              "local_files_only": local_only,
-              "revision": revision,
-              "low_cpu_mem_usage": True,
-              "torch_dtype": dtype}
+        kw = {
+            "trust_remote_code": True,
+            "attn_implementation": cfg.get("attn_impl", "sdpa"),
+            "local_files_only": local_only,
+            "revision": revision,
+            "low_cpu_mem_usage": True,
+            "torch_dtype": dtype,
+        }
         with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports):
             try:
                 mdl = AutoModelForCausalLM.from_pretrained(model_id, **kw)
@@ -1615,7 +1602,8 @@ def main():
                 kw.pop("attn_implementation", None)
                 mdl = AutoModelForCausalLM.from_pretrained(model_id, **kw)
             prc = AutoProcessor.from_pretrained(
-                model_id, trust_remote_code=True, local_files_only=local_only, revision=revision)
+                model_id, trust_remote_code=True, local_files_only=local_only, revision=revision
+            )
         return mdl, prc, "remote_code"
 
     impl = "?"
@@ -1625,7 +1613,7 @@ def main():
             try:
                 model, processor, impl = load_native()
             except Exception as exc:
-                errors.append("native: %s" % exc)
+                errors.append(f"native: {exc}")
                 log(traceback.format_exc())
                 log("native load failed; falling back to remote code")
                 model, processor, impl = load_remote_code()
@@ -1633,7 +1621,7 @@ def main():
             try:
                 model, processor, impl = load_remote_code()
             except Exception as exc:
-                errors.append("remote_code: %s" % exc)
+                errors.append(f"remote_code: {exc}")
                 log(traceback.format_exc())
                 if not HAS_NATIVE:
                     raise
@@ -1645,7 +1633,7 @@ def main():
         except Exception as exc:
             if device != "cuda" or not allow_cpu_fallback:
                 raise
-            cuda_error = "moving the model to CUDA failed: %s" % exc
+            cuda_error = f"moving the model to CUDA failed: {exc}"
             log(cuda_error)
             log("falling back to CPU")
             device = "cpu"
@@ -1655,26 +1643,46 @@ def main():
     except Exception as exc:
         hint = ""
         text = " ".join(errors) + " " + str(exc)
-        if ("forced_bos_token_id" in text or "_supports_sdpa" in text
-                or "Unrecognized configuration class" in text):
-            hint = (" -- this is the known Florence-2 remote-code break on "
-                    "transformers >= 4.50. Use FLORENCE_MODEL_ID = "
-                    "'florence-community/Florence-2-large' (needs transformers "
-                    ">= 4.56), or pin transformers==4.49.0.")
+        if (
+            "forced_bos_token_id" in text
+            or "_supports_sdpa" in text
+            or "Unrecognized configuration class" in text
+        ):
+            hint = (
+                " -- this is the known Florence-2 remote-code break on "
+                "transformers >= 4.50. Use FLORENCE_MODEL_ID = "
+                "'florence-community/Florence-2-large' (needs transformers "
+                ">= 4.56), or pin transformers==4.49.0."
+            )
         elif "nvml" in text.lower() or "NVML_SUCCESS" in text:
-            hint = (" -- CUDA/NVML could not be initialised. Check `nvidia-smi`; "
-                    "a driver update without a reboot is the usual cause. Set "
-                    "FLORENCE_DEVICE = 'cpu' to run without the GPU.")
-        emit({"ready": False,
-              "error": "model load failed: %s%s" % (exc, hint),
-              "transformers": tf_version,
-              "has_native": HAS_NATIVE})
+            hint = (
+                " -- CUDA/NVML could not be initialised. Check `nvidia-smi`; "
+                "a driver update without a reboot is the usual cause. Set "
+                "FLORENCE_DEVICE = 'cpu' to run without the GPU."
+            )
+        emit(
+            {
+                "ready": False,
+                "error": f"model load failed: {exc}{hint}",
+                "transformers": tf_version,
+                "has_native": HAS_NATIVE,
+            }
+        )
         log(traceback.format_exc())
         return 1
 
-    emit({"ready": True, "device": device, "dtype": str(dtype), "model_id": model_id,
-          "impl": impl, "transformers": tf_version, "cuda_error": cuda_error,
-          "checkpoint_revision": getattr(model.config, "_commit_hash", None) or revision})
+    emit(
+        {
+            "ready": True,
+            "device": device,
+            "dtype": str(dtype),
+            "model_id": model_id,
+            "impl": impl,
+            "transformers": tf_version,
+            "cuda_error": cuda_error,
+            "checkpoint_revision": getattr(model.config, "_commit_hash", None) or revision,
+        }
+    )
 
     task = cfg.get("task", "<OCR_WITH_REGION>")
     fallback_plain = bool(cfg.get("fallback_plain_ocr", True))
@@ -1689,16 +1697,14 @@ def main():
         img = Image.fromarray(gray).convert("RGB")
         scale = upscale if upscale and upscale > 0 else 1.0
         if abs(scale - 1.0) > 1e-6:
-            img = img.resize((max(1, int(round(img.width * scale))),
-                              max(1, int(round(img.height * scale)))),
-                             Image.BICUBIC)
+            img = img.resize(
+                (max(1, int(round(img.width * scale))), max(1, int(round(img.height * scale)))),
+                Image.BICUBIC,
+            )
             return img, scale
         return img, 1.0
 
     def sequence_confidences(out, n):
-        # exp of the length-normalised log-prob, clipped to 0..1.
-        # Returns None per item when nothing can be derived, so the caller can
-        # tell "confident" apart from "unknown" instead of silently seeing 1.0.
         default = [None] * n
         try:
             seq_scores = getattr(out, "sequences_scores", None)
@@ -1712,8 +1718,12 @@ def main():
             sequences = getattr(out, "sequences", None)
             if scores is None or sequences is None:
                 return default
-            trans = model.compute_transition_scores(
-                sequences, scores, normalize_logits=True).detach().float().cpu()
+            trans = (
+                model.compute_transition_scores(sequences, scores, normalize_logits=True)
+                .detach()
+                .float()
+                .cpu()
+            )
             finite = torch.isfinite(trans)
             totals = torch.where(finite, trans, torch.zeros_like(trans)).sum(dim=-1)
             counts = finite.sum(dim=-1).clamp(min=1)
@@ -1725,26 +1735,17 @@ def main():
     def generate(prompt, images):
         texts_in = [prompt] * len(images)
         try:
-            inputs = processor(text=texts_in, images=images,
-                               return_tensors="pt", padding=True)
+            inputs = processor(text=texts_in, images=images, return_tensors="pt", padding=True)
         except Exception:
             inputs = processor(text=texts_in, images=images, return_tensors="pt")
 
-        # Forward everything the processor produced (input_ids, pixel_values and
-        # attention_mask if present) rather than hand-picking keys.
         try:
             inputs = inputs.to(device)
         except Exception:
-            inputs = {k: (v.to(device) if hasattr(v, "to") else v)
-                      for k, v in dict(inputs).items()}
+            inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in dict(inputs).items()}
         if device != "cpu" and "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(dtype)
 
-        # output_scores=True is REQUIRED for any confidence at all: both
-        # `scores` and beam search's `sequences_scores` are only returned when
-        # it is set. Turning it off silently makes every confidence unknown,
-        # which makes FLORENCE_MIN_CONFIDENCE a no-op. With max_new_tokens=64
-        # the cost is roughly 40 MB per call, which is worth paying.
         with torch.inference_mode():
             out = model.generate(
                 **inputs,
@@ -1791,7 +1792,7 @@ def main():
         try:
             parsed = processor.post_process_generation(decoded, task=tsk, image_size=size)
         except Exception as exc:
-            raise RuntimeError("Florence-2 output parsing failed: %s" % exc) from exc
+            raise RuntimeError(f"Florence-2 output parsing failed: {exc}") from exc
         payload = parsed.get(tsk) if isinstance(parsed, dict) else None
         if payload is None:
             return []
@@ -1819,15 +1820,19 @@ def main():
 
         decoded, confs = generate_oom_safe(task, images)
         if len(decoded) != len(images):
-            raise RuntimeError("Florence-2 returned %d results for %d images" % (len(decoded), len(images)))
+            raise RuntimeError(
+                f"Florence-2 returned {len(decoded)} results for {len(images)} images"
+            )
         if len(confs) != len(images):
             confs = [None] * len(images)
 
         if not warned_no_conf[0] and all(c is None for c in confs):
             warned_no_conf[0] = True
-            log("WARNING: no generation scores available from this model/"
+            log(
+                "WARNING: no generation scores available from this model/"
                 "transformers version. Confidence will be reported as null and "
-                "FLORENCE_MIN_CONFIDENCE cannot filter anything.")
+                "FLORENCE_MIN_CONFIDENCE cannot filter anything."
+            )
 
         results = []
         need_fallback = []
@@ -1849,7 +1854,7 @@ def main():
                         c = float(cf2[j]) if (j < len(cf2) and cf2[j] is not None) else None
                         results[i] = [(p, t, c) for p, t in parse(dec2[j], "<OCR>", sizes[i])]
             except Exception as exc:
-                raise RuntimeError("Florence-2 fallback OCR failed: %s" % exc) from exc
+                raise RuntimeError(f"Florence-2 fallback OCR failed: {exc}") from exc
 
         final = []
         for hits, scale in zip(results, scales):
@@ -1857,8 +1862,9 @@ def main():
             for pts, txt, conf in hits:
                 if pts is not None and abs(scale - 1.0) > 1e-6:
                     pts = (np.asarray(pts, dtype=np.float32) / scale).tolist()
-                rows.append({"points": pts, "text": txt,
-                             "conf": (None if conf is None else float(conf))})
+                rows.append(
+                    {"points": pts, "text": txt, "conf": (None if conf is None else float(conf))}
+                )
             final.append(rows)
 
         calls[0] += 1
@@ -1876,7 +1882,7 @@ def main():
         try:
             req = json.loads(line)
         except Exception as exc:
-            emit({"ok": False, "error": "bad request: %s" % exc})
+            emit({"ok": False, "error": f"bad request: {exc}"})
             continue
 
         cmd = req.get("cmd", "ocr")
@@ -1902,11 +1908,6 @@ if __name__ == "__main__":
 
 
 def _florence_worker_python():
-    """Locate a real Python interpreter for the worker.
-
-    sys.executable can point at the Slicer application binary rather than an
-    interpreter, so PythonSlicer is preferred when it can be found.
-    """
     exe = str(FLORENCE_WORKER_PYTHON or "").strip()
     if exe and os.path.exists(exe):
         return exe
@@ -1915,14 +1916,18 @@ def _florence_worker_python():
     try:
         home = slicer.app.slicerHome
         if home:
-            candidates += [os.path.join(home, "bin", "PythonSlicer"),
-                           os.path.join(home, "bin", "PythonSlicer.exe")]
+            candidates += [
+                os.path.join(home, "bin", "PythonSlicer"),
+                os.path.join(home, "bin", "PythonSlicer.exe"),
+            ]
     except Exception:
         pass
     bindir = os.path.dirname(sys.executable or "")
     if bindir:
-        candidates += [os.path.join(bindir, "PythonSlicer"),
-                       os.path.join(bindir, "PythonSlicer.exe")]
+        candidates += [
+            os.path.join(bindir, "PythonSlicer"),
+            os.path.join(bindir, "PythonSlicer.exe"),
+        ]
     try:
         found = shutil.which("PythonSlicer")
         if found:
@@ -1937,16 +1942,6 @@ def _florence_worker_python():
 
 
 def _florence_worker_env(minimal=False):
-    """Environment for the worker.
-
-    Slicer prepends its own library directories to LD_LIBRARY_PATH, which can
-    shadow the system NVIDIA libraries and make NVML fail inside child
-    processes. slicer.util.startupEnvironment() returns the environment as it
-    was before Slicer modified it, which is what external processes want.
-
-    minimal=True drops every CUDA-related variable this module would otherwise
-    set, so a GPU failure can be attributed to the machine rather than to us.
-    """
     env = None
     if FLORENCE_USE_SLICER_STARTUP_ENV:
         try:
@@ -1981,7 +1976,9 @@ def _florence_worker_env(minimal=False):
 
 
 FLORENCE_GPU_PROBE_SOURCE = r"""
-import os, sys, json
+import json
+import os
+import sys
 
 info = {
     "python": sys.executable,
@@ -1989,26 +1986,26 @@ info = {
     "LD_LIBRARY_PATH": (os.environ.get("LD_LIBRARY_PATH") or "")[:400],
 }
 
-# Where does the loader find NVML? A stub or a version-mismatched copy here is
-# a classic cause of nvmlInit_v2() failing while the GPU itself is fine.
 try:
     import ctypes.util
+
     info["find_library_nvidia-ml"] = ctypes.util.find_library("nvidia-ml")
 except Exception as exc:
     info["find_library_error"] = str(exc)
 
 try:
     import ctypes
+
     lib = ctypes.CDLL("libnvidia-ml.so.1")
     rc = lib.nvmlInit_v2()
-    info["direct_nvmlInit_v2"] = ("ok" if rc == 0 else "FAILED rc=%d" % rc)
+    info["direct_nvmlInit_v2"] = "ok" if rc == 0 else f"FAILED rc={rc}"
 except Exception as exc:
-    info["direct_nvmlInit_v2"] = "could not load libnvidia-ml.so.1: %s" % exc
+    info["direct_nvmlInit_v2"] = f"could not load libnvidia-ml.so.1: {exc}"
 
 try:
     import torch
+
     info["torch"] = torch.__version__
-    # None here means a CPU-ONLY wheel: no CUDA support was compiled in.
     info["torch_built_with_cuda"] = torch.version.cuda
     try:
         info["is_available"] = bool(torch.cuda.is_available())
@@ -2019,12 +2016,12 @@ try:
     if info.get("is_available"):
         try:
             info["device_count"] = torch.cuda.device_count()
-            info["device_names"] = [torch.cuda.get_device_name(i)
-                                    for i in range(torch.cuda.device_count())]
+            info["device_names"] = [
+                torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())
+            ]
         except Exception as exc:
             info["device_query_error"] = str(exc)
 
-        # Stage 1: plain allocation, no allocator features.
         try:
             t = torch.zeros(8, device="cuda")
             t = t + 1
@@ -2032,23 +2029,29 @@ try:
             info["allocation_probe"] = "ok"
             del t
         except Exception as exc:
-            info["allocation_probe"] = "FAILED: %s" % exc
+            info["allocation_probe"] = f"FAILED: {exc}"
 
-        # Stage 2: does expandable_segments specifically break it? That option
-        # routes the allocator through DriverAPI -> nvmlInit_v2().
         try:
             import subprocess as _sp
-            code = ("import torch; torch.zeros(8, device='cuda'); "
-                    "torch.cuda.synchronize(); print('ok')")
+
+            code = (
+                "import torch; torch.zeros(8, device='cuda'); "
+                "torch.cuda.synchronize(); print('ok')"
+            )
             _env = dict(os.environ)
             _env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-            pr = _sp.run([sys.executable, "-c", code], capture_output=True,
-                         text=True, timeout=180, env=_env)
+            pr = _sp.run(
+                [sys.executable, "-c", code], capture_output=True, text=True, timeout=180, env=_env
+            )
             info["expandable_segments_probe"] = (
-                "ok" if pr.returncode == 0 else
-                "FAILED: %s" % ((pr.stderr or pr.stdout).strip().splitlines() or [""])[-1])
+                "ok"
+                if pr.returncode == 0
+                else "FAILED: {}".format(
+                    ((pr.stderr or pr.stdout).strip().splitlines() or [""])[-1]
+                )
+            )
         except Exception as exc:
-            info["expandable_segments_probe"] = "could not test: %s" % exc
+            info["expandable_segments_probe"] = f"could not test: {exc}"
 except Exception as exc:
     info["torch_import_error"] = str(exc)
 
@@ -2057,45 +2060,42 @@ print(json.dumps(info, indent=2))
 
 
 def florence_gpu_report():
-    '''Diagnose GPU availability in the worker's own context.
-
-    Run from Slicer's Python console:
-
-        from HeadCTDeid import florence_gpu_report
-        print(florence_gpu_report())
-
-    The probe runs in the same interpreter and environment as the Florence-2
-    worker, so its answer reflects what the worker will actually see - which can
-    differ from what Slicer's own Python reports.
-    '''
     lines = []
     exe = _florence_worker_python()
     env = _florence_worker_env()
 
-    lines.append("worker interpreter : %s" % exe)
-    lines.append("FLORENCE_DEVICE    : %s" % FLORENCE_DEVICE)
-    lines.append("CUDA_VISIBLE_DEVICES set for worker: %s"
-                 % env.get("CUDA_VISIBLE_DEVICES"))
-    lines.append("PYTORCH_CUDA_ALLOC_CONF   : %s"
-                 % (env.get("PYTORCH_CUDA_ALLOC_CONF") or "<unset>"))
+    lines.append(f"worker interpreter : {exe}")
+    lines.append(f"FLORENCE_DEVICE    : {FLORENCE_DEVICE}")
+    lines.append("CUDA_VISIBLE_DEVICES set for worker: {}".format(env.get("CUDA_VISIBLE_DEVICES")))
+    lines.append(
+        "PYTORCH_CUDA_ALLOC_CONF   : " f'{env.get("PYTORCH_CUDA_ALLOC_CONF") or "<unset>"}'
+    )
     lines.append("")
 
     try:
-        pr = subprocess.run(["nvidia-smi",
-                             "--query-gpu=index,name,driver_version,memory.total,memory.used",
-                             "--format=csv,noheader"],
-                            capture_output=True, text=True, timeout=30, env=env)
+        pr = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,driver_version,memory.total,memory.used",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
         if pr.returncode == 0 and pr.stdout.strip():
             lines.append("nvidia-smi:")
             for row in pr.stdout.strip().splitlines():
                 lines.append("    " + row.strip())
         else:
-            lines.append("nvidia-smi FAILED (rc=%s): %s"
-                         % (pr.returncode, (pr.stderr or pr.stdout).strip()[:300]))
+            lines.append(
+                f"nvidia-smi FAILED (rc={pr.returncode}): {(pr.stderr or pr.stdout).strip()[:300]}"
+            )
     except FileNotFoundError:
         lines.append("nvidia-smi: not found on PATH")
     except Exception as exc:
-        lines.append("nvidia-smi error: %s" % exc)
+        lines.append(f"nvidia-smi error: {exc}")
     lines.append("")
 
     info = {}
@@ -2104,63 +2104,96 @@ def florence_gpu_report():
         script = os.path.join(tmpdir, "gpu_probe.py")
         with open(script, "w", encoding="utf-8") as f:
             f.write(FLORENCE_GPU_PROBE_SOURCE)
-        pr = subprocess.run([exe, script], capture_output=True, text=True,
-                            timeout=300, env=env, cwd=tmpdir)
+        pr = subprocess.run(
+            [exe, script], capture_output=True, text=True, timeout=300, env=env, cwd=tmpdir
+        )
         lines.append("torch probe (in worker environment):")
         out = (pr.stdout or "").strip()
         lines.append(out if out else "    <no output>")
         if pr.returncode != 0:
-            lines.append("    probe exited rc=%s: %s" % (pr.returncode, (pr.stderr or "").strip()[:500]))
+            lines.append(
+                "    probe exited rc={}: {}".format(pr.returncode, (pr.stderr or "").strip()[:500])
+            )
         try:
             info = json.loads(out)
         except Exception:
             info = {}
     except Exception as exc:
-        lines.append("torch probe failed to run: %s" % exc)
+        lines.append(f"torch probe failed to run: {exc}")
     lines.append("")
 
     lines.append("diagnosis:")
     if info.get("torch_import_error"):
-        lines.append("    torch cannot be imported by the worker interpreter: %s"
-                     % info["torch_import_error"])
-        lines.append("    -> install torch into that interpreter, or point "
-                     "FLORENCE_WORKER_PYTHON at one that has it.")
+        lines.append(
+            "    torch cannot be imported by the worker interpreter: {}".format(
+                info["torch_import_error"]
+            )
+        )
+        lines.append(
+            "    -> install torch into that interpreter, or point "
+            "FLORENCE_WORKER_PYTHON at one that has it."
+        )
     elif info.get("torch_built_with_cuda") in (None, "None", ""):
-        lines.append("    torch %s is a CPU-ONLY build (torch.version.cuda is None)."
-                     % info.get("torch", "?"))
+        lines.append(
+            "    torch {} is a CPU-ONLY build (torch.version.cuda is None).".format(
+                info.get("torch", "?")
+            )
+        )
         lines.append("    No GPU is possible with this wheel, regardless of driver.")
         lines.append("    -> reinstall a CUDA build, e.g.")
-        lines.append("       pip install --force-reinstall torch "
-                     "--index-url https://download.pytorch.org/whl/cu124")
+        lines.append(
+            "       pip install --force-reinstall torch "
+            "--index-url https://download.pytorch.org/whl/cu124"
+        )
     elif not info.get("is_available"):
-        lines.append("    torch was built with CUDA %s but reports no usable device."
-                     % info.get("torch_built_with_cuda"))
+        lines.append(
+            "    torch was built with CUDA {} but reports no usable device.".format(
+                info.get("torch_built_with_cuda")
+            )
+        )
         if info.get("is_available_error"):
-            lines.append("    error: %s" % info["is_available_error"])
-        lines.append("    -> if nvidia-smi above also failed, this is a driver problem "
-                     "(a driver update without a reboot is the usual cause).")
-        lines.append("    -> if nvidia-smi works, CUDA_VISIBLE_DEVICES may be excluding "
-                     "the GPU: try FLORENCE_CUDA_VISIBLE_DEVICES = \"\" to leave it unset.")
+            lines.append("    error: {}".format(info["is_available_error"]))
+        lines.append(
+            "    -> if nvidia-smi above also failed, this is a driver problem "
+            "(a driver update without a reboot is the usual cause)."
+        )
+        lines.append(
+            "    -> if nvidia-smi works, CUDA_VISIBLE_DEVICES may be excluding "
+            'the GPU: try FLORENCE_CUDA_VISIBLE_DEVICES = "" to leave it unset.'
+        )
     elif str(info.get("allocation_probe", "")).startswith("FAILED"):
-        lines.append("    the device is visible but plain allocation fails: %s"
-                     % info.get("allocation_probe"))
+        lines.append(
+            "    the device is visible but plain allocation fails: {}".format(
+                info.get("allocation_probe")
+            )
+        )
         if str(info.get("direct_nvmlInit_v2", "")).lower().find("ok") < 0:
-            lines.append("    NVML itself does not initialise (%s)."
-                         % info.get("direct_nvmlInit_v2"))
-            lines.append("    -> driver/NVML mismatch on the machine. A driver updated "
-                         "without a reboot is the usual cause; reboot and retest.")
+            lines.append(
+                "    NVML itself does not initialise ({}).".format(info.get("direct_nvmlInit_v2"))
+            )
+            lines.append(
+                "    -> driver/NVML mismatch on the machine. A driver updated "
+                "without a reboot is the usual cause; reboot and retest."
+            )
         else:
             lines.append("    -> driver/library mismatch, or another process holds all VRAM.")
     elif str(info.get("expandable_segments_probe", "")).startswith("FAILED"):
         lines.append("    plain CUDA allocation WORKS, but expandable_segments fails:")
-        lines.append("      %s" % info.get("expandable_segments_probe"))
-        lines.append("    -> keep FLORENCE_PYTORCH_CUDA_ALLOC_CONF = \"\" (the default). "
-                     "That option routes the allocator through NVML, which is broken here.")
+        lines.append("      {}".format(info.get("expandable_segments_probe")))
+        lines.append(
+            '    -> keep FLORENCE_PYTORCH_CUDA_ALLOC_CONF = "" (the default). '
+            "That option routes the allocator through NVML, which is broken here."
+        )
     else:
-        lines.append("    GPU looks usable from the worker: %s"
-                     % ", ".join(info.get("device_names") or ["?"]))
-        lines.append("    -> if Florence-2 still runs on CPU, check the worker stderr log "
-                     "for a fallback message, and confirm FLORENCE_DEVICE is 'auto' or 'cuda'.")
+        lines.append(
+            "    GPU looks usable from the worker: {}".format(
+                ", ".join(info.get("device_names") or ["?"])
+            )
+        )
+        lines.append(
+            "    -> if Florence-2 still runs on CPU, check the worker stderr log "
+            "for a fallback message, and confirm FLORENCE_DEVICE is 'auto' or 'cuda'."
+        )
 
     report = "\n".join(lines)
     try:
@@ -2171,11 +2204,6 @@ def florence_gpu_report():
 
 
 class Florence2WorkerClient:
-    """Parent-side handle on the Florence-2 worker process.
-
-    Exposes the same readtext()/readtext_batch() surface as the in-process
-    Florence2Engine, so DicomProcessor does not care which one it is holding.
-    """
 
     def __init__(self, logger=None):
         self.logger = logger
@@ -2257,12 +2285,16 @@ class Florence2WorkerClient:
 
         _safe_show_status(
             f"Loading {FLORENCE_MODEL_ID} in a worker process "
-            f"(first run downloads the weights, ~1.5 GB)...", 10000)
+            f"(first run downloads the weights, ~1.5 GB)...",
+            10000,
+        )
 
         line = self._read_json(timeout_sec=float(FLORENCE_WORKER_LOAD_TIMEOUT_SEC))
         if not line or not line.get("ready"):
             err = (line or {}).get("error", "worker did not start")
-            self._log(f"Florence-2 worker failed to start: {err}\n{self._stderr_tail()}", error=True)
+            self._log(
+                f"Florence-2 worker failed to start: {err}\n{self._stderr_tail()}", error=True
+            )
             self.close()
             raise RuntimeError(err)
 
@@ -2273,18 +2305,22 @@ class Florence2WorkerClient:
         self.transformers_version = line.get("transformers", "?")
         self.checkpoint_revision = line.get("checkpoint_revision")
         self.cuda_error = line.get("cuda_error")
-        self._log(f"Florence-2 worker ready: model={self.model_id} impl={self.impl} "
-                  f"device={self.device} dtype={self.dtype} "
-                  f"transformers={self.transformers_version}"
-                  f"{' [minimal env]' if minimal_env else ''}")
+        self._log(
+            f"Florence-2 worker ready: model={self.model_id} impl={self.impl} "
+            f"device={self.device} dtype={self.dtype} "
+            f"transformers={self.transformers_version}"
+            f"{' [minimal env]' if minimal_env else ''}"
+        )
 
         if self.cuda_error:
             nvml_related = "nvml" in str(self.cuda_error).lower()
-            if (nvml_related and not minimal_env
-                    and FLORENCE_RETRY_CUDA_WITH_MINIMAL_ENV):
-                self._log("Florence-2: NVML failure on first launch; retrying with a "
-                          "minimal environment (no PYTORCH_CUDA_ALLOC_CONF, no "
-                          "CUDA_VISIBLE_DEVICES override).", error=True)
+            if nvml_related and not minimal_env and FLORENCE_RETRY_CUDA_WITH_MINIMAL_ENV:
+                self._log(
+                    "Florence-2: NVML failure on first launch; retrying with a "
+                    "minimal environment (no PYTORCH_CUDA_ALLOC_CONF, no "
+                    "CUDA_VISIBLE_DEVICES override).",
+                    error=True,
+                )
                 _safe_show_status("Retrying Florence-2 GPU init with a clean environment...", 6000)
                 try:
                     self.close()
@@ -2295,9 +2331,12 @@ class Florence2WorkerClient:
 
             self._log(f"Florence-2 fell back to {self.device}: {self.cuda_error}", error=True)
             if minimal_env:
-                self._log("The GPU also failed with a minimal environment, so this is a "
-                          "driver/NVML problem on the machine rather than a setting in "
-                          "this module. Run florence_gpu_report() for details.", error=True)
+                self._log(
+                    "The GPU also failed with a minimal environment, so this is a "
+                    "driver/NVML problem on the machine rather than a setting in "
+                    "this module. Run florence_gpu_report() for details.",
+                    error=True,
+                )
             _safe_show_status(f"Florence-2 running on {self.device} (GPU unavailable).", 8000)
 
     def _pump_stdout(self):
@@ -2310,7 +2349,6 @@ class Florence2WorkerClient:
             self._out_q.put(None)
 
     def _read_json(self, timeout_sec):
-        """Block for one JSON line, keeping the Slicer UI responsive."""
         deadline = time.time() + float(timeout_sec)
         while time.time() < deadline:
             try:
@@ -2355,8 +2393,11 @@ class Florence2WorkerClient:
         if self._restarts >= int(FLORENCE_WORKER_MAX_RESTARTS):
             return False
         self._restarts += 1
-        self._log(f"Restarting Florence-2 worker (attempt {self._restarts}) after:"
-                  f"\n{self._stderr_tail()}", error=True)
+        self._log(
+            f"Restarting Florence-2 worker (attempt {self._restarts}) after:"
+            f"\n{self._stderr_tail()}",
+            error=True,
+        )
         try:
             self.close()
         except Exception:
@@ -2410,13 +2451,19 @@ class Florence2WorkerClient:
                     pts = r.get("points")
                     pts = None if pts is None else np.asarray(pts, dtype=np.float32).reshape(-1, 2)
                     conf = r.get("conf", None)
-                    hits.append((pts, _strip_special(r.get("text", "")),
-                                 None if conf is None else float(conf)))
+                    hits.append(
+                        (
+                            pts,
+                            _strip_special(r.get("text", "")),
+                            None if conf is None else float(conf),
+                        )
+                    )
                 out.append(hits)
 
             if len(out) != len(grays):
                 raise RuntimeError(
-                    f"Florence-2 worker returned {len(out)} results for {len(grays)} images")
+                    f"Florence-2 worker returned {len(out)} results for {len(grays)} images"
+                )
             return out
 
         finally:
@@ -2450,9 +2497,11 @@ class Florence2WorkerClient:
                         except Exception:
                             pass
         finally:
-            for closer in (self.proc.stdin if self.proc else None,
-                           self.proc.stdout if self.proc else None,
-                           self._stderr_handle):
+            for closer in (
+                self.proc.stdin if self.proc else None,
+                self.proc.stdout if self.proc else None,
+                self._stderr_handle,
+            ):
                 try:
                     if closer:
                         closer.close()
@@ -2466,7 +2515,6 @@ _FLORENCE_LOAD_FAILED = False
 
 
 def get_shared_florence_engine(logger=None):
-    """Return the shared engine (worker process by default), or None."""
     global _FLORENCE_SHARED_ENGINE, _FLORENCE_LOAD_FAILED
 
     if _FLORENCE_SHARED_ENGINE is not None:
@@ -2481,12 +2529,16 @@ def get_shared_florence_engine(logger=None):
         else:
             _safe_show_status(
                 f"Loading {FLORENCE_MODEL_ID} in-process "
-                f"(first run downloads the weights, ~1.5 GB)...", 10000)
+                f"(first run downloads the weights, ~1.5 GB)...",
+                10000,
+            )
             engine = Florence2Engine()
             where = "in-process"
 
-        msg = (f"Florence-2 ready ({where}): model={FLORENCE_MODEL_ID} "
-               f"device={engine.device} dtype={engine.dtype} task={FLORENCE_TASK}")
+        msg = (
+            f"Florence-2 ready ({where}): model={FLORENCE_MODEL_ID} "
+            f"device={engine.device} dtype={engine.dtype} task={FLORENCE_TASK}"
+        )
         if logger:
             try:
                 logger.info(msg)
@@ -2494,11 +2546,17 @@ def get_shared_florence_engine(logger=None):
                 pass
         _safe_show_status(msg, 3000)
 
-        _update_run_provenance({"observed_model": {
-            "model_id": getattr(engine, "model_id", FLORENCE_MODEL_ID),
-            "checkpoint_revision": getattr(engine, "checkpoint_revision", None),
-            "implementation": getattr(engine, "impl", None),
-            "device": str(engine.device), "dtype": str(engine.dtype)}})
+        _update_run_provenance(
+            {
+                "observed_model": {
+                    "model_id": getattr(engine, "model_id", FLORENCE_MODEL_ID),
+                    "checkpoint_revision": getattr(engine, "checkpoint_revision", None),
+                    "implementation": getattr(engine, "impl", None),
+                    "device": str(engine.device),
+                    "dtype": str(engine.dtype),
+                }
+            }
+        )
         _FLORENCE_SHARED_ENGINE = engine
         return engine
 
@@ -2514,7 +2572,6 @@ def get_shared_florence_engine(logger=None):
 
 
 def shutdown_shared_florence_engine():
-    """Release the model and its memory. Safe to call more than once."""
     global _FLORENCE_SHARED_ENGINE, _FLORENCE_LOAD_FAILED
 
     engine = _FLORENCE_SHARED_ENGINE
@@ -2530,20 +2587,14 @@ def shutdown_shared_florence_engine():
 
 
 def prefetch_florence_weights(model_id=None):
-    """Download the weights ahead of time.
-
-    Handy on a PHI machine: run this once from Slicer's Python console while
-    the machine has internet, then set FLORENCE_LOCAL_FILES_ONLY = True.
-
-        from HeadCTDeid import prefetch_florence_weights
-        prefetch_florence_weights()
-    """
     mid = model_id or FLORENCE_MODEL_ID
 
     if FLORENCE_PREFER_NATIVE and mid in FLORENCE_NATIVE_EQUIVALENT:
         try:
-            from transformers import Florence2ForConditionalGeneration
-            mid = FLORENCE_NATIVE_EQUIVALENT[mid]
+            import transformers
+
+            if hasattr(transformers, "Florence2ForConditionalGeneration"):
+                mid = FLORENCE_NATIVE_EQUIVALENT[mid]
         except Exception:
             pass
 
@@ -2553,7 +2604,9 @@ def prefetch_florence_weights(model_id=None):
 
     from huggingface_hub import snapshot_download
 
-    path = snapshot_download(repo_id=mid, revision=str(FLORENCE_MODEL_REVISION or "").strip() or None)
+    path = snapshot_download(
+        repo_id=mid, revision=str(FLORENCE_MODEL_REVISION or "").strip() or None
+    )
     _safe_show_status(f"Florence-2 weights cached at: {path}", 8000)
     return path
 
@@ -2565,8 +2618,8 @@ class HeadCTDeid(ScriptedLoadableModule):
         self.parent.categories = ["Utilities"]
         self.parent.dependencies = []
         self.parent.contributors = ["Anh Tuan Tran, Sam Payabvash"]
-        self.parent.helpText = "This module de-identifies DICOM files by removing patient information based on a given mapping table."
-        self.parent.acknowledgementText = "This file was developed by Anh Tuan Tran, Sam Payabvash (Columbia University)."
+        self.parent.helpText = "De-identifies head CT DICOM using a folder mapping table."
+        self.parent.acknowledgementText = "Anh Tuan Tran, Sam Payabvash (Columbia University)."
 
 
 class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
@@ -2587,8 +2640,12 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.logic = HeadCTDeidLogic()
 
-        self.ui.inputFolderButton.connect("directoryChanged(QString)", self.updateParameterNodeFromGUI)
-        self.ui.outputFolderButton.connect("directoryChanged(QString)", self.updateParameterNodeFromGUI)
+        self.ui.inputFolderButton.connect(
+            "directoryChanged(QString)", self.updateParameterNodeFromGUI
+        )
+        self.ui.outputFolderButton.connect(
+            "directoryChanged(QString)", self.updateParameterNodeFromGUI
+        )
         self.ui.applyButton.connect("clicked()", self.onApplyButton)
         self.ui.excelFileButton.connect("clicked()", self.onBrowseExcelFile)
         self.ui.deidentifyCheckbox.connect("toggled(bool)", self.updateParameterNodeFromGUI)
@@ -2601,14 +2658,19 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def setParameterNode(self, inputParameterNode):
         import vtk
+
         if inputParameterNode:
             self.logic.setDefaultParameters(inputParameterNode)
 
         if self._parameterNode is not None:
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
+            self.removeObserver(
+                self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode
+            )
         self._parameterNode = inputParameterNode
         if self._parameterNode is not None:
-            self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
+            self.addObserver(
+                self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode
+            )
         self.updateGUIFromParameterNode()
 
     def updateGUIFromParameterNode(self, caller=None, event=None):
@@ -2622,8 +2684,12 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.excelFileButton.text = excelFile
         self.ui.outputFolderButton.directory = self._parameterNode.GetParameter("OutputFolder")
 
-        self.ui.deidentifyCheckbox.setChecked(self._parameterNode.GetParameter("Deidentify") == "true")
-        self.ui.deidentifyCTACheckbox.setChecked(self._parameterNode.GetParameter("DeidentifyCTA") == "true")
+        self.ui.deidentifyCheckbox.setChecked(
+            self._parameterNode.GetParameter("Deidentify") == "true"
+        )
+        self.ui.deidentifyCTACheckbox.setChecked(
+            self._parameterNode.GetParameter("DeidentifyCTA") == "true"
+        )
 
         if (
             len(self._parameterNode.GetParameter("InputFolder")) > 1
@@ -2645,16 +2711,19 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._parameterNode.SetParameter("InputFolder", self.ui.inputFolderButton.directory)
         self._parameterNode.SetParameter("ExcelFile", self.ui.excelFileButton.text)
         self._parameterNode.SetParameter("OutputFolder", self.ui.outputFolderButton.directory)
-        self._parameterNode.SetParameter("Deidentify", str(self.ui.deidentifyCheckbox.isChecked()).lower())
-        self._parameterNode.SetParameter("DeidentifyCTA", str(self.ui.deidentifyCTACheckbox.isChecked()).lower())
+        self._parameterNode.SetParameter(
+            "Deidentify", str(self.ui.deidentifyCheckbox.isChecked()).lower()
+        )
+        self._parameterNode.SetParameter(
+            "DeidentifyCTA", str(self.ui.deidentifyCTACheckbox.isChecked()).lower()
+        )
         self._parameterNode.EndModify(wasModified)
 
     def onApplyButton(self):
         try:
-            import gdcm
+            importlib.import_module("gdcm")
             slicer.util.infoDisplay(
-                "This tool is a work-in-progress being validated in project. "
-                "Contact sp4479@columbia.edu for details. Use at your own risk.",
+                "Work in progress. Use at your own risk. Contact: sp4479@columbia.edu",
                 windowTitle="Warning",
             )
 
@@ -2674,10 +2743,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             )
             if summary and summary["status"] != "completed":
                 slicer.util.errorDisplay(
-                    "Processing ended with errors or no eligible images in one or "
-                    "more examinations. Partial output is retained for review. "
-                    "See run_summary.json and the processing logs; do not treat "
-                    "this batch as successfully completed.",
+                    "Incomplete: some examinations failed. See run_summary.json.",
                     windowTitle="Processing incomplete",
                 )
         except (ValueError, FileNotFoundError) as exc:
@@ -2685,7 +2751,9 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except Exception:
             slicer.util.pip_install("python-gdcm==3.0.25")
             slicer.util.pip_uninstall("torch")
-            slicer.util.pip_install([ "torch", "--extra-index-url", "https://download.pytorch.org/whl/cu121"])
+            slicer.util.pip_install(
+                ["torch", "--extra-index-url", "https://download.pytorch.org/whl/cu121"]
+            )
             slicer.util.pip_install("pandas==2.2.3")
             slicer.util.pip_install("openpyxl")
             slicer.util.pip_install("pydicom")
@@ -2703,16 +2771,18 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.util.pip_install("huggingface_hub")
             import torch
             from packaging import version
+
             if version.parse(torch.__version__) < version.parse("2.3"):
                 slicer.util.pip_uninstall("numpy")
                 slicer.util.pip_install("numpy<2")
             slicer.util.infoDisplay(
-                "To support full encoding DICOM.\nPlease restart Slicer to complete the setup.",
-                windowTitle="Warning",
+                "Dependencies installed. Please restart Slicer.",
+                windowTitle="Restart required",
             )
 
     def onBrowseExcelFile(self):
         from ctk import ctkFileDialog
+
         fileDialog = ctkFileDialog()
         fileDialog.setWindowTitle("Select Excel/CSV File")
         fileDialog.setNameFilters(["Excel Files (*.xlsx)", "CSV Files (*.csv)", "All Files (*)"])
@@ -2766,27 +2836,30 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             os.makedirs(os.path.dirname(csv_path), exist_ok=True)
             if not os.path.exists(csv_path):
                 with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, fieldnames=[
-                        "timestamp",
-                        "patient_old_id",
-                        "patient_new_id",
-                        "series_folder",
-                        "source_dir",
-                        "source_filename",
-                        "instance_number",
-                        "series_instance_uid",
-                        "study_instance_uid",
-                        "sop_instance_uid",
-                        "burned_in_annotation",
-                        "decision",
-                        "reason",
-                        "hit_text",
-                        "hit_conf",
-                        "hit_bbox",
-                        "n_redacted_regions",
-                        "boxless_hits",
-                        "forced_keep",
-                    ])
+                    w = csv.DictWriter(
+                        f,
+                        fieldnames=[
+                            "timestamp",
+                            "patient_old_id",
+                            "patient_new_id",
+                            "series_folder",
+                            "source_dir",
+                            "source_filename",
+                            "instance_number",
+                            "series_instance_uid",
+                            "study_instance_uid",
+                            "sop_instance_uid",
+                            "burned_in_annotation",
+                            "decision",
+                            "reason",
+                            "hit_text",
+                            "hit_conf",
+                            "hit_bbox",
+                            "n_redacted_regions",
+                            "boxless_hits",
+                            "forced_keep",
+                        ],
+                    )
                     w.writeheader()
         except Exception as e:
             self.logger.error(f"Failed to initialize global drop csv: {e}")
@@ -2803,9 +2876,9 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         import pandas
 
         if not os.path.exists(inputFolder):
-            raise ValueError(f"Input folder does not exist: {inputFolder}")
+            raise ValueError(f"Input folder not found: {inputFolder}")
         if not os.path.exists(excelFile):
-            raise ValueError(f"Excel/CSV file does not exist: {excelFile}")
+            raise ValueError(f"Mapping file not found: {excelFile}")
 
         os.makedirs(outputFolder, exist_ok=True)
         self._ensure_logger(outputFolder)
@@ -2819,54 +2892,100 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
-        aliases = {"original_folder_names": "original_folder_name", "new_folder_names": "new_folder_name"}
+        aliases = {
+            "original_folder_names": "original_folder_name",
+            "new_folder_names": "new_folder_name",
+        }
         for col in list(df.columns):
             normalized = str(col).strip().lower()
             canonical = aliases.get(normalized, normalized)
             if canonical in columns_as_text and canonical not in df.columns:
                 df = df.rename(columns={col: canonical})
         if ("original_folder_name" not in df.columns) or ("new_folder_name" not in df.columns):
-            raise ValueError("Excel file must contain 'original_folder_name' and 'new_folder_name' columns")
+            raise ValueError("Mapping file needs columns: original_folder_name, new_folder_name")
 
         if df[columns_as_text].isna().any().any():
-            raise ValueError("Mapping file contains missing folder names or pseudonyms")
+            raise ValueError("Mapping file has empty cells")
         df["original_folder_name"] = df["original_folder_name"].astype(str).str.strip()
         df["new_folder_name"] = df["new_folder_name"].astype(str).str.strip()
-        if (df["original_folder_name"].duplicated().any()
-                or df["new_folder_name"].str.casefold().duplicated().any()):
-            raise ValueError("Use unique source-folder names and unique examination pseudonyms; keep participant linkage separately")
-        if not df["new_folder_name"].map(lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,15}", v))).all():
-            raise ValueError("Examination pseudonyms must be 1-16 ASCII letters/digits/dots/underscores/hyphens, beginning with a letter or digit")
+        if (
+            df["original_folder_name"].duplicated().any()
+            or df["new_folder_name"].str.casefold().duplicated().any()
+        ):
+            raise ValueError("Folder names and pseudonyms must be unique")
+        if (
+            not df["new_folder_name"]
+            .map(lambda v: bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,15}", v)))
+            .all()
+        ):
+            raise ValueError("Pseudonyms: 1-16 chars, A-Z a-z 0-9 . _ -")
         id_mapping = dict(zip(df["original_folder_name"], df["new_folder_name"]))
 
-        dicom_folders = [d for d in os.listdir(inputFolder) if os.path.isdir(os.path.join(inputFolder, d))]
+        dicom_folders = [
+            d for d in os.listdir(inputFolder) if os.path.isdir(os.path.join(inputFolder, d))
+        ]
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(outputFolder, f"Processed for Anonymization_{current_time}")
         os.makedirs(out_path, exist_ok=True)
         global _RUN_PROVENANCE_PATH
         _RUN_PROVENANCE_PATH = os.path.join(out_path, "run_provenance.json")
         deps = {}
-        for package in ("numpy", "pydicom", "python-gdcm", "torch", "transformers", "opencv-python-headless", "scikit-image"):
+        for package in (
+            "numpy",
+            "pydicom",
+            "python-gdcm",
+            "torch",
+            "transformers",
+            "opencv-python-headless",
+            "scikit-image",
+        ):
             try:
                 deps[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 deps[package] = None
         with open(__file__, "rb") as module_file:
             module_hash = hashlib.sha256(module_file.read()).hexdigest()
-        _update_run_provenance({
-            "created_at": datetime.now().isoformat(), "module_sha256": module_hash,
-            "module_revision": MODULE_REVISION,
-            "slicer_version": slicer.app.applicationVersion, "python": sys.version,
-            "dependencies": deps, "force_ocr_all": bool(force_ocr_all),
-            "remove_CTA": bool(remove_CTA), "random_seed": DEID_RANDOM_SEED,
-            "configured_model_id": FLORENCE_MODEL_ID,
-            "configured_model_revision": FLORENCE_MODEL_REVISION or None,
-            "settings": {key: value for key, value in globals().items()
-                         if key.isupper() and key.startswith(("FLORENCE_", "FACE_", "AIR_", "BONE_", "PRESCREEN_", "REDACT_", "DEID_", "PS315_", "TEXT_", "NEVER_", "ALWAYS_", "ENABLE_"))
-                         and not key.endswith("_SOURCE") and key != "FLORENCE_EXTRA_WORKER_ENV"
-                         and isinstance(value, (str, int, float, bool, type(None)))},
-            "observed_model": None,
-            "note": "Production provenance only; no independent audit or repeatability result is implied."})
+        _update_run_provenance(
+            {
+                "created_at": datetime.now().isoformat(),
+                "module_sha256": module_hash,
+                "module_revision": MODULE_REVISION,
+                "slicer_version": slicer.app.applicationVersion,
+                "python": sys.version,
+                "dependencies": deps,
+                "force_ocr_all": bool(force_ocr_all),
+                "remove_CTA": bool(remove_CTA),
+                "random_seed": DEID_RANDOM_SEED,
+                "configured_model_id": FLORENCE_MODEL_ID,
+                "configured_model_revision": FLORENCE_MODEL_REVISION or None,
+                "settings": {
+                    key: value
+                    for key, value in globals().items()
+                    if key.isupper()
+                    and key.startswith(
+                        (
+                            "FLORENCE_",
+                            "FACE_",
+                            "AIR_",
+                            "BONE_",
+                            "PRESCREEN_",
+                            "REDACT_",
+                            "DEID_",
+                            "PS315_",
+                            "TEXT_",
+                            "NEVER_",
+                            "ALWAYS_",
+                            "ENABLE_",
+                        )
+                    )
+                    and not key.endswith("_SOURCE")
+                    and key != "FLORENCE_EXTRA_WORKER_ENV"
+                    and isinstance(value, (str, int, float, bool, type(None)))
+                },
+                "observed_model": None,
+                "note": "Production provenance only; no independent audit or repeatability result is implied.",
+            }
+        )
 
         original_face_render_dir = os.path.join(out_path, "original_face_render")
         after_deidentification_render_dir = os.path.join(out_path, "after_deidentification_render")
@@ -2896,7 +3015,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
 
         folders_to_process = [f for f in sorted(dicom_folders) if f in id_mapping]
         if not folders_to_process:
-            raise ValueError("No input examination folders match the mapping file")
+            raise ValueError("No input folders match the mapping file")
         total = len(folders_to_process)
         done = 0
         examination_results = []
@@ -2907,26 +3026,24 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             progressBar.setValue(0)
 
         for foldername in folders_to_process:
-            dst_folder = ""
             try:
-                dst_folder = os.path.join(out_path, id_mapping[foldername])
-
                 processor = DicomProcessor(force_ocr_all=bool(force_ocr_all))
                 processors.append(processor)
 
                 src_folder = os.path.join(inputFolder, foldername)
 
-                _safe_show_status(f"Processing patient folder: {foldername} → {id_mapping[foldername]}", 4000)
-                self.logger.info(f"Processing patient folder: {foldername} → {id_mapping[foldername]}")
+                _safe_show_status(
+                    f"Processing patient folder: {foldername} → {id_mapping[foldername]}", 4000
+                )
+                self.logger.info(
+                    f"Processing patient folder: {foldername} → {id_mapping[foldername]}"
+                )
 
                 processing_ok = processor.drown_volume(
                     in_path=src_folder,
-                    out_path=dst_folder,
-                    replacer="face",
+                    out_path=os.path.join(out_path, id_mapping[foldername]),
                     id=id_mapping[foldername],
                     patient_old_id=foldername,
-                    patient_id="0",
-                    name=f"Processed for Anonymization {id_mapping[foldername]}",
                     remove_CTA=remove_CTA,
                     global_drop_csv_path=global_drop_csv_path,
                     global_qc_csv_path=global_qc_csv_path,
@@ -2936,7 +3053,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     global_verify_fail_png_dir=ocr_verify_fail_dir,
                     global_prescreen_png_dir=ocr_prescreen_dir,
                     global_not_examined_png_dir=ocr_not_examined_dir,
-                    patient_input_root=src_folder,
                     original_face_render_dir=original_face_render_dir,
                     after_deidentification_render_dir=after_deidentification_render_dir,
                 )
@@ -2948,22 +3064,30 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     progressBar.setValue(int(done * 99 / total) if done < total else 99)
 
                 status = "completed" if processing_ok else "incomplete"
-                examination_results.append({
-                    "examination_id": id_mapping[foldername], "status": status,
-                    "eligible_instances": processor._eligible_slice_count,
-                    "saved_instances": processor._saved_slice_count,
-                    "ocr_failed_instances": processor._ocr_failure_count,
-                    "processing_error_count": len(processor._processing_errors),
-                })
+                examination_results.append(
+                    {
+                        "examination_id": id_mapping[foldername],
+                        "status": status,
+                        "eligible_instances": processor._eligible_slice_count,
+                        "saved_instances": processor._saved_slice_count,
+                        "ocr_failed_instances": processor._ocr_failure_count,
+                        "processing_error_count": len(processor._processing_errors),
+                    }
+                )
                 _safe_show_status(f"{status}: {id_mapping[foldername]}", 3000)
-                self.logger.info("Examination %s: %s", id_mapping[foldername], status)
+                self.logger.info(f"Examination {id_mapping[foldername]}: {status}")
 
-            except Exception as e:
-                self.logger.exception("Error processing examination %s", id_mapping[foldername])
-                self.logger.warning("Partial output retained for review; no output folder was deleted")
-                examination_results.append({
-                    "examination_id": id_mapping[foldername], "status": "failed",
-                })
+            except Exception:
+                self.logger.exception(f"Error processing examination {id_mapping[foldername]}")
+                self.logger.warning(
+                    "Partial output retained for review; no output folder was deleted"
+                )
+                examination_results.append(
+                    {
+                        "examination_id": id_mapping[foldername],
+                        "status": "failed",
+                    }
+                )
 
         for p in processors:
             try:
@@ -2992,25 +3116,17 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         with open(os.path.join(out_path, "run_summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         _update_run_provenance({"processing_status": summary["status"]})
-        message = "Processing completed." if complete else "Processing ended with errors; review partial output."
+        message = (
+            "Processing completed."
+            if complete
+            else "Processing ended with errors; review partial output."
+        )
         _safe_show_status(message, 5000)
         self.logger.info(message)
         return summary
 
 
 class DicomProcessor:
-    """
-    Pipeline: metadata processing + face/air replacement + optional text redaction.
-
-    Detection run decision per slice:
-      if force_ocr_all == True:
-          run Florence-2 detection on every slice
-      else:
-          run Florence-2 detection only when BurnedInAnnotation==YES
-
-    A cheap OpenCV top-hat pre-screen can skip obviously empty slices first
-    (PRESCREEN_MODE), because Florence-2 is much slower than EasyOCR was.
-    """
 
     def __init__(self, force_ocr_all=False):
         if DEID_SHARE_ONE_UID_MAP:
@@ -3039,7 +3155,6 @@ class DicomProcessor:
 
         self._ocr = None
         self._prescreen_skipped = 0
-        self._detect_calls = 0
         self._warned_unknown_conf = False
         self._uid_repair_failures = 0
         self._uid_repair_examples = set()
@@ -3047,8 +3162,9 @@ class DicomProcessor:
         try:
             if ENABLE_TEXT_DETECTION:
                 logging.getLogger(__name__).info(
-                    "Burned-in text mode: action=%s, never_drop=%s -> slices with text "
-                    "are blacked out and KEPT." % (TEXT_ACTION, NEVER_DROP_SLICES))
+                    f"Burned-in text mode: action={TEXT_ACTION}, never_drop={NEVER_DROP_SLICES} -> slices with text "
+                    "are blacked out and KEPT."
+                )
         except Exception:
             pass
         self._unknown_conf_count = 0
@@ -3095,7 +3211,9 @@ class DicomProcessor:
             stderr = (stderr or "") + f"\ncommunicate_error: {e}"
         finally:
             try:
-                self._running_subprocesses = [p for p in self._running_subprocesses if p is not proc]
+                self._running_subprocesses = [
+                    p for p in self._running_subprocesses if p is not proc
+                ]
             except Exception:
                 pass
 
@@ -3123,20 +3241,7 @@ class DicomProcessor:
         self._running_subprocesses = [p for p in self._running_subprocesses if p.poll() is None]
         return len(self._running_subprocesses) == 0
 
-    def _detect_gpu_available(self):
-        try:
-            import torch
-            if hasattr(torch, "cuda") and torch.cuda.is_available():
-                try:
-                    return True, torch.cuda.get_device_name(0)
-                except Exception:
-                    return True, "CUDA GPU"
-            return False, "CPU"
-        except Exception:
-            return False, "CPU"
-
     def _ensure_ocr(self):
-        """Lazily obtain the shared Florence-2 engine."""
         if self._ocr is not None:
             return True
 
@@ -3148,20 +3253,7 @@ class DicomProcessor:
         self._ocr = engine
         return True
 
-    def _alnum_count(self, s: str) -> int:
-        return _alnum_count(s)
-
-    def _text_plausible(self, txt: str) -> bool:
-        return _text_plausible(txt)
-
     def _dicom_pixels_to_gray8_for_ocr(self, ds):
-        """
-        DICOM -> 8-bit grayscale for the OCR model:
-        - pixels = ds.pixel_array (take first frame if multi-frame)
-        - apply RescaleSlope / RescaleIntercept
-        - min-max normalize to [0, 255] uint8
-        - invert MONOCHROME1 so text is bright on dark (RESPECT_MONOCHROME1)
-        """
         import cv2
 
         pixels = ds.pixel_array
@@ -3208,7 +3300,6 @@ class DicomProcessor:
         return gray8
 
     def _run_florence(self, gray8):
-        """Return raw hits [(points|None, text, confidence), ...]."""
         try:
             return self._ocr.readtext(gray8)
         except Exception as e:
@@ -3219,7 +3310,6 @@ class DicomProcessor:
             raise OCRProcessingError(f"Florence-2 inference failed: {e}") from e
 
     def _filter_florence_hits(self, hits, gray8):
-        """Apply confidence, plausibility, box-size and hallucination filters."""
         kept = []
         any_flagged = False
         dropped_low_conf = 0
@@ -3232,10 +3322,9 @@ class DicomProcessor:
                         try:
                             self.logger.warning(
                                 "Florence-2 returned no confidence score; "
-                                "FLORENCE_MIN_CONFIDENCE=%s cannot filter these hits "
-                                "(FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN=%s)."
-                                % (FLORENCE_MIN_CONFIDENCE,
-                                   FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN))
+                                f"FLORENCE_MIN_CONFIDENCE={FLORENCE_MIN_CONFIDENCE} cannot filter these hits "
+                                f"(FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN={FLORENCE_KEEP_WHEN_CONFIDENCE_UNKNOWN})."
+                            )
                         except Exception:
                             pass
                     self._unknown_conf_count += 1
@@ -3250,7 +3339,9 @@ class DicomProcessor:
                     continue
                 if not _box_big_enough(points):
                     continue
-                if FLORENCE_RESTRICT_TO_BORDER_BAND and not _in_border_band(points, gray8.shape[:2]):
+                if FLORENCE_RESTRICT_TO_BORDER_BAND and not _in_border_band(
+                    points, gray8.shape[:2]
+                ):
                     continue
 
                 flags = _hallucination_flags(txt, gray8)
@@ -3266,7 +3357,6 @@ class DicomProcessor:
         return kept, any_flagged, dropped_low_conf
 
     def _draw_ocr_results(self, gray8, items):
-        """Draw Florence-2 boxes/labels onto a BGR debug image."""
         import cv2
 
         det_img = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
@@ -3327,19 +3417,6 @@ class DicomProcessor:
         return det_img
 
     def detect_text_debug(self, ds, burned_flag=False):
-        """
-        Run Florence-2 burned-in text detection on one DICOM slice.
-
-        Returns:
-          has_text: bool
-          hit_text: str            (all kept strings joined with " | ")
-          hit_conf: float|None     (sequence-level generation probability)
-          hit_bbox: list|None      (points of the first kept hit, None for <OCR>)
-          gray8: uint8 image
-          detection_img: BGR image with boxes drawn
-          boxes: list of (N,2) float arrays, one per localised hit
-          boxless: int, number of hits with no coordinates (plain <OCR>)
-        """
         import cv2
 
         try:
@@ -3357,20 +3434,28 @@ class DicomProcessor:
                 maybe_text, _n = _prescreen_says_maybe_text(gray8)
                 if not maybe_text:
                     self._prescreen_skipped += 1
-                    return (False, "", None, None, gray8,
-                            cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR), [], 0)
+                    return (
+                        False,
+                        "",
+                        None,
+                        None,
+                        gray8,
+                        cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR),
+                        [],
+                        0,
+                    )
 
-        self._detect_calls += 1
         raw_hits = self._run_florence(gray8)
         if not raw_hits:
-            return (False, "", None, None, gray8,
-                    cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR), [], 0)
+            return (False, "", None, None, gray8, cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR), [], 0)
 
         kept, _flagged, _low_conf = self._filter_florence_hits(raw_hits, gray8)
         detection_img = self._draw_ocr_results(gray8, kept if kept else [])
 
         if kept:
-            texts = " | ".join(str(t).replace("\n", " ").strip() for _, t, _, _ in kept if str(t).strip())
+            texts = " | ".join(
+                str(t).replace("\n", " ").strip() for _, t, _, _ in kept if str(t).strip()
+            )
 
             known = [float(c) for _, _, c, _ in kept if c is not None]
             best_conf = max(known) if known else None
@@ -3387,13 +3472,20 @@ class DicomProcessor:
 
             bbox_list = boxes[0].tolist() if boxes else None
 
-            return (True, texts, (None if best_conf is None else float(best_conf)),
-                    bbox_list, gray8, detection_img, boxes, boxless)
+            return (
+                True,
+                texts,
+                (None if best_conf is None else float(best_conf)),
+                bbox_list,
+                gray8,
+                detection_img,
+                boxes,
+                boxless,
+            )
 
         return False, "", None, None, gray8, detection_img, [], 0
 
     def _textlike_component_boxes(self, gray8):
-        """Every character-sized bright component in the slice, as (x,y,w,h)."""
         try:
             import cv2
 
@@ -3408,21 +3500,22 @@ class DicomProcessor:
             out = []
             for i in range(1, num):
                 x, y, w, h, area = stats[i]
-                if (PRESCREEN_MIN_CHAR_H <= h <= PRESCREEN_MAX_CHAR_H
-                        and PRESCREEN_MIN_CHAR_W <= w <= PRESCREEN_MAX_CHAR_W
-                        and area >= PRESCREEN_MIN_CHAR_AREA):
+                if (
+                    PRESCREEN_MIN_CHAR_H <= h <= PRESCREEN_MAX_CHAR_H
+                    and PRESCREEN_MIN_CHAR_W <= w <= PRESCREEN_MAX_CHAR_W
+                    and area >= PRESCREEN_MIN_CHAR_AREA
+                ):
                     out.append((int(x), int(y), int(w), int(h)))
             return out
         except Exception:
             return []
 
     def _group_components_into_lines(self, comps):
-        """Cluster character boxes into text lines by vertical then horizontal run."""
         if not comps:
             return []
 
         rows = []
-        for (x, y, w, h) in sorted(comps, key=lambda c: (c[1], c[0])):
+        for x, y, w, h in sorted(comps, key=lambda c: (c[1], c[0])):
             cy = y + h / 2.0
             placed = False
             for row in rows:
@@ -3461,7 +3554,6 @@ class DicomProcessor:
         return out
 
     def _line_is_relevant(self, line, seed_rects, shape_hw):
-        """Keep a swept line only near the edge or near a model-flagged region."""
         h, w = int(shape_hw[0]), int(shape_hw[1])
         x0, y0, x1, y1 = line
         cx = (x0 + x1) / 2.0
@@ -3473,15 +3565,13 @@ class DicomProcessor:
             return True
 
         pad = float(REDACT_SWEEP_NEAR_HIT_PX)
-        for (sx0, sy0, sx1, sy1) in seed_rects:
-            if (x0 < sx1 + pad and x1 > sx0 - pad
-                    and y0 < sy1 + pad and y1 > sy0 - pad):
+        for sx0, sy0, sx1, sy1 in seed_rects:
+            if x0 < sx1 + pad and x1 > sx0 - pad and y0 < sy1 + pad and y1 > sy0 - pad:
                 return True
         return False
 
     @staticmethod
     def _merge_rects(rects):
-        """Union overlapping rectangles so masks read as solid blocks."""
         items = list(rects)
         changed = True
         while changed:
@@ -3494,10 +3584,8 @@ class DicomProcessor:
                     hit = False
                     rest = []
                     for b in items:
-                        if (a[0] <= b[2] and b[0] <= a[2]
-                                and a[1] <= b[3] and b[1] <= a[3]):
-                            a = (min(a[0], b[0]), min(a[1], b[1]),
-                                 max(a[2], b[2]), max(a[3], b[3]))
+                        if a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]:
+                            a = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
                             hit = True
                             changed = True
                         else:
@@ -3507,13 +3595,9 @@ class DicomProcessor:
             items = merged
         return items
 
-    def _redaction_rects(self, boxes, boxless, shape_hw, gray_shape_hw=None,
-                         boxless_mode=None, gray8=None):
-        """Turn detected boxes into padded axis-aligned rectangles to blank out.
-
-        Masks are grown deliberately: Florence-2's boxes hug the glyphs, and a
-        tight mask can leave readable fragments at the edges.
-        """
+    def _redaction_rects(
+        self, boxes, boxless, shape_hw, gray_shape_hw=None, boxless_mode=None, gray8=None
+    ):
         h, w = int(shape_hw[0]), int(shape_hw[1])
 
         sx = sy = 1.0
@@ -3526,7 +3610,7 @@ class DicomProcessor:
         exact = str(REDACT_GEOMETRY).lower() == "exact"
 
         rects = []
-        for pts in (boxes or []):
+        for pts in boxes or []:
             try:
                 arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
                 if arr.size == 0:
@@ -3560,7 +3644,7 @@ class DicomProcessor:
                 lines = self._group_components_into_lines(comps)
 
                 seed_in_gray = []
-                for (rx0, ry0, rx1, ry1) in seed_rects:
+                for rx0, ry0, rx1, ry1 in seed_rects:
                     seed_in_gray.append((rx0 / sx, ry0 / sy, rx1 / sx, ry1 / sy))
 
                 for line in lines:
@@ -3569,12 +3653,14 @@ class DicomProcessor:
                     lx0, ly0, lx1, ly1 = line
                     bh_ = max(1.0, ly1 - ly0)
                     pad = max(float(REDACT_PAD_PX), float(REDACT_PAD_FRAC) * bh_)
-                    rects.append((
-                        int(max(0, np.floor((lx0 - pad) * sx))),
-                        int(max(0, np.floor((ly0 - pad) * sy))),
-                        int(min(w, np.ceil((lx1 + pad) * sx))),
-                        int(min(h, np.ceil((ly1 + pad) * sy))),
-                    ))
+                    rects.append(
+                        (
+                            int(max(0, np.floor((lx0 - pad) * sx))),
+                            int(max(0, np.floor((ly0 - pad) * sy))),
+                            int(min(w, np.ceil((lx1 + pad) * sx))),
+                            int(min(h, np.ceil((ly1 + pad) * sy))),
+                        )
+                    )
             except Exception:
                 pass
 
@@ -3585,18 +3671,21 @@ class DicomProcessor:
                 extra = float(REDACT_LINE_EXTRA_PX)
                 grown = []
                 gap = float(REDACT_SWEEP_LINE_GAP_X)
-                for (rx0, ry0, rx1, ry1) in rects:
+                for rx0, ry0, rx1, ry1 in rects:
                     gx0, gy0 = rx0 / sx, ry0 / sy
                     gx1, gy1 = rx1 / sx, ry1 / sy
 
-                    row = [(float(cx), float(cx + cw)) for (cx, cy, cw, ch) in comps
-                           if gy0 <= (cy + ch / 2.0) <= gy1]
+                    row = [
+                        (float(cx), float(cx + cw))
+                        for (cx, cy, cw, ch) in comps
+                        if gy0 <= (cy + ch / 2.0) <= gy1
+                    ]
 
                     nx0, nx1 = gx0, gx1
                     changed = True
                     while changed:
                         changed = False
-                        for (cx0, cx1) in row:
+                        for cx0, cx1 in row:
                             if cx1 >= nx0 - gap and cx0 <= nx1 + gap:
                                 if cx0 < nx0:
                                     nx0 = cx0
@@ -3605,12 +3694,14 @@ class DicomProcessor:
                                     nx1 = cx1
                                     changed = True
 
-                    grown.append((
-                        int(max(0, np.floor((nx0 - extra) * sx))),
-                        ry0,
-                        int(min(w, np.ceil((nx1 + extra) * sx))),
-                        ry1,
-                    ))
+                    grown.append(
+                        (
+                            int(max(0, np.floor((nx0 - extra) * sx))),
+                            ry0,
+                            int(min(w, np.ceil((nx1 + extra) * sx))),
+                            ry1,
+                        )
+                    )
                 rects = grown
             except Exception:
                 pass
@@ -3618,24 +3709,24 @@ class DicomProcessor:
         if not exact:
             rects = self._merge_rects(rects)
 
-        mode = str(boxless_mode if boxless_mode is not None
-                   else REDACT_BOXLESS_STRATEGY).lower()
+        mode = str(boxless_mode if boxless_mode is not None else REDACT_BOXLESS_STRATEGY).lower()
         if boxless and mode == "border_band":
             bx = int(round(float(REDACT_BORDER_BAND_FRAC) * w))
             by = int(round(float(REDACT_BORDER_BAND_FRAC) * h))
             bx = max(1, min(bx, w // 2))
             by = max(1, min(by, h // 2))
-            rects.extend([
-                (0, 0, w, by),
-                (0, h - by, w, h),
-                (0, 0, bx, h),
-                (w - bx, 0, w, h),
-            ])
+            rects.extend(
+                [
+                    (0, 0, w, by),
+                    (0, h - by, w, h),
+                    (0, 0, bx, h),
+                    (w - bx, 0, w, h),
+                ]
+            )
 
         return rects
 
     def _apply_redaction(self, hu_slice, rects):
-        """Blank the given rectangles in a HU array. Returns regions written."""
         if not rects:
             return 0
 
@@ -3654,7 +3745,7 @@ class DicomProcessor:
                 value = float(REDACT_AIR_HU)
 
         n = 0
-        for (x0, y0, x1, y1) in rects:
+        for x0, y0, x1, y1 in rects:
             try:
                 hu_slice[y0:y1, x0:x1] = value
                 n += 1
@@ -3663,11 +3754,6 @@ class DicomProcessor:
         return n
 
     def _draw_mask_rects(self, det_img, rects, gray_shape_hw=None, hu_shape_hw=None):
-        """Outline the rectangles that will actually be blacked out.
-
-        Mask rectangles are computed in pixel-array coordinates, while the debug
-        image is the OCR grayscale, so they are mapped back if the two differ.
-        """
         if det_img is None or not rects or not OCR_DEBUG_DRAW_MASK_RECTS:
             return det_img
         try:
@@ -3684,7 +3770,7 @@ class DicomProcessor:
                     sy = float(gh) / float(hh)
                     sx = float(gw) / float(hw_)
 
-            for (x0, y0, x1, y1) in rects:
+            for x0, y0, x1, y1 in rects:
                 ax0 = int(max(0, min(w - 1, round(x0 * sx))))
                 ay0 = int(max(0, min(h - 1, round(y0 * sy))))
                 ax1 = int(max(0, min(w, round(x1 * sx))))
@@ -3701,25 +3787,19 @@ class DicomProcessor:
         return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
 
     def _render_redacted_png(self, gray8, rects):
-        """Render the slice as it will look after masking: solid black boxes.
-
-        This is a picture of the result, not an annotation of the detection, so
-        it can be checked directly for surviving text.
-        """
         if gray8 is None:
             return None
         try:
             import cv2
 
             out = gray8.copy()
-            for (x0, y0, x1, y1) in (rects or []):
+            for x0, y0, x1, y1 in rects or []:
                 out[y0:y1, x0:x1] = 0
             return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
         except Exception:
             return None
 
     def _hu_to_gray8(self, hu, ds=None):
-        """Same normalisation as the OCR input, but from a HU array."""
         arr = np.asarray(hu, dtype=np.float32)
         mn = float(np.min(arr))
         mx = float(np.max(arr))
@@ -3737,7 +3817,6 @@ class DicomProcessor:
         return gray8
 
     def _verify_redaction(self, hu_slice, ds):
-        """Re-run detection on the masked slice. Returns (still_has_text, text)."""
         try:
             gray8 = self._hu_to_gray8(hu_slice, ds)
         except Exception as exc:
@@ -3751,12 +3830,12 @@ class DicomProcessor:
         if not kept:
             return False, ""
 
-        texts = " | ".join(str(t).replace("\n", " ").strip()
-                           for _, t, _, _ in kept if str(t).strip())
+        texts = " | ".join(
+            str(t).replace("\n", " ").strip() for _, t, _, _ in kept if str(t).strip()
+        )
         return True, texts
 
     def _save_debug_png(self, out_dir, patient_new_id, series_folder, source_filename, img):
-        """Write a debug PNG into one of the global only_for_debug folders."""
         if not out_dir or img is None:
             return None
         try:
@@ -3777,6 +3856,7 @@ class DicomProcessor:
 
     def is_dicom(self, file_path, remove_CTA=False):
         import pydicom
+
         try:
             ds = pydicom.dcmread(file_path, force=True)
             try:
@@ -3785,14 +3865,10 @@ class DicomProcessor:
                 pass
             accepted = self.checkCTmeta(ds, remove_CTA) == 1
             if not accepted:
-                if not hasattr(self, "_ct_filter_rejections"):
-                    self._ct_filter_rejections = defaultdict(int)
                 for reason in self._last_ct_filter_reasons or ("metadata_filter_rejected",):
                     self._ct_filter_rejections[reason] += 1
             return accepted
         except Exception:
-            if not hasattr(self, "_ct_filter_rejections"):
-                self._ct_filter_rejections = defaultdict(int)
             self._ct_filter_rejections["DICOM_read_or_classification_error"] += 1
             return False
 
@@ -3822,16 +3898,16 @@ class DicomProcessor:
 
     def largest_connected_component(self, binary_image):
         import cv2
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_image, connectivity=8)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary_image, connectivity=8
+        )
         if num_labels <= 1:
             return np.zeros_like(binary_image, dtype=np.uint8)
         largest_idx = np.argmax(stats[1:, cv2.CC_STAT_AREA]) + 1
         lcc = np.zeros(labels.shape, dtype=np.uint8)
         lcc[labels == largest_idx] = 1
         return lcc
-
-    def get_largest_component_volume(self, volume):
-        return self.largest_connected_component(volume)
 
     def _kernel_from_pixel_spacing(self, ds, slice_key=None):
         rng = random
@@ -3868,17 +3944,10 @@ class DicomProcessor:
         except Exception:
             return rng.randint(int(FACE_KERNEL_MIN_MM), int(FACE_KERNEL_MAX_MM))
 
-    def apply_mask_and_get_values(self, image_volume, mask_volume):
-        masked = image_volume * mask_volume
-        vals = np.unique(masked)
-        vals = vals[(vals > FACE_MIN_VALUE) & (vals < FACE_MAX_VALUE)]
-        return vals.tolist()
-
     def is_substring_in_list(self, substring, string_list):
         return any(substring in str(s) for s in string_list)
 
     def _is_secondary_capture_sop_class(self, ds):
-        """Return True for Secondary Capture SOP Class UIDs in (0008,0016)."""
         try:
             sop_class = ds.get((0x0008, 0x0016), "")
             sop_class = sop_class.value if hasattr(sop_class, "value") else sop_class
@@ -3897,12 +3966,6 @@ class DicomProcessor:
             return False
 
     def checkCTmeta(self, ds, remove_CTA=False):
-        """Select original/primary/axial, single-frame grayscale head CT.
-
-        Historical argument name retained for compatibility: remove_CTA=True
-        corresponds to the UI's ALLOW CTA/CTP option, so it BYPASSES only the
-        angiography/perfusion exclusion. Other eligibility checks still apply.
-        """
         self._last_ct_filter_reasons = ()
         try:
             if int(getattr(ds, "NumberOfFrames", 1) or 1) != 1:
@@ -3914,16 +3977,18 @@ class DicomProcessor:
             modality = ds.get((0x0008, 0x0060), "")
             modality = [modality.value] if hasattr(modality, "value") else [modality]
             modality = [str(x).lower().replace(" ", "") for x in modality]
-            status1 = any(self.is_substring_in_list(c, modality)
-                          for c in ["ct", "computedtomography", "ctprotocal"])
+            status1 = any(
+                self.is_substring_in_list(c, modality)
+                for c in ["ct", "computedtomography", "ctprotocal"]
+            )
             imageType = ds.get((0x0008, 0x0008), "")
             imageType = [imageType.value] if hasattr(imageType, "value") else [imageType]
             imageType = [str(x).lower().replace(" ", "") for x in imageType]
-            status2 = all(self.is_substring_in_list(c, imageType)
-                          for c in ["original", "primary", "axial"])
+            status2 = all(
+                self.is_substring_in_list(c, imageType) for c in ["original", "primary", "axial"]
+            )
             descriptions = []
-            for tag in ((0x0008, 0x1030), (0x0008, 0x103E),
-                        (0x0018, 0x0015), (0x0018, 0x1160)):
+            for tag in ((0x0008, 0x1030), (0x0008, 0x103E), (0x0018, 0x0015), (0x0018, 0x1160)):
                 if tag not in ds or ds[tag].value is None:
                     continue
                 value = ds[tag].value
@@ -3931,9 +3996,11 @@ class DicomProcessor:
                     descriptions.extend(str(v) for v in value if v is not None)
                 else:
                     descriptions.append(str(value))
-            # Keep field/value boundaries. Never turn CT + AXIAL into CTA.
-            status3 = any(term in value.lower()
-                          for value in descriptions for term in ("head", "brain", "skull"))
+            status3 = any(
+                term in value.lower()
+                for value in descriptions
+                for term in ("head", "brain", "skull")
+            )
             excluded_reason = ""
             if not remove_CTA:
                 for value in descriptions:
@@ -3956,13 +4023,12 @@ class DicomProcessor:
             self._last_ct_filter_reasons = tuple(reasons)
             return int(status1 and status2 and status3 and status4 and status5)
         except Exception as exc:
-            self.error = str(exc)
             self._last_ct_filter_reasons = ("metadata_parse_error_" + type(exc).__name__,)
             return 0
 
-
     def _keep_only_components_touching_seed(self, mask_uint8, seed_uint8):
         import cv2
+
         m = (mask_uint8 > 0).astype(np.uint8)
         s = (seed_uint8 > 0).astype(np.uint8)
         if m.max() == 0:
@@ -3980,128 +4046,26 @@ class DicomProcessor:
             keep[labels == lab] = 1
         return keep
 
-    def _anterior_axis_and_sign(self, ds):
-        try:
-            iop = ds.get((0x0020, 0x0037), None)
-            if iop is None:
-                return 0, +1
-
-            v = np.array(iop.value, dtype=float).reshape(2, 3)
-            row_cos = v[0]
-            col_cos = v[1]
-            anterior_LPS = np.array([0.0, -1.0, 0.0])
-
-            dr = float(np.dot(row_cos, anterior_LPS))
-            dc = float(np.dot(col_cos, anterior_LPS))
-
-            if abs(dr) >= abs(dc):
-                axis = 0
-                sign = +1 if dr > 0 else -1
-            else:
-                axis = 1
-                sign = +1 if dc > 0 else -1
-            return axis, sign
-        except Exception:
-            return 0, +1
-
-    def _anterior_region_mask(self, shape_hw, ds, front_fraction=0.55):
-        H, W = shape_hw
-        axis, sign = self._anterior_axis_and_sign(ds)
-        Y, X = np.ogrid[:H, :W]
-        cy, cx = H // 2, W // 2
-
-        if axis == 0:
-            if sign > 0:
-                cutoff = int(cy + (1.0 - front_fraction) * (H - 1 - cy))
-                m = (Y >= cutoff)
-            else:
-                cutoff = int(cy - (1.0 - front_fraction) * (cy))
-                m = (Y <= cutoff)
-        else:
-            if sign > 0:
-                cutoff = int(cx + (1.0 - front_fraction) * (W - 1 - cx))
-                m = (X >= cutoff)
-            else:
-                cutoff = int(cx - (1.0 - front_fraction) * (cx))
-                m = (X <= cutoff)
-
-        return m.astype(np.uint8)
-
-    def bounded_dilate_with_front_boost(
-        self,
-        lcc_air_seed,
-        pixels_hu,
-        ds,
-        k_max,
-        bone_stop_hu=BONE_STOP_HU,
-        front_fraction=0.55,
-    ):
+    def bounded_dilate(self, lcc_air_seed, pixels_hu, k_max, bone_stop_hu=BONE_STOP_HU):
         import cv2
 
         seed = (lcc_air_seed > 0).astype(np.uint8)
-        H, W = seed.shape
-
         allowed = (pixels_hu < int(bone_stop_hu)).astype(np.uint8)
-
-        k_max = int(max(1, k_max))
-
-        # --- Barrier-respecting (geodesic) dilation ---
-        # A single cv2.dilate() with a large kernel expands the seed as a
-        # full disk in one shot; masking by `allowed` only *afterward* does
-        # not stop growth from tunneling across bone that is thinner than
-        # the kernel radius (thin orbital wall, temporal bone, sutures,
-        # pediatric skull, etc.) -- the far side survives because it's still
-        # below bone_stop_hu, even though the true path to it crosses bone.
-        #
-        # Instead, grow by a small step and re-clip to `allowed` after every
-        # single step. Growth is then blocked the instant it touches bone,
-        # regardless of total reach, because a pixel can only ever enter the
-        # mask by being adjacent to an already-allowed pixel already in the
-        # mask -- there is no way to skip over a barrier of any thickness.
         step_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        n_steps = int(max(1, ceil(k_max / 2.0)))  # ~k_max total reach, in 1px/step increments
+        n_steps = int(max(1, ceil(int(max(1, k_max)) / 2.0)))
 
-        max_once = seed.copy()
+        grown = seed.copy()
         for _ in range(n_steps):
-            grown = cv2.dilate(max_once, step_kernel)
-            grown = (grown & allowed).astype(np.uint8)
-            if np.array_equal(grown, max_once):
-                break  # converged early, nothing left to grow into
-            max_once = grown
+            nxt = (cv2.dilate(grown, step_kernel) & allowed).astype(np.uint8)
+            if np.array_equal(nxt, grown):
+                break
+            grown = nxt
+        return self._keep_only_components_touching_seed(grown, seed)
 
-        max_once = self._keep_only_components_touching_seed(max_once, seed)
-
-        k33 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, FRONT_BOOST_KERNEL)
-        anterior_region = self._anterior_region_mask((H, W), ds, front_fraction=front_fraction)
-
-        boosted = cv2.dilate(max_once, k33)
-        boosted = (boosted & allowed & anterior_region & max_once).astype(np.uint8)
-
-        combined = (max_once | boosted).astype(np.uint8)
-        combined = (combined & max_once).astype(np.uint8)
-        combined = (combined & allowed).astype(np.uint8)
-        combined = self._keep_only_components_touching_seed(combined, seed)
-
-        return combined
-
-    def apply_random_values_optimized(
-        self,
-        pixels_hu,
-        dilated_mask,
-        unique_values_list,
-        bone_stop_hu=BONE_STOP_HU,
-        fill_mode="air",
-    ):
-        new_vol = np.array(pixels_hu, copy=True)
-        mask = (dilated_mask == 1) & (pixels_hu < int(bone_stop_hu))
-
-        if fill_mode == "sample" and unique_values_list:
-            repl = np.random.choice(unique_values_list, size=int(mask.sum()))
-            new_vol[mask] = repl.astype(new_vol.dtype)
-        else:
-            new_vol[mask] = -1000
-
-        return new_vol
+    def fill_air(self, pixels_hu, mask, bone_stop_hu=BONE_STOP_HU):
+        out = np.array(pixels_hu, copy=True)
+        out[(mask == 1) & (pixels_hu < int(bone_stop_hu))] = -1000
+        return out
 
     def curves_callback(self, ds, elem):
         if elem.tag.group & 0xFF00 == 0x5000:
@@ -4116,7 +4080,6 @@ class DicomProcessor:
         return uid_dict[s]
 
     def _current_date_da(self):
-        """The anonymization date, as DICOM DA (YYYYMMDD)."""
         fixed = str(DEID_ANONYMIZATION_DATE or "").strip()
         if len(fixed) == 8 and fixed.isdigit():
             return fixed
@@ -4124,7 +4087,6 @@ class DicomProcessor:
 
     @staticmethod
     def _parse_da(value):
-        """Parse a DICOM DA value into a date, or None."""
         try:
             s = "".join(ch for ch in str(value or "") if ch.isdigit())
             if len(s) < 8:
@@ -4134,7 +4096,6 @@ class DicomProcessor:
             return None
 
     def _compute_age_string(self, birth_date_value, study_date_value):
-        """Age at the exam as a DICOM AS value (e.g. '067Y'), capped per Safe Harbor."""
         birth = self._parse_da(birth_date_value)
         exam = self._parse_da(study_date_value)
         if birth is None or exam is None or exam < birth:
@@ -4147,14 +4108,9 @@ class DicomProcessor:
             return None
         if years > int(DEID_MAX_AGE_YEARS):
             years = int(DEID_MAX_AGE_YEARS)
-        return "%03dY" % years
+        return f"{years:03d}Y"
 
     def _replace_all_dates(self, ds):
-        """Rewrite every DA/DT element to the anonymization date.
-
-        A VR-driven sweep rather than a fixed tag list, so private and vendor
-        date tags are covered too. Returns (n_changed, names_changed).
-        """
         today = self._current_date_da()
         changed = [0]
         names = set()
@@ -4165,12 +4121,9 @@ class DicomProcessor:
             return today
 
         def fix_dt(value):
-            def one(v):
-                s = str(v or "").strip()
-                return today + "000000.000000"
             if _is_multivalue(value):
-                return [one(v) for v in value]
-            return one(value)
+                return [today + "000000.000000" for _ in value]
+            return today + "000000.000000"
 
         def fix_tm(value):
             if str(DEID_TIME_POLICY).lower() != "zero":
@@ -4206,16 +4159,14 @@ class DicomProcessor:
                     elem.value = new_val
                     changed[0] += 1
                     tag = (elem.tag.group, elem.tag.element)
-                    names.add(DATE_TIME_TAGS_OF_INTEREST.get(
-                        tag, "(%04X,%04X)" % tag))
+                    names.add(DATE_TIME_TAGS_OF_INTEREST.get(tag, "({:04X},{:04X})".format(*tag)))
                 except Exception:
                     continue
 
         walk(ds)
         return changed[0], names
 
-    def _replace_dt_date_and_time(self, original_value):
-        """Replace date and remove original DT time and UTC offset."""
+    def _replace_dt_date_and_time(self):
         return self._current_date_da() + "000000.000000"
 
     def _set_safe_value_by_vr(self, ds, tag, vr, generate_uid_fn, patient_id_value):
@@ -4235,7 +4186,7 @@ class DicomProcessor:
         if vr == "TM":
             return
         if vr == "DT":
-            ds[tag].value = self._replace_dt_date_and_time(ds[tag].value)
+            ds[tag].value = self._replace_dt_date_and_time()
             return
 
         if vr == "UI":
@@ -4249,8 +4200,9 @@ class DicomProcessor:
                     mapping = self.series_uid_map
                 elif tag == (0x0008, 0x0018):
                     mapping = self.sop_uid_map
-                ds[tag].value = [self._remap_uid(v, mapping, generate_uid_fn)
-                                 for v in ds[tag].value]
+                ds[tag].value = [
+                    self._remap_uid(v, mapping, generate_uid_fn) for v in ds[tag].value
+                ]
                 return
             if tag == (0x0020, 0x000D):
                 ds[tag].value = self._remap_uid(ds[tag].value, self.study_uid_map, generate_uid_fn)
@@ -4262,7 +4214,9 @@ class DicomProcessor:
                 ds[tag].value = self._remap_uid(ds[tag].value, self.sop_uid_map, generate_uid_fn)
                 return
             if tag == (0x0020, 0x0052):
-                ds[tag].value = self._remap_uid(ds[tag].value, self.uid_map_general, generate_uid_fn)
+                ds[tag].value = self._remap_uid(
+                    ds[tag].value, self.uid_map_general, generate_uid_fn
+                )
                 return
             ds[tag].value = self._remap_uid(ds[tag].value, self.uid_map_general, generate_uid_fn)
             return
@@ -4295,13 +4249,6 @@ class DicomProcessor:
             pass
 
     def _fix_invalid_uids(self, ds):
-        """Replace syntactically invalid UIDs, including those in File Meta.
-
-        The same map used for de-identification is reused, so a given original
-        UID always maps to the same replacement and cross-references between
-        instances survive. Standard concept UIDs (SOP Class, Transfer Syntax)
-        are left alone.
-        """
         from pydicom.uid import generate_uid
 
         fixed = [0]
@@ -4325,7 +4272,8 @@ class DicomProcessor:
 
                     val = elem.value
                     if isinstance(val, (list, tuple)) or (
-                            hasattr(val, "__iter__") and not isinstance(val, (str, bytes))):
+                        hasattr(val, "__iter__") and not isinstance(val, (str, bytes))
+                    ):
                         out = []
                         changed = False
                         for v in list(val):
@@ -4359,13 +4307,17 @@ class DicomProcessor:
         return fixed[0]
 
     def _apply_ps315_profile(self, ds):
-        """Apply the configured policy at every sequence depth.
-
-        This is a production transformation, not an independent disk audit.
-        """
-        stats = {"overlays": 0, "icons": 0, "descriptors": 0, "curves": 0,
-                 "order_entry": 0, "extra_identifiers": 0, "dangling_refs": 0,
-                 "security": 0, "private": 0}
+        stats = {
+            "overlays": 0,
+            "icons": 0,
+            "descriptors": 0,
+            "curves": 0,
+            "order_entry": 0,
+            "extra_identifiers": 0,
+            "dangling_refs": 0,
+            "security": 0,
+            "private": 0,
+        }
         if not PS315_APPLY_PROFILE:
             return stats
         extra = set(PS315_EXTRA_IDENTIFIERS_TO_REMOVE)
@@ -4394,7 +4346,9 @@ class DicomProcessor:
                     category = "extra_identifiers"
                 elif PS315_REMOVE_ICON_IMAGE_SEQUENCE and tag == (0x0088, 0x0200):
                     category = "icons"
-                elif tag in PS315_DESCRIPTOR_TAGS and str(PS315_DESCRIPTOR_POLICY).lower() == "blank":
+                elif (
+                    tag in PS315_DESCRIPTOR_TAGS and str(PS315_DESCRIPTOR_POLICY).lower() == "blank"
+                ):
                     if elem.VR == "SQ" and PS315_DELETE_EMPTIED_SEQUENCES:
                         category = "descriptors"
                     else:
@@ -4411,13 +4365,6 @@ class DicomProcessor:
         return stats
 
     def _drop_empty_sop_references(self, ds):
-        """Remove sequence items whose Type 1 reference UID is empty.
-
-        ReferencedSOPClassUID and ReferencedSOPInstanceUID are Type 1: they must
-        be present AND have a value. An item with an empty one points at nothing,
-        and dciodvfy reports it as an Error. Dropping the item is the only fix
-        that does not fabricate a reference.
-        """
         removed = [0]
         if not DEID_DROP_EMPTY_SOP_REFERENCES:
             return 0
@@ -4459,7 +4406,6 @@ class DicomProcessor:
         return removed[0]
 
     def _set_deidentification_attributes(self, ds, pixel_verified=False, face_verified=False):
-        """Declare the profile in (0012,0062/0063/0064), as PS3.15 requires."""
         try:
             from pydicom.dataset import Dataset
             from pydicom.sequence import Sequence
@@ -4513,14 +4459,6 @@ class DicomProcessor:
             pass
 
     def _set_temporal_information_flag(self, ds):
-        """(0028,0303) Longitudinal Temporal Information Modified.
-
-        Annex E requires a de-identifier to state what it did to temporal
-        information. Under the default configuration dates are replaced with a
-        single anonymization date, so intervals between studies are not
-        preserved and the correct value is REMOVED. If a future release adds
-        consistent per-patient date shifting, this becomes MODIFIED.
-        """
         if not DEID_SET_LONGITUDINAL_TEMPORAL_FLAG:
             return
 
@@ -4534,18 +4472,19 @@ class DicomProcessor:
             pass
 
     def _ps315_qc_report(self, ds):
-        """DICOMQC-style self check on the de-identified dataset."""
         findings = []
         if not PS315_RUN_QC:
             return findings
 
         def add(kind, tag, name, detail):
-            findings.append({
-                "finding": kind,
-                "tag": ("(%04X,%04X)" % tag) if tag else "",
-                "name": name,
-                "detail": str(detail)[:120],
-            })
+            findings.append(
+                {
+                    "finding": kind,
+                    "tag": ("({:04X},{:04X})".format(*tag)) if tag else "",
+                    "name": name,
+                    "detail": str(detail)[:120],
+                }
+            )
 
         for tag, name in PS315_QC_MUST_BE_ABSENT.items():
             try:
@@ -4582,10 +4521,12 @@ class DicomProcessor:
                     elif tag == (0x0088, 0x0200):
                         add("icon_image_present", tag, "IconImageSequence", "SQ")
 
-                    if elem.VR == "UI" and elem.value is not None \
-                            and tag not in UID_TAGS_NEVER_REMAPPED:
-                        vals = (list(elem.value)
-                                if _is_multivalue(elem.value) else [elem.value])
+                    if (
+                        elem.VR == "UI"
+                        and elem.value is not None
+                        and tag not in UID_TAGS_NEVER_REMAPPED
+                    ):
+                        vals = list(elem.value) if _is_multivalue(elem.value) else [elem.value]
                         for v in vals:
                             if not _uid_is_valid(v):
                                 add("invalid_uid", tag, "UID", v)
@@ -4631,8 +4572,7 @@ class DicomProcessor:
                         if produced and ref in item:
                             v = str(item[ref].value or "").strip()
                             if v and v not in produced:
-                                add("unresolved_reference", ref,
-                                    "ReferencedSOPInstanceUID", v)
+                                add("unresolved_reference", ref, "ReferencedSOPInstanceUID", v)
                         check_refs(item, depth + 1)
                 except Exception:
                     continue
@@ -4643,33 +4583,46 @@ class DicomProcessor:
             if (0x0012, 0x0062) not in ds or str(ds[(0x0012, 0x0062)].value).upper() != "YES":
                 add("missing_declaration", (0x0012, 0x0062), "PatientIdentityRemoved", "")
             if (0x0012, 0x0064) not in ds:
-                add("missing_declaration", (0x0012, 0x0064),
-                    "DeidentificationMethodCodeSequence", "")
+                add(
+                    "missing_declaration",
+                    (0x0012, 0x0064),
+                    "DeidentificationMethodCodeSequence",
+                    "",
+                )
             if DEID_SET_LONGITUDINAL_TEMPORAL_FLAG and (0x0028, 0x0303) not in ds:
-                add("missing_declaration", (0x0028, 0x0303),
-                    "LongitudinalTemporalInformationModified", "")
+                add(
+                    "missing_declaration",
+                    (0x0028, 0x0303),
+                    "LongitudinalTemporalInformationModified",
+                    "",
+                )
         except Exception:
             pass
 
-        # Check the explicit File Meta/preamble policy (Annex E.1.1).
         try:
             for tag, name in FILE_META_TAGS_TO_REMOVE.items():
                 fm = getattr(ds, "file_meta", None)
                 if fm is not None and tag in fm:
-                    if tag == (0x0002, 0x0013) and str(fm[tag].value) == DEID_IMPLEMENTATION_VERSION:
+                    if (
+                        tag == (0x0002, 0x0013)
+                        and str(fm[tag].value) == DEID_IMPLEMENTATION_VERSION
+                    ):
                         continue
                     add("file_meta_not_removed", tag, name, "Unexpected source File Meta value")
             pre = getattr(ds, "preamble", None)
             if DEID_ZERO_PREAMBLE and pre is not None and set(pre) != {0}:
-                add("preamble_not_zeroed", None, "128-byte preamble",
-                    "%d non-zero byte(s)" % sum(1 for b in pre if b))
+                add(
+                    "preamble_not_zeroed",
+                    None,
+                    "128-byte preamble",
+                    f"{sum(1 for b in pre if b)} non-zero byte(s)",
+                )
         except Exception:
             pass
 
         return findings
 
     def _find_invalid_uids(self, ds):
-        """List any UI values that are still non-conformant after repair."""
         bad = []
 
         def walk(dataset):
@@ -4683,9 +4636,7 @@ class DicomProcessor:
                         continue
                     if (elem.tag.group, elem.tag.element) in UID_TAGS_NEVER_REMAPPED:
                         continue
-                    vals = (list(elem.value)
-                            if _is_multivalue(elem.value)
-                            else [elem.value])
+                    vals = list(elem.value) if _is_multivalue(elem.value) else [elem.value]
                     for v in vals:
                         if not _uid_is_valid(v):
                             bad.append(str(v))
@@ -4699,12 +4650,6 @@ class DicomProcessor:
         return bad
 
     def _sync_file_meta(self, ds):
-        """Bring group 0002 into line with the de-identified dataset.
-
-        Dataset iteration does not include file_meta, so the anonymisation pass
-        never sees it and the original instance UID would otherwise be written
-        into the output file.
-        """
         fm = getattr(ds, "file_meta", None)
         if fm is None:
             return
@@ -4732,10 +4677,10 @@ class DicomProcessor:
                     continue
 
         from pydicom.uid import PYDICOM_IMPLEMENTATION_UID
+
         fm.ImplementationClassUID = PYDICOM_IMPLEMENTATION_UID
         fm.ImplementationVersionName = DEID_IMPLEMENTATION_VERSION
 
-        # The output preamble is initialized even if the source lacked one.
         if DEID_ZERO_PREAMBLE:
             try:
                 ds.preamble = b"\x00" * 128
@@ -4763,7 +4708,9 @@ class DicomProcessor:
                     tag = (elem.tag.group, elem.tag.element)
 
                     if tag in PDF_TAGS_TO_DEID and tag in dataset:
-                        self._set_safe_value_by_vr(dataset, tag, elem.VR, generate_uid, patient_id_value)
+                        self._set_safe_value_by_vr(
+                            dataset, tag, elem.VR, generate_uid, patient_id_value
+                        )
 
                 except Exception:
                     continue
@@ -4771,14 +4718,21 @@ class DicomProcessor:
         recurse(ds)
 
     def _append_qc_rows(self, csv_path, rows):
-        """Write production pre-write findings. An absent/empty file does not establish audit success."""
         if not csv_path or not rows:
             return
         try:
             file_exists = os.path.exists(csv_path)
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
-                fieldnames = ["timestamp", "patient_new_id", "series_folder",
-                              "source_filename", "finding", "tag", "name", "detail"]
+                fieldnames = [
+                    "timestamp",
+                    "patient_new_id",
+                    "series_folder",
+                    "source_filename",
+                    "finding",
+                    "tag",
+                    "name",
+                    "detail",
+                ]
                 w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 if not file_exists:
                     w.writeheader()
@@ -4832,11 +4786,8 @@ class DicomProcessor:
         self,
         original_dir,
         out_dir,
-        replacer="face",
         id="new_folder_name",
         patient_old_id="",
-        patient_id="0",
-        new_patient_id="Processed for anonymization",
         remove_CTA=False,
         global_drop_csv_path=None,
         global_qc_csv_path=None,
@@ -4846,14 +4797,17 @@ class DicomProcessor:
         global_verify_fail_png_dir=None,
         global_prescreen_png_dir=None,
         global_not_examined_png_dir=None,
-        patient_input_root=None,
         original_face_render_dir=None,
         after_deidentification_render_dir=None,
     ):
         import pydicom
 
         os.makedirs(out_dir, exist_ok=True)
-        files = [f for f in os.listdir(original_dir) if self.is_dicom(os.path.join(original_dir, f), remove_CTA)]
+        files = [
+            f
+            for f in os.listdir(original_dir)
+            if self.is_dicom(os.path.join(original_dir, f), remove_CTA)
+        ]
         errors = []
 
         dropped_rows = []
@@ -4902,7 +4856,9 @@ class DicomProcessor:
             tmp_root = tempfile.mkdtemp(prefix="headctdeid_tmpdicom_")
 
             if files:
-                _safe_show_status(f"[{id}] Series: {os.path.basename(original_dir)} | slices={len(files)}", 2500)
+                _safe_show_status(
+                    f"[{id}] Series: {os.path.basename(original_dir)} | slices={len(files)}", 2500
+                )
 
             for i, fname in enumerate(files, start=1):
                 src_path = os.path.join(original_dir, fname)
@@ -4953,7 +4909,8 @@ class DicomProcessor:
                         try:
                             orig_study_date = getattr(ds, "StudyDate", None)
                             age_str = self._compute_age_string(
-                                getattr(ds, "PatientBirthDate", None), orig_study_date)
+                                getattr(ds, "PatientBirthDate", None), orig_study_date
+                            )
                             if age_str is None:
                                 existing = str(getattr(ds, "PatientAge", "") or "").strip()
                                 if existing:
@@ -4975,8 +4932,10 @@ class DicomProcessor:
                             capped = age_str
                             try:
                                 yrs = int(str(age_str)[:3])
-                                if str(age_str).upper().endswith("Y") and yrs > int(DEID_MAX_AGE_YEARS):
-                                    capped = "%03dY" % int(DEID_MAX_AGE_YEARS)
+                                if str(age_str).upper().endswith("Y") and yrs > int(
+                                    DEID_MAX_AGE_YEARS
+                                ):
+                                    capped = f"{int(DEID_MAX_AGE_YEARS):03d}Y"
                                     age_capped_count += 1
                             except Exception:
                                 pass
@@ -5006,19 +4965,23 @@ class DicomProcessor:
                         ps315_descriptors += st["descriptors"]
 
                     iod_actions = _repair_classic_ct_iod(ds, confirmed_head=source_head_confirmed)
-                    _append_iod_actions(os.path.join(out_dir, DEID_IOD_ACTIONS_FILENAME), fname, iod_actions)
+                    _append_iod_actions(
+                        os.path.join(out_dir, DEID_IOD_ACTIONS_FILENAME), fname, iod_actions
+                    )
                     for action, location, detail in iod_actions:
                         if action == "unresolved":
-                            self.logger.warning("[%s] IOD metadata review %s: %s", id, location, detail)
+                            self.logger.warning(f"[{id}] IOD metadata review {location}: {detail}")
 
                     if PS315_RUN_QC:
                         for f in self._ps315_qc_report(ds):
-                            f.update({
-                                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                                "patient_new_id": id,
-                                "series_folder": os.path.basename(original_dir),
-                                "source_filename": fname,
-                            })
+                            f.update(
+                                {
+                                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                    "patient_new_id": id,
+                                    "series_folder": os.path.basename(original_dir),
+                                    "source_filename": fname,
+                                }
+                            )
                             qc_rows.append(f)
 
                     pixels_hu = self.get_pixels_hu(ds)
@@ -5028,21 +4991,33 @@ class DicomProcessor:
                     was_prescreen_skipped = False
 
                     want_detect = ENABLE_TEXT_DETECTION and (
-                        ALWAYS_EXAMINE_ALL_SLICES or self._force_ocr_all or burned_flag)
+                        ALWAYS_EXAMINE_ALL_SLICES or self._force_ocr_all or burned_flag
+                    )
                     if want_detect:
                         _skipped_before = self._prescreen_skipped
-                        (has_text, hit_txt, hit_conf, hit_bbox, gray8,
-                         detection_img, boxes, boxless) = self.detect_text_debug(
-                            ds, burned_flag=burned_flag)
-                        was_prescreen_skipped = (self._prescreen_skipped > _skipped_before)
+                        (
+                            has_text,
+                            hit_txt,
+                            hit_conf,
+                            hit_bbox,
+                            gray8,
+                            detection_img,
+                            boxes,
+                            boxless,
+                        ) = self.detect_text_debug(ds, burned_flag=burned_flag)
+                        was_prescreen_skipped = self._prescreen_skipped > _skipped_before
 
                         if has_text:
                             png_detected += 1
 
                             action = str(TEXT_ACTION).lower()
 
-                            if (action == "redact" and boxless and not boxes
-                                    and str(REDACT_BOXLESS_STRATEGY).lower() == "drop"):
+                            if (
+                                action == "redact"
+                                and boxless
+                                and not boxes
+                                and str(REDACT_BOXLESS_STRATEGY).lower() == "drop"
+                            ):
                                 action = "drop"
 
                             if NEVER_DROP_SLICES and action == "drop":
@@ -5051,8 +5026,12 @@ class DicomProcessor:
 
                             if action == "redact":
                                 boxless_mode = str(REDACT_BOXLESS_STRATEGY).lower()
-                                if NEVER_DROP_SLICES and boxless and not boxes \
-                                        and boxless_mode != "border_band":
+                                if (
+                                    NEVER_DROP_SLICES
+                                    and boxless
+                                    and not boxes
+                                    and boxless_mode != "border_band"
+                                ):
                                     boxless_mode = "border_band"
 
                                 redact_rects = self._redaction_rects(
@@ -5071,69 +5050,74 @@ class DicomProcessor:
                                     os.path.basename(original_dir),
                                     fname,
                                     self._draw_mask_rects(
-                                        detection_img, redact_rects,
-                                        gray_shape_hw=(None if gray8 is None
-                                                       else gray8.shape[:2]),
-                                        hu_shape_hw=pixels_hu.shape[:2]),
+                                        detection_img,
+                                        redact_rects,
+                                        gray_shape_hw=(None if gray8 is None else gray8.shape[:2]),
+                                        hu_shape_hw=pixels_hu.shape[:2],
+                                    ),
                                 )
 
                             if action == "redact" and redact_rects:
                                 redact_count += 1
 
-                                dropped_rows.append({
-                                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                                    "patient_old_id": patient_old_id,
-                                    "patient_new_id": id,
-                                    "series_folder": os.path.basename(original_dir),
-                                    "source_dir": original_dir,
-                                    "source_filename": fname,
-                                    "instance_number": inst,
-                                    "series_instance_uid": series_uid,
-                                    "study_instance_uid": study_uid,
-                                    "sop_instance_uid": sop_uid,
-                                    "burned_in_annotation": bool(burned_flag),
-                                    "decision": "REDACTED",
-                                    "reason": "florence2_redacted_text",
-                                    "hit_text": hit_txt,
-                                    "hit_conf": hit_conf,
-                                    "hit_bbox": hit_bbox,
-                                    "n_redacted_regions": len(redact_rects),
-                                    "boxless_hits": int(boxless),
-                                    "forced_keep": bool(forced_keep),
-                                })
+                                dropped_rows.append(
+                                    {
+                                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                        "patient_old_id": patient_old_id,
+                                        "patient_new_id": id,
+                                        "series_folder": os.path.basename(original_dir),
+                                        "source_dir": original_dir,
+                                        "source_filename": fname,
+                                        "instance_number": inst,
+                                        "series_instance_uid": series_uid,
+                                        "study_instance_uid": study_uid,
+                                        "sop_instance_uid": sop_uid,
+                                        "burned_in_annotation": bool(burned_flag),
+                                        "decision": "REDACTED",
+                                        "reason": "florence2_redacted_text",
+                                        "hit_text": hit_txt,
+                                        "hit_conf": hit_conf,
+                                        "hit_bbox": hit_bbox,
+                                        "n_redacted_regions": len(redact_rects),
+                                        "boxless_hits": int(boxless),
+                                        "forced_keep": bool(forced_keep),
+                                    }
+                                )
 
                             elif action == "drop" and not NEVER_DROP_SLICES:
                                 drop_count += 1
-                                dropped_rows.append({
-                                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                                    "patient_old_id": patient_old_id,
-                                    "patient_new_id": id,
-                                    "series_folder": os.path.basename(original_dir),
-                                    "source_dir": original_dir,
-                                    "source_filename": fname,
-                                    "instance_number": inst,
-                                    "series_instance_uid": series_uid,
-                                    "study_instance_uid": study_uid,
-                                    "sop_instance_uid": sop_uid,
-                                    "burned_in_annotation": bool(burned_flag),
-                                    "decision": "DROPPED",
-                                    "reason": "florence2_detected_text",
-                                    "hit_text": hit_txt,
-                                    "hit_conf": hit_conf,
-                                    "hit_bbox": hit_bbox,
-                                    "n_redacted_regions": 0,
-                                    "boxless_hits": int(boxless),
-                                    "forced_keep": False,
-                                })
+                                dropped_rows.append(
+                                    {
+                                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                        "patient_old_id": patient_old_id,
+                                        "patient_new_id": id,
+                                        "series_folder": os.path.basename(original_dir),
+                                        "source_dir": original_dir,
+                                        "source_filename": fname,
+                                        "instance_number": inst,
+                                        "series_instance_uid": series_uid,
+                                        "study_instance_uid": study_uid,
+                                        "sop_instance_uid": sop_uid,
+                                        "burned_in_annotation": bool(burned_flag),
+                                        "decision": "DROPPED",
+                                        "reason": "florence2_detected_text",
+                                        "hit_text": hit_txt,
+                                        "hit_conf": hit_conf,
+                                        "hit_bbox": hit_bbox,
+                                        "n_redacted_regions": 0,
+                                        "boxless_hits": int(boxless),
+                                        "forced_keep": False,
+                                    }
+                                )
                                 del ds, pixels_hu
                                 continue
 
                             else:
                                 unmasked_count += 1
                                 self.logger.warning(
-                                    "[%s] %s: text detected but NOT masked "
-                                    "(boxless=%d, strategy=%s): %r"
-                                    % (id, fname, boxless, REDACT_BOXLESS_STRATEGY, hit_txt))
+                                    f"[{id}] {fname}: text detected but NOT masked (boxless={boxless}, "
+                                    f"strategy={REDACT_BOXLESS_STRATEGY}): {hit_txt!r}"
+                                )
 
                         elif detection_img is not None:
                             if was_prescreen_skipped:
@@ -5168,8 +5152,7 @@ class DicomProcessor:
                                     id,
                                     os.path.basename(original_dir),
                                     fname,
-                                    self._gray_to_bgr(
-                                        self._dicom_pixels_to_gray8_for_ocr(ds)),
+                                    self._gray_to_bgr(self._dicom_pixels_to_gray8_for_ocr(ds)),
                                 )
                             except Exception:
                                 png_none += 1
@@ -5178,34 +5161,9 @@ class DicomProcessor:
                     lcc = self.largest_connected_component(bin_mask)
 
                     k_max = int(self._kernel_from_pixel_spacing(ds, slice_key=source_slice_key))
-                    dilated = self.bounded_dilate_with_front_boost(
-                        lcc_air_seed=lcc,
-                        pixels_hu=pixels_hu,
-                        ds=ds,
-                        k_max=k_max,
-                        bone_stop_hu=BONE_STOP_HU,
-                        front_fraction=0.55,
-                    )
+                    dilated = self.bounded_dilate(lcc, pixels_hu, k_max)
 
-                    ring = ((dilated > 0) & (lcc == 0)).astype(np.uint8)
-
-                    if replacer == "face":
-                        vals = self.apply_mask_and_get_values(pixels_hu, ring)
-                    elif replacer == "air":
-                        vals = [0]
-                    else:
-                        try:
-                            vals = [int(replacer)]
-                        except Exception:
-                            vals = self.apply_mask_and_get_values(pixels_hu, ring)
-
-                    new_volume = self.apply_random_values_optimized(
-                        pixels_hu,
-                        dilated,
-                        vals,
-                        bone_stop_hu=BONE_STOP_HU,
-                        fill_mode="air",
-                    )
+                    new_volume = self.fill_air(pixels_hu, dilated)
 
                     if redact_rects:
                         self._apply_redaction(new_volume, redact_rects)
@@ -5216,8 +5174,7 @@ class DicomProcessor:
                                 id,
                                 os.path.basename(original_dir),
                                 fname,
-                                self._render_redacted_png(
-                                    self._hu_to_gray8(new_volume, ds), []),
+                                self._render_redacted_png(self._hu_to_gray8(new_volume, ds), []),
                             )
 
                         if REDACT_VERIFY_WITH_SECOND_PASS:
@@ -5225,18 +5182,21 @@ class DicomProcessor:
                             if still_text:
                                 verify_fail_count += 1
                                 self.logger.warning(
-                                    "[%s] %s: text STILL detected after masking: %r"
-                                    % (id, fname, still_txt))
+                                    f"[{id}] {fname}: text STILL detected after masking: {still_txt!r}"
+                                )
                                 self._save_debug_png(
                                     global_verify_fail_png_dir,
                                     id,
                                     os.path.basename(original_dir),
                                     fname,
                                     self._render_redacted_png(
-                                        self._hu_to_gray8(new_volume, ds), []),
+                                        self._hu_to_gray8(new_volume, ds), []
+                                    ),
                                 )
-                                if (str(REDACT_VERIFY_ON_FAILURE).lower() == "drop"
-                                        and not NEVER_DROP_SLICES):
+                                if (
+                                    str(REDACT_VERIFY_ON_FAILURE).lower() == "drop"
+                                    and not NEVER_DROP_SLICES
+                                ):
                                     drop_count += 1
                                     del ds, pixels_hu, new_volume
                                     continue
@@ -5246,6 +5206,7 @@ class DicomProcessor:
                     new_slice = (new_volume - intercept) / slope
 
                     from pydicom.uid import ExplicitVRLittleEndian
+
                     ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
                     ds.is_little_endian = True
                     ds.is_implicit_VR = False
@@ -5267,7 +5228,9 @@ class DicomProcessor:
                     with open(trace_path, "a", newline="", encoding="utf-8") as trace_file:
                         trace = csv.writer(trace_file)
                         if not trace_exists:
-                            trace.writerow(["output_file", "kernel_parameter_pixels", "random_seed", "fill_hu"])
+                            trace.writerow(
+                                ["output_file", "kernel_parameter_pixels", "random_seed", "fill_hu"]
+                            )
                         trace.writerow([out_name, k_max, DEID_RANDOM_SEED, -1000])
                     kept_count += 1
 
@@ -5278,19 +5241,30 @@ class DicomProcessor:
                     ocr_failure_count += 1
                     self._ocr_failure_count += 1
                     errors.append((fname, f"OCR_FAILED: {e}"))
-                    self.logger.error("[%s] %s: OCR_FAILED: %s", id, fname, e)
-                    dropped_rows.append({
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "patient_old_id": patient_old_id, "patient_new_id": id,
-                        "series_folder": os.path.basename(original_dir),
-                        "source_dir": original_dir, "source_filename": fname,
-                        "instance_number": inst, "series_instance_uid": series_uid,
-                        "study_instance_uid": study_uid, "sop_instance_uid": sop_uid,
-                        "burned_in_annotation": "YES" if burned_flag else "NO",
-                        "decision": "OCR_FAILED", "reason": str(e),
-                        "hit_text": "", "hit_conf": None, "hit_bbox": None,
-                        "n_redacted_regions": 0, "boxless_hits": 0, "forced_keep": False,
-                    })
+                    self.logger.error(f"[{id}] {fname}: OCR_FAILED: {e}")
+                    dropped_rows.append(
+                        {
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "patient_old_id": patient_old_id,
+                            "patient_new_id": id,
+                            "series_folder": os.path.basename(original_dir),
+                            "source_dir": original_dir,
+                            "source_filename": fname,
+                            "instance_number": inst,
+                            "series_instance_uid": series_uid,
+                            "study_instance_uid": study_uid,
+                            "sop_instance_uid": sop_uid,
+                            "burned_in_annotation": "YES" if burned_flag else "NO",
+                            "decision": "OCR_FAILED",
+                            "reason": str(e),
+                            "hit_text": "",
+                            "hit_conf": None,
+                            "hit_bbox": None,
+                            "n_redacted_regions": 0,
+                            "boxless_hits": 0,
+                            "forced_keep": False,
+                        }
+                    )
                 except Exception as e:
                     err_count += 1
                     errors.append((fname, str(e)))
@@ -5307,136 +5281,148 @@ class DicomProcessor:
             if n_in:
                 if n_out == n_in:
                     self.logger.info(
-                        "[%s] %s: %d/%d slices written (none removed); %d had text "
-                        "blacked out." % (id, os.path.basename(original_dir),
-                                          n_out, n_in, redact_count))
+                        f"[{id}] {os.path.basename(original_dir)}: {n_out}/{n_in} slices "
+                        f"written (none removed); {redact_count} had text blacked out."
+                    )
                 else:
                     self.logger.warning(
-                        "[%s] %s: %d/%d slices written - %d MISSING "
-                        "(dropped=%d, errors=%d). With NEVER_DROP_SLICES=%s, any "
+                        f"[{id}] {os.path.basename(original_dir)}: {n_out}/{n_in} slices "
+                        f"written - {n_in - n_out} MISSING (dropped={drop_count}, errors="
+                        f"{err_count}). With NEVER_DROP_SLICES={NEVER_DROP_SLICES}, any "
                         "shortfall is a read/processing error, not text removal."
-                        % (id, os.path.basename(original_dir), n_out, n_in,
-                           n_in - n_out, drop_count, err_count, NEVER_DROP_SLICES))
+                    )
 
             if n_in:
-                accounted = (png_detected + png_no_text + png_prescreen
-                             + png_not_examined + png_none)
+                accounted = png_detected + png_no_text + png_prescreen + png_not_examined + png_none
                 self.logger.info(
-                    "[%s] %s: debug PNG accounting over %d slice(s): "
-                    "text_found=%d, examined_clean=%d, prescreen_skipped=%d, "
-                    "not_examined=%d, no_image=%d (total %d)"
-                    % (id, os.path.basename(original_dir), n_in,
-                       png_detected, png_no_text, png_prescreen,
-                       png_not_examined, png_none, accounted))
+                    f"[{id}] {os.path.basename(original_dir)}: debug PNG accounting over "
+                    f"{n_in} slice(s): text_found={png_detected}, examined_clean="
+                    f"{png_no_text}, prescreen_skipped={png_prescreen}, not_examined="
+                    f"{png_not_examined}, no_image={png_none} (total {accounted})"
+                )
                 if png_detected != redact_count + drop_count + unmasked_count:
                     self.logger.warning(
-                        "[%s] PNG/action mismatch: %d slice(s) with text but "
-                        "%d redacted + %d dropped + %d unmasked."
-                        % (id, png_detected, redact_count, drop_count, unmasked_count))
+                        f"[{id}] PNG/action mismatch: {png_detected} slice(s) with text but "
+                        f"{redact_count} redacted + {drop_count} dropped + {unmasked_count} "
+                        "unmasked."
+                    )
                 if png_not_examined and not ALWAYS_EXAMINE_ALL_SLICES:
                     self.logger.warning(
-                        "[%s] %d slice(s) were NOT examined for burned-in text "
-                        "(detection runs only when the de-identify option is on or "
-                        "BurnedInAnnotation=YES). See only_for_debug/%s."
-                        % (id, png_not_examined, OCR_DEBUG_NOT_EXAMINED_DIRNAME))
+                        f"[{id}] {png_not_examined} slice(s) were NOT examined for burned-in "
+                        "text (detection runs only when the de-identify option is on or "
+                        "BurnedInAnnotation=YES). See only_for_debug/"
+                        f"{OCR_DEBUG_NOT_EXAMINED_DIRNAME}."
+                    )
                 if png_prescreen:
                     self.logger.info(
-                        "[%s] %d slice(s) were skipped by the OpenCV pre-screen and "
-                        "never reached Florence-2. Set PRESCREEN_MODE = \"off\" to "
-                        "examine every slice. See only_for_debug/%s."
-                        % (id, png_prescreen, OCR_DEBUG_PRESCREEN_DIRNAME))
+                        f"[{id}] {png_prescreen} slice(s) were skipped by the OpenCV pre-screen "
+                        'and never reached Florence-2. Set PRESCREEN_MODE = "off" to examine '
+                        f"every slice. See only_for_debug/{OCR_DEBUG_PRESCREEN_DIRNAME}."
+                    )
                 if png_none:
                     self.logger.warning(
-                        "[%s] %d slice(s) produced NO debug image (pixel conversion or "
-                        "model init failed). These were not checked for text."
-                        % (id, png_none))
+                        f"[{id}] {png_none} slice(s) produced NO debug image (pixel conversion "
+                        "or model init failed). These were not checked for text."
+                    )
 
             if ocr_failure_count:
                 self.logger.error(
-                    "[%s] %d slice(s) failed OCR; not counted as text-negative "
-                    "and not written. This examination is incomplete.", id, ocr_failure_count)
+                    f"[{id}] {ocr_failure_count} slice(s) failed OCR; not counted as "
+                    "text-negative and not written. This examination is incomplete."
+                )
 
             if redact_count or unmasked_count:
                 self.logger.info(
-                    "[%s] burned-in text: %d slice(s) redacted and KEPT, %d dropped, "
-                    "%d detected but NOT masked (action=%s, boxless strategy=%s, "
-                    "never_drop=%s)."
-                    % (id, redact_count, drop_count, unmasked_count,
-                       TEXT_ACTION, REDACT_BOXLESS_STRATEGY, NEVER_DROP_SLICES))
+                    f"[{id}] burned-in text: {redact_count} slice(s) redacted and KEPT, "
+                    f"{drop_count} dropped, {unmasked_count} detected but NOT masked "
+                    f"(action={TEXT_ACTION}, boxless strategy={REDACT_BOXLESS_STRATEGY}, "
+                    f"never_drop={NEVER_DROP_SLICES})."
+                )
                 if verify_fail_count:
                     self.logger.warning(
-                        "[%s] %d slice(s) still showed text on the SECOND pass after "
-                        "masking. Review only_for_debug/%s and consider increasing "
-                        "REDACT_PAD_FRAC." % (id, verify_fail_count,
-                                              OCR_DEBUG_VERIFY_FAIL_DIRNAME))
+                        f"[{id}] {verify_fail_count} slice(s) still showed text on the SECOND "
+                        "pass after masking. Review only_for_debug/"
+                        f"{OCR_DEBUG_VERIFY_FAIL_DIRNAME} and consider increasing REDACT_PAD_FRAC."
+                    )
                 if unmasked_count:
                     self.logger.warning(
-                        "[%s] %d slice(s) still contain detected text. Review "
-                        "only_for_debug/%s before release."
-                        % (id, unmasked_count, OCR_DEBUG_DETECTED_DIRNAME))
+                        f"[{id}] {unmasked_count} slice(s) still contain detected text. Review "
+                        f"only_for_debug/{OCR_DEBUG_DETECTED_DIRNAME} before release."
+                    )
 
-            if (ps315_overlays or ps315_curves or ps315_icons
-                    or ps315_descriptors or ps315_order or ps315_extra
-                    or ps315_dangling):
+            if (
+                ps315_overlays
+                or ps315_curves
+                or ps315_icons
+                or ps315_descriptors
+                or ps315_order
+                or ps315_extra
+                or ps315_dangling
+            ):
                 self.logger.info(
-                    "[%s] PS3.15: removed %d overlay element(s), %d curve element(s), "
-                    "%d icon image sequence(s), %d order-entry attribute(s), "
-                    "%d extra identifier(s), %d dangling SOP reference(s), "
-                    "blanked %d free-text descriptor(s)."
-                    % (id, ps315_overlays, ps315_curves, ps315_icons,
-                       ps315_order, ps315_extra, ps315_dangling, ps315_descriptors))
+                    f"[{id}] PS3.15: removed {ps315_overlays} overlay element(s), "
+                    f"{ps315_curves} curve element(s), {ps315_icons} icon image "
+                    f"sequence(s), {ps315_order} order-entry attribute(s), {ps315_extra} "
+                    f"extra identifier(s), {ps315_dangling} dangling SOP reference(s), "
+                    f"blanked {ps315_descriptors} free-text descriptor(s)."
+                )
 
             if self._uid_repair_failures:
                 self.logger.warning(
-                    "[%s] %s: %d UID value(s) could not be repaired, e.g. %s"
-                    % (id, os.path.basename(original_dir), self._uid_repair_failures,
-                       sorted(self._uid_repair_examples)[:3]))
+                    f"[{id}] {os.path.basename(original_dir)}: {self._uid_repair_failures} "
+                    "UID value(s) could not be repaired, e.g. "
+                    f"{sorted(self._uid_repair_examples)[:3]}"
+                )
                 self._uid_repair_failures = 0
                 self._uid_repair_examples = set()
 
             if date_fix_count:
                 shown = ", ".join(sorted(date_tag_names)[:10])
                 more = len(date_tag_names) - 10
+                extra = f" +{more} more" if more > 0 else ""
                 self.logger.info(
-                    "[%s] dates: %d value(s) across %d tag(s) replaced with the "
-                    "anonymization date %s [%s%s]; time policy=%s."
-                    % (id, date_fix_count, len(date_tag_names),
-                       self._current_date_da(), shown,
-                       (" +%d more" % more) if more > 0 else "",
-                       DEID_TIME_POLICY))
+                    f"[{id}] dates: {date_fix_count} value(s) across {len(date_tag_names)}"
+                    f" tag(s) replaced with the anonymization date {self._current_date_da()} ["
+                    f"{shown}{extra}]; time policy="
+                    f"{DEID_TIME_POLICY}."
+                )
             if age_capped_count:
                 self.logger.info(
-                    "[%s] %d slice(s) had PatientAge capped at %dY (Safe Harbor)."
-                    % (id, age_capped_count, int(DEID_MAX_AGE_YEARS)))
+                    f"[{id}] {age_capped_count} slice(s) had PatientAge capped at "
+                    f"{int(DEID_MAX_AGE_YEARS)}Y (Safe Harbor)."
+                )
 
             if uid_fix_count:
                 self.logger.info(
-                    "[%s] repaired %d non-conformant UID value(s) (PS3.5 section 9.1); "
-                    "replacements are consistent across the output set." % (id, uid_fix_count))
+                    f"[{id}] repaired {uid_fix_count} non-conformant UID value(s) (PS3.5 "
+                    "section 9.1); replacements are consistent across the output set."
+                )
 
             if self._conf_samples or self._unknown_conf_count:
                 try:
                     arr = np.asarray(self._conf_samples, dtype=float)
                     if arr.size:
                         self.logger.info(
-                            "[%s] detection confidence over %d detected slices: "
-                            "min=%.3f p10=%.3f median=%.3f max=%.3f | unknown=%d "
-                            "(threshold=%.2f)"
-                            % (id, arr.size, float(arr.min()),
-                               float(np.percentile(arr, 10)), float(np.median(arr)),
-                               float(arr.max()), self._unknown_conf_count,
-                               float(FLORENCE_MIN_CONFIDENCE)))
+                            f"[{id}] detection confidence over {arr.size} detected slices: min="
+                            f"{float(arr.min()):.3f} p10={float(np.percentile(arr, 10)):.3f} median="
+                            f"{float(np.median(arr)):.3f} max={float(arr.max()):.3f} | unknown="
+                            f"{self._unknown_conf_count} (threshold="
+                            f"{float(FLORENCE_MIN_CONFIDENCE):.2f})"
+                        )
                     else:
                         self.logger.info(
-                            "[%s] no usable confidence scores (%d hits with unknown "
-                            "confidence); FLORENCE_MIN_CONFIDENCE is not filtering."
-                            % (id, self._unknown_conf_count))
+                            f"[{id}] no usable confidence scores ({self._unknown_conf_count} hits "
+                            "with unknown confidence); FLORENCE_MIN_CONFIDENCE is not filtering."
+                        )
                 except Exception:
                     pass
 
             if files and not prepared:
-                reason = ("all_slices_failed_to_process" if NEVER_DROP_SLICES
-                          else "all_slices_removed_due_to_detected_text")
+                reason = (
+                    "all_slices_failed_to_process"
+                    if NEVER_DROP_SLICES
+                    else "all_slices_removed_due_to_detected_text"
+                )
                 errors.append((os.path.basename(original_dir), reason))
 
             for tmp_path, final_path in prepared:
@@ -5453,7 +5439,9 @@ class DicomProcessor:
 
                 if original_face_render_dir:
                     try:
-                        original_png = os.path.join(original_face_render_dir, f"{render_label}_original.png")
+                        original_png = os.path.join(
+                            original_face_render_dir, f"{render_label}_original.png"
+                        )
                         self._render_one_anterior_vtk_folder_subprocess(
                             dicom_dir=original_dir,
                             out_png=original_png,
@@ -5466,14 +5454,20 @@ class DicomProcessor:
                         )
                     except Exception as e:
                         try:
-                            with open(os.path.join(original_face_render_dir, "render_log.txt"), "a") as f:
-                                f.write(f"[{datetime.now()}] Original render failed for {original_dir}: {e}\n")
+                            with open(
+                                os.path.join(original_face_render_dir, "render_log.txt"), "a"
+                            ) as f:
+                                f.write(
+                                    f"[{datetime.now()}] Original render failed for {original_dir}: {e}\n"
+                                )
                         except Exception:
                             pass
 
                 if after_deidentification_render_dir:
                     try:
-                        after_png = os.path.join(after_deidentification_render_dir, f"{render_label}_after.png")
+                        after_png = os.path.join(
+                            after_deidentification_render_dir, f"{render_label}_after.png"
+                        )
                         self._render_one_anterior_vtk_folder_subprocess(
                             dicom_dir=out_dir,
                             out_png=after_png,
@@ -5486,8 +5480,13 @@ class DicomProcessor:
                         )
                     except Exception as e:
                         try:
-                            with open(os.path.join(after_deidentification_render_dir, "render_log.txt"), "a") as f:
-                                f.write(f"[{datetime.now()}] After-deidentification render failed for {out_dir}: {e}\n")
+                            with open(
+                                os.path.join(after_deidentification_render_dir, "render_log.txt"),
+                                "a",
+                            ) as f:
+                                f.write(
+                                    f"[{datetime.now()}] After-deidentification render failed for {out_dir}: {e}\n"
+                                )
                         except Exception:
                             pass
 
@@ -5509,10 +5508,11 @@ class DicomProcessor:
                     for r in qc_rows:
                         kinds[r["finding"]] = kinds.get(r["finding"], 0) + 1
                     self.logger.warning(
-                        "[%s] PS3.15 QC: %d finding(s) %s -- see %s"
-                        % (id, len(qc_rows), kinds, PS315_QC_CSV_NAME))
+                        f"[{id}] PS3.15 QC: {len(qc_rows)} finding(s) {kinds} -- see "
+                        f"{PS315_QC_CSV_NAME}"
+                    )
                 else:
-                    self.logger.info("[%s] PS3.15 QC: no findings." % id)
+                    self.logger.info(f"[{id}] PS3.15 QC: no findings.")
 
             if tmp_root and os.path.isdir(tmp_root):
                 try:
@@ -5523,8 +5523,8 @@ class DicomProcessor:
         return errors
 
     def _render_fallback_middle_slice(self, dicom_dir: str, out_png: str):
-        import pydicom
         import cv2
+        import pydicom
 
         paths = []
         for fn in os.listdir(dicom_dir):
@@ -5597,15 +5597,13 @@ if img is None:
 dims = img.GetDimensions()
 if (not dims) or (dims[0] <= 1) or (dims[1] <= 1) or (dims[2] < int({min_slices})):
     raise RuntimeError(f"Bad/too-thin volume dims: {{dims}} (min_slices={min_slices})")
-# Smooth CT volume first
 smooth = vtk.vtkImageGaussianSmooth()
 smooth.SetInputConnection(reader.GetOutputPort())
 smooth.SetStandardDeviations(1.2, 1.2, 1.0)
 smooth.SetRadiusFactors(2.0, 2.0, 1.5)
 smooth.Update()
 
-# Extract outer skin surface: air/skin boundary
-skin_value = -250.0   # try -450 to -250 if needed
+skin_value = -250.0
 
 try:
     contour = vtk.vtkFlyingEdges3D()
@@ -5616,13 +5614,11 @@ contour.SetInputConnection(smooth.GetOutputPort())
 contour.SetValue(0, skin_value)
 contour.Update()
 
-# Keep only largest connected surface = head/face
 connect = vtk.vtkPolyDataConnectivityFilter()
 connect.SetInputConnection(contour.GetOutputPort())
 connect.SetExtractionModeToLargestRegion()
 connect.Update()
 
-# Smooth surface to remove stair-step CT rings
 surf_smooth = vtk.vtkSmoothPolyDataFilter()
 surf_smooth.SetInputConnection(connect.GetOutputPort())
 surf_smooth.SetNumberOfIterations(35)
@@ -5714,7 +5710,9 @@ print(out_png)
             script_path = tf.name
 
         try:
-            rc, stdout, stderr = self._popen_and_wait([sys.executable, script_path], timeout_sec=timeout_sec)
+            rc, stdout, stderr = self._popen_and_wait(
+                [sys.executable, script_path], timeout_sec=timeout_sec
+            )
             if rc != 0:
                 raise RuntimeError(f"VTK render subprocess failed: {stderr or stdout}")
             if not os.path.exists(out_png):
@@ -5746,7 +5744,9 @@ print(out_png)
         except Exception as e:
             try:
                 with open(os.path.join(dicomDir, "render_log.txt"), "a") as f:
-                    f.write(f"[{datetime.now()}] VTK render failed; fallback to middle-slice. Reason: {e}\n")
+                    f.write(
+                        f"[{datetime.now()}] VTK render failed; fallback to middle-slice. Reason: {e}\n"
+                    )
             except Exception:
                 pass
             self._render_fallback_middle_slice(dicomDir, out_path)
@@ -5795,7 +5795,11 @@ print(out_png)
                     pass
                 all_outputs.append(f"[FAILED] {d} :: {e}")
 
-        rendered = [p for p in all_outputs if isinstance(p, str) and p.endswith(".png") and os.path.exists(p)]
+        rendered = [
+            p
+            for p in all_outputs
+            if isinstance(p, str) and p.endswith(".png") and os.path.exists(p)
+        ]
         if not rendered:
             raise RuntimeError("No snapshots produced (all DICOM folders failed to render).")
 
@@ -5805,11 +5809,8 @@ print(out_png)
         self,
         in_path,
         out_path,
-        replacer="face",
         id="new_folder_name",
         patient_old_id="",
-        patient_id="0",
-        name="",
         remove_CTA=False,
         global_drop_csv_path=None,
         global_qc_csv_path=None,
@@ -5819,12 +5820,11 @@ print(out_png)
         global_verify_fail_png_dir=None,
         global_prescreen_png_dir=None,
         global_not_examined_png_dir=None,
-        patient_input_root=None,
         original_face_render_dir=None,
         after_deidentification_render_dir=None,
     ):
         try:
-            for root, dirs, files in os.walk(in_path):
+            for root, _dirs, files in os.walk(in_path):
                 rel = os.path.relpath(root, in_path)
                 out_dir = os.path.join(out_path, rel)
                 dicom_files = [f for f in files if self.is_dicom(os.path.join(root, f), remove_CTA)]
@@ -5833,11 +5833,8 @@ print(out_png)
                     series_errors = self.save_new_dicom_files(
                         original_dir=root,
                         out_dir=out_dir,
-                        replacer=replacer,
                         id=id,
                         patient_old_id=patient_old_id,
-                        patient_id=patient_id,
-                        new_patient_id="Processed for anonymization",
                         remove_CTA=remove_CTA,
                         global_drop_csv_path=global_drop_csv_path,
                         global_qc_csv_path=global_qc_csv_path,
@@ -5847,7 +5844,6 @@ print(out_png)
                         global_prescreen_png_dir=global_prescreen_png_dir,
                         global_not_examined_png_dir=global_not_examined_png_dir,
                         global_no_text_png_dir=global_no_text_png_dir,
-                        patient_input_root=patient_input_root or in_path,
                         original_face_render_dir=original_face_render_dir,
                         after_deidentification_render_dir=after_deidentification_render_dir,
                     )
@@ -5855,9 +5851,11 @@ print(out_png)
 
             if not self._eligible_slice_count:
                 counts = getattr(self, "_ct_filter_rejections", {})
-                detail = ", ".join("%s=%d" % (reason, count) for reason, count in sorted(counts.items()))
-                raise ValueError("No eligible single-frame grayscale CT instances were found. "
-                                 "Rejected filter evaluations: " + (detail or "no candidate files encountered"))
+                detail = ", ".join(f"{reason}={count}" for reason, count in sorted(counts.items()))
+                raise ValueError(
+                    "No eligible single-frame grayscale CT instances were found. "
+                    "Rejected filter evaluations: " + (detail or "no candidate files encountered")
+                )
 
             for curr, subdirs, files in os.walk(out_path, topdown=True):
                 if not subdirs:
