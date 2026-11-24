@@ -574,6 +574,15 @@ DEID_NORMALIZE_CONFIRMED_HEAD = True
 DEID_REMOVE_RETIRED_DOSE_SAVING = True
 DEID_REMOVE_MODALITIES_IN_STUDY = True
 DEID_IOD_ACTIONS_FILENAME = "metadata_iod_actions.csv"
+DEID_OUTPUT_DIRNAME = "deid"
+REVIEW_DIRNAME = "restricted_review"
+STAGING_DIRNAME = "_staging"
+INCOMPLETE_DIRNAME = "incomplete_output"
+REVIEW_README_TEXT = (
+    "This folder contains identifiable data (original face renders, debug images, "
+    "source folder names, original UIDs, detected text).\n"
+    "Do not share. Share only the 'deid' folder.\n"
+)
 CT_CLASSIC_SOP_UID = "1.2.840.10008.5.1.4.1.1.2"
 CT_OPTIONAL_ROOT_CODE_SEQUENCES = {
     0x00081032: "ProcedureCodeSequence",
@@ -736,16 +745,16 @@ def _repair_classic_ct_iod(dataset, confirmed_head=False):
     return actions
 
 
-def _append_iod_actions(path, source_filename, actions):
-    if not actions:
+def _append_csv(path, header, rows):
+    if not path or not rows:
         return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     exists = os.path.isfile(path)
     with open(path, "a", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         if not exists:
-            writer.writerow(["source_filename", "action", "element_path", "detail"])
-        for action, location, detail in actions:
-            writer.writerow([source_filename, action, location, detail])
+            writer.writerow(header)
+        writer.writerows(rows)
 
 
 GLOBAL_DROPPED_CSV_NAME = "global_burned_in_text_actions.csv"
@@ -809,6 +818,15 @@ def dicom_has_burned_in(ds) -> bool:
         return v in {"yes", "y", "true", "1"}
     except Exception:
         return False
+
+
+def _no_window_kwargs():
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": startupinfo}
 
 
 def _safe_show_status(msg: str, ms: int = 2000):
@@ -2041,7 +2059,12 @@ try:
             _env = dict(os.environ)
             _env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
             pr = _sp.run(
-                [sys.executable, "-c", code], capture_output=True, text=True, timeout=180, env=_env
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=_env,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
             )
             info["expandable_segments_probe"] = (
                 "ok"
@@ -2079,6 +2102,7 @@ def florence_gpu_report():
                 "--query-gpu=index,name,driver_version,memory.total,memory.used",
                 "--format=csv,noheader",
             ],
+            **_no_window_kwargs(),
             capture_output=True,
             text=True,
             timeout=30,
@@ -2105,7 +2129,13 @@ def florence_gpu_report():
         with open(script, "w", encoding="utf-8") as f:
             f.write(FLORENCE_GPU_PROBE_SOURCE)
         pr = subprocess.run(
-            [exe, script], capture_output=True, text=True, timeout=300, env=env, cwd=tmpdir
+            [exe, script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+            cwd=tmpdir,
+            **_no_window_kwargs(),
         )
         lines.append("torch probe (in worker environment):")
         out = (pr.stdout or "").strip()
@@ -2272,9 +2302,8 @@ class Florence2WorkerClient:
             bufsize=1,
             cwd=self._tmpdir,
             env=self._worker_env(minimal=minimal_env),
+            **_no_window_kwargs(),
         )
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         cmd = [self._worker_python(), self._script_path, json.dumps(cfg)]
         self.proc = subprocess.Popen(cmd, **popen_kwargs)
@@ -2743,7 +2772,7 @@ class HeadCTDeidWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             )
             if summary and summary["status"] != "completed":
                 slicer.util.errorDisplay(
-                    "Incomplete: some examinations failed. See run_summary.json.",
+                    "Some exams failed. See restricted_review/run_summary.json.",
                     windowTitle="Processing incomplete",
                 )
         except (ValueError, FileNotFoundError) as exc:
@@ -2816,16 +2845,16 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         try:
             os.makedirs(outputFolder, exist_ok=True)
             log_file = os.path.join(outputFolder, "patient_processing.log")
-            already = any(
-                isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_file
-                for h in self.logger.handlers
+            for handler in list(self.logger.handlers):
+                if isinstance(handler, logging.FileHandler):
+                    self.logger.removeHandler(handler)
+                    handler.close()
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
             )
-            if not already:
-                file_handler = logging.FileHandler(log_file)
-                file_handler.setLevel(logging.INFO)
-                file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-                file_handler.setFormatter(file_formatter)
-                self.logger.addHandler(file_handler)
+            self.logger.addHandler(file_handler)
             self.logger.setLevel(logging.INFO)
             self.logger.info(f"Initialized patient processing module {log_file}")
         except Exception:
@@ -2881,7 +2910,6 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             raise ValueError(f"Mapping file not found: {excelFile}")
 
         os.makedirs(outputFolder, exist_ok=True)
-        self._ensure_logger(outputFolder)
 
         columns_as_text = ["original_folder_name", "new_folder_name"]
         ext = os.path.splitext(excelFile)[1].lower()
@@ -2925,10 +2953,16 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             d for d in os.listdir(inputFolder) if os.path.isdir(os.path.join(inputFolder, d))
         ]
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(outputFolder, f"Processed for Anonymization_{current_time}")
+        run_path = os.path.join(outputFolder, f"Processed for Anonymization_{current_time}")
+        out_path = os.path.join(run_path, DEID_OUTPUT_DIRNAME)
+        review_path = os.path.join(run_path, REVIEW_DIRNAME)
         os.makedirs(out_path, exist_ok=True)
+        os.makedirs(review_path, exist_ok=True)
+        with open(os.path.join(review_path, "README.txt"), "w", encoding="utf-8") as f:
+            f.write(REVIEW_README_TEXT)
+        self._ensure_logger(review_path)
         global _RUN_PROVENANCE_PATH
-        _RUN_PROVENANCE_PATH = os.path.join(out_path, "run_provenance.json")
+        _RUN_PROVENANCE_PATH = os.path.join(review_path, "run_provenance.json")
         deps = {}
         for package in (
             "numpy",
@@ -2987,16 +3021,18 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             }
         )
 
-        original_face_render_dir = os.path.join(out_path, "original_face_render")
-        after_deidentification_render_dir = os.path.join(out_path, "after_deidentification_render")
+        original_face_render_dir = os.path.join(review_path, "original_face_render")
+        after_deidentification_render_dir = os.path.join(
+            review_path, "after_deidentification_render"
+        )
         os.makedirs(original_face_render_dir, exist_ok=True)
         os.makedirs(after_deidentification_render_dir, exist_ok=True)
 
-        global_drop_csv_path = os.path.join(out_path, GLOBAL_DROPPED_CSV_NAME)
-        global_qc_csv_path = os.path.join(out_path, PS315_QC_CSV_NAME)
+        global_drop_csv_path = os.path.join(review_path, GLOBAL_DROPPED_CSV_NAME)
+        global_qc_csv_path = os.path.join(review_path, PS315_QC_CSV_NAME)
         self._init_global_drop_csv(global_drop_csv_path)
 
-        ocr_debug_root = os.path.join(out_path, OCR_DEBUG_ROOT_DIRNAME)
+        ocr_debug_root = os.path.join(review_path, OCR_DEBUG_ROOT_DIRNAME)
         ocr_detected_dir = os.path.join(ocr_debug_root, OCR_DEBUG_DETECTED_DIRNAME)
         ocr_no_text_dir = os.path.join(ocr_debug_root, OCR_DEBUG_NO_TEXT_DIRNAME)
         ocr_redacted_dir = os.path.join(ocr_debug_root, OCR_DEBUG_REDACTED_DIRNAME)
@@ -3028,6 +3064,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
         for foldername in folders_to_process:
             try:
                 processor = DicomProcessor(force_ocr_all=bool(force_ocr_all))
+                processor.review_dir = review_path
                 processors.append(processor)
 
                 src_folder = os.path.join(inputFolder, foldername)
@@ -3089,6 +3126,11 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
                     }
                 )
 
+        try:
+            os.rmdir(os.path.join(review_path, STAGING_DIRNAME))
+        except OSError:
+            pass
+
         for p in processors:
             try:
                 p.wait_for_all_subprocesses(timeout_total_sec=7200)
@@ -3113,7 +3155,7 @@ class HeadCTDeidLogic(ScriptedLoadableModuleLogic):
             "independent_audit_performed": False,
             "note": "Production processing summary, not an independent saved-file audit.",
         }
-        with open(os.path.join(out_path, "run_summary.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(review_path, "run_summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
         _update_run_provenance({"processing_status": summary["status"]})
         message = (
@@ -3144,6 +3186,9 @@ class DicomProcessor:
         self.logger = logging.getLogger("PatientProcessor")
         self._force_ocr_all = bool(force_ocr_all)
         self._render_counter = 0
+        self.review_dir = None
+        self._patient_in_root = ""
+        self._patient_out_root = ""
         self._processing_errors = []
         self._eligible_slice_count = 0
         self._ct_filter_rejections = defaultdict(int)
@@ -3172,7 +3217,13 @@ class DicomProcessor:
 
     def _popen_and_wait(self, cmd, timeout_sec):
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                **_no_window_kwargs(),
+            )
         except Exception as e:
             return -1, "", str(e)
 
@@ -4803,6 +4854,7 @@ class DicomProcessor:
         import pydicom
 
         os.makedirs(out_dir, exist_ok=True)
+        series_key = os.path.relpath(out_dir, self._patient_out_root or out_dir)
         files = [
             f
             for f in os.listdir(original_dir)
@@ -4965,8 +5017,17 @@ class DicomProcessor:
                         ps315_descriptors += st["descriptors"]
 
                     iod_actions = _repair_classic_ct_iod(ds, confirmed_head=source_head_confirmed)
-                    _append_iod_actions(
-                        os.path.join(out_dir, DEID_IOD_ACTIONS_FILENAME), fname, iod_actions
+                    _append_csv(
+                        self._review_file(DEID_IOD_ACTIONS_FILENAME),
+                        [
+                            "patient_new_id",
+                            "source_series",
+                            "source_filename",
+                            "action",
+                            "element_path",
+                            "detail",
+                        ],
+                        [[id, series_key, fname, *a] for a in iod_actions],
                     )
                     for action, location, detail in iod_actions:
                         if action == "unresolved":
@@ -5222,16 +5283,18 @@ class DicomProcessor:
 
                     _dcm_save_as(ds, tmp_path, enforce_file_format=True)
                     prepared.append((tmp_path, final_path))
-                    trace_path = os.path.join(out_dir, "face_processing_parameters.csv")
-                    os.makedirs(out_dir, exist_ok=True)
-                    trace_exists = os.path.isfile(trace_path)
-                    with open(trace_path, "a", newline="", encoding="utf-8") as trace_file:
-                        trace = csv.writer(trace_file)
-                        if not trace_exists:
-                            trace.writerow(
-                                ["output_file", "kernel_parameter_pixels", "random_seed", "fill_hu"]
-                            )
-                        trace.writerow([out_name, k_max, DEID_RANDOM_SEED, -1000])
+                    _append_csv(
+                        self._review_file("face_processing_parameters.csv"),
+                        [
+                            "patient_new_id",
+                            "source_series",
+                            "output_file",
+                            "kernel_parameter_pixels",
+                            "random_seed",
+                            "fill_hu",
+                        ],
+                        [[id, series_key, out_name, k_max, DEID_RANDOM_SEED, -1000]],
+                    )
                     kept_count += 1
 
                     del ds, pixels_hu, new_volume
@@ -5436,6 +5499,11 @@ class DicomProcessor:
             if prepared:
                 self._render_counter += 1
                 render_label = _safe_filename(f"{id}_series{self._render_counter:05d}")
+                _append_csv(
+                    self._review_file("render_index.csv"),
+                    ["render_label", "patient_new_id", "source_series"],
+                    [[render_label, id, series_key]],
+                )
 
                 if original_face_render_dir:
                     try:
@@ -5491,13 +5559,10 @@ class DicomProcessor:
                             pass
 
         finally:
-            if errors:
-                try:
-                    with open(os.path.join(out_dir, "log.txt"), "a") as error_file:
-                        for dicom_file, err in errors:
-                            error_file.write(f"File: {dicom_file}, Error: {err}\n")
-                except Exception:
-                    pass
+            try:
+                self._log_errors(id, series_key, errors)
+            except Exception:
+                pass
 
             self._append_global_drop_rows(global_drop_csv_path, dropped_rows)
             self._append_qc_rows(global_qc_csv_path, qc_rows)
@@ -5522,53 +5587,6 @@ class DicomProcessor:
 
         return errors
 
-    def _render_fallback_middle_slice(self, dicom_dir: str, out_png: str):
-        import cv2
-        import pydicom
-
-        paths = []
-        for fn in os.listdir(dicom_dir):
-            fp = os.path.join(dicom_dir, fn)
-            if os.path.isfile(fp):
-                try:
-                    _ = pydicom.dcmread(fp, force=True, stop_before_pixels=True)
-                    paths.append(fp)
-                except Exception:
-                    pass
-        if not paths:
-            raise RuntimeError("Fallback render: no dicoms found")
-
-        def instnum(p):
-            try:
-                ds = pydicom.dcmread(p, force=True, stop_before_pixels=True)
-                return int(getattr(ds, "InstanceNumber", 1))
-            except Exception:
-                return sys.maxsize
-
-        paths.sort(key=instnum)
-        mid = paths[len(paths) // 2]
-        ds = pydicom.dcmread(mid, force=True)
-        try:
-            _decompress_preserving_instance_uid(ds)
-        except Exception:
-            pass
-        img = ds.pixel_array.astype(np.float32)
-
-        intercept = float(getattr(ds, "RescaleIntercept", 0))
-        slope = float(getattr(ds, "RescaleSlope", 1) or 1.0)
-        hu = img * slope + intercept
-
-        w_center = -100.0
-        w_width = 350.0
-        lo = w_center - (w_width / 2.0)
-        hi = w_center + (w_width / 2.0)
-        hu = np.clip(hu, lo, hi)
-        out8 = ((hu - lo) / max(1e-6, (hi - lo)) * 255.0).astype(np.uint8)
-
-        os.makedirs(os.path.dirname(out_png), exist_ok=True)
-        cv2.imwrite(out_png, out8)
-        return out_png
-
     def _render_one_anterior_vtk_folder_subprocess(
         self,
         dicom_dir: str,
@@ -5581,8 +5599,14 @@ class DicomProcessor:
         timeout_sec: int = 60,
     ):
         script = f"""
+import atexit
 import os
+import sys
 import vtk
+
+_vtk_log = vtk.vtkStringOutputWindow()
+vtk.vtkOutputWindow.SetInstance(_vtk_log)
+atexit.register(lambda: sys.stderr.write(_vtk_log.GetOutput()))
 
 dicom_dir = r\"\"\"{dicom_dir}\"\"\"
 out_png  = r\"\"\"{out_png}\"\"\"
@@ -5654,6 +5678,7 @@ ren.ResetCamera()
 
 renwin = vtk.vtkRenderWindow()
 renwin.SetOffScreenRendering(1)
+renwin.SetShowWindow(False)
 renwin.AddRenderer(ren)
 renwin.SetSize(int({image_size}), int({image_size}))
 renwin.SetMultiSamples(0)
@@ -5724,86 +5749,59 @@ print(out_png)
             except Exception:
                 pass
 
-    def _render_one_dicom_folder(self, dicomDir, out_prefix="view"):
-        if not os.path.isdir(dicomDir):
-            raise RuntimeError(f"Not a folder: {dicomDir}")
+    def _review_file(self, name):
+        return os.path.join(self.review_dir, name) if self.review_dir else ""
 
-        out_path = os.path.join(dicomDir, f"{out_prefix}_anterior.png")
+    def _log_errors(self, patient_new_id, series_key, errors):
+        _append_csv(
+            self._review_file("processing_errors.csv"),
+            ["timestamp", "patient_new_id", "source_series", "file", "error"],
+            [
+                [datetime.now().isoformat(timespec="seconds"), patient_new_id, series_key, f, e]
+                for f, e in errors
+            ],
+        )
+
+    def _quarantine_output(self, staging_path, id):
+        if not os.path.isdir(staging_path):
+            return
+        target = os.path.join(self.review_dir, INCOMPLETE_DIRNAME, id)
         try:
-            self._render_one_anterior_vtk_folder_subprocess(
-                dicom_dir=dicomDir,
-                out_png=out_path,
-                image_size=1024,
-                zoom_out=4.0,
-                rotate_180=True,
-                view_angle_deg=12.0,
-                min_slices=16,
-                timeout_sec=60,
-            )
-            return [out_path]
+            if os.path.exists(target):
+                shutil.rmtree(target)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.move(staging_path, target)
+            self.logger.warning(f"[{id}] Incomplete output moved to {INCOMPLETE_DIRNAME}/{id}")
         except Exception as e:
-            try:
-                with open(os.path.join(dicomDir, "render_log.txt"), "a") as f:
-                    f.write(
-                        f"[{datetime.now()}] VTK render failed; fallback to middle-slice. Reason: {e}\n"
-                    )
-            except Exception:
-                pass
-            self._render_fallback_middle_slice(dicomDir, out_path)
-            return [out_path]
+            self.logger.error(f"[{id}] Could not move incomplete output: {e}")
 
-    def _find_all_dicom_dirs(self, rootFolder):
-        import pydicom
-
-        def _has_any_dicom(d):
-            try:
-                for fn in os.listdir(d):
-                    fp = os.path.join(d, fn)
-                    if not os.path.isfile(fp):
-                        continue
-                    try:
-                        _ = pydicom.dcmread(fp, force=True, stop_before_pixels=True)
-                        return True
-                    except Exception:
-                        continue
-            except Exception:
-                return False
-            return False
-
-        dicom_dirs = []
-        for curr, subdirs, files in os.walk(rootFolder):
-            if _has_any_dicom(curr):
-                dicom_dirs.append(curr)
-
-        return sorted(set(dicom_dirs))
-
-    def _create_and_save_multi_view_snapshots(self, patientFolder, out_prefix="view"):
-        dicom_dirs = self._find_all_dicom_dirs(patientFolder)
-        if not dicom_dirs:
-            raise RuntimeError("No snapshots produced (no DICOM-containing subfolders found).")
-
-        all_outputs = []
-        for d in dicom_dirs:
-            try:
-                outs = self._render_one_dicom_folder(d, out_prefix=out_prefix)
-                all_outputs.extend(outs)
-            except Exception as e:
-                try:
-                    with open(os.path.join(d, "render_log.txt"), "a") as f:
-                        f.write(f"[{datetime.now()}] Render failed: {e}\n")
-                except Exception:
-                    pass
-                all_outputs.append(f"[FAILED] {d} :: {e}")
-
-        rendered = [
-            p
-            for p in all_outputs
-            if isinstance(p, str) and p.endswith(".png") and os.path.exists(p)
-        ]
-        if not rendered:
-            raise RuntimeError("No snapshots produced (all DICOM folders failed to render).")
-
-        return all_outputs
+    def _rename_output_folders(self, out_path, id):
+        renamed = {}
+        for curr, subdirs, _files in os.walk(out_path, topdown=True):
+            if not subdirs:
+                continue
+            old_curr = renamed.get(curr, curr)
+            moves = []
+            for i, d in enumerate(sorted(subdirs), start=1):
+                tmp = os.path.join(curr, f"__TMP__RENAME__{i:04d}__")
+                os.rename(os.path.join(curr, d), tmp)
+                moves.append((tmp, d))
+            new_names = []
+            for i, (tmp, old_name) in enumerate(moves, start=1):
+                dst = os.path.join(curr, f"{id}_{i}")
+                os.rename(tmp, dst)
+                renamed[dst] = os.path.join(old_curr, old_name)
+                new_names.append(f"{id}_{i}")
+            subdirs[:] = new_names
+        root = os.path.dirname(out_path)
+        _append_csv(
+            self._review_file("series_folder_map.csv"),
+            ["patient_new_id", "source_series", "output_series"],
+            [
+                [id, os.path.relpath(old, out_path), os.path.relpath(new, root)]
+                for new, old in sorted(renamed.items())
+            ],
+        )
 
     def drown_volume(
         self,
@@ -5823,7 +5821,19 @@ print(out_png)
         original_face_render_dir=None,
         after_deidentification_render_dir=None,
     ):
+        if not self.review_dir:
+            self.review_dir = os.path.join(os.path.dirname(out_path), REVIEW_DIRNAME)
+        final_path = out_path
+        out_path = os.path.join(self.review_dir, STAGING_DIRNAME, os.path.basename(final_path))
+        if os.path.exists(out_path):
+            shutil.rmtree(out_path)
+        self._patient_in_root = in_path
+        self._patient_out_root = out_path
         try:
+            if os.path.isdir(final_path) and not os.listdir(final_path):
+                os.rmdir(final_path)
+            if os.path.exists(final_path):
+                raise FileExistsError(f"Output already exists: {final_path}")
             for root, _dirs, files in os.walk(in_path):
                 rel = os.path.relpath(root, in_path)
                 out_dir = os.path.join(out_path, rel)
@@ -5857,47 +5867,18 @@ print(out_png)
                     "Rejected filter evaluations: " + (detail or "no candidate files encountered")
                 )
 
-            for curr, subdirs, files in os.walk(out_path, topdown=True):
-                if not subdirs:
-                    continue
-
-                subdirs_sorted = sorted(subdirs)
-                tmp_map = []
-                for i, d in enumerate(subdirs_sorted, start=1):
-                    src = os.path.join(curr, d)
-                    tmp = os.path.join(curr, f"__TMP__RENAME__{i:04d}__")
-                    if os.path.exists(src):
-                        os.rename(src, tmp)
-                        tmp_map.append(tmp)
-
-                new_names = []
-                for i, tmp in enumerate(tmp_map, start=1):
-                    dst_name = f"{id}_{i}"
-                    dst = os.path.join(curr, dst_name)
-                    os.rename(tmp, dst)
-                    new_names.append(dst_name)
-
-                subdirs[:] = new_names
-
-            try:
-                self._create_and_save_multi_view_snapshots(out_path, out_prefix="view")
-            except Exception as e:
-                try:
-                    with open(os.path.join(out_path, "render_summary.txt"), "a") as f:
-                        f.write(f"[{datetime.now()}] Snapshot phase failed: {e}\n")
-                except Exception:
-                    pass
-
             self.wait_for_all_subprocesses(timeout_total_sec=7200)
+            self._rename_output_folders(out_path, id)
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+            shutil.move(out_path, final_path)
 
         except Exception as e:
             self._processing_errors.append(("", str(e)))
             try:
-                os.makedirs(out_path, exist_ok=True)
-                with open(os.path.join(out_path, "log.txt"), "a") as f:
-                    f.write(f"Error: {e}\n")
+                self._log_errors(id, "", [("", str(e))])
             except Exception:
                 pass
+            self._quarantine_output(out_path, id)
             return 0
 
         return int(not self._processing_errors)
